@@ -359,6 +359,8 @@ class Controller:
     def probe_score(self, camera_name: str, tag: str) -> Optional[float]:
         """One loop-res render of the current scene scored against the camera's reference
         — the cheap 'did that help?' measurement."""
+        if getattr(self.cfg, "no_renders", False):
+            return None                    # no-render mode: plans apply unmeasured
         e = self.session.cameras.get(camera_name)
         if not (e and e.reference):
             return None
@@ -464,7 +466,7 @@ class Controller:
             log("⚠ reference stats unavailable (install Pillow or set system_python) — "
                 "running LLM-visual mode")
         ref_block = self._image_block(e.reference)
-        if ref_block is None:
+        if ref_block is None and not getattr(self.cfg, "no_renders", False):
             raise RuntimeError("reference image could not be prepared for the LLM")
 
         if start_override is not None:
@@ -477,6 +479,11 @@ class Controller:
                                              overcast_sun_mode=self.cfg.overcast_sun_mode)
             for line in why:
                 log("first guess: " + line)
+
+        if getattr(self.cfg, "no_renders", False):
+            e.locks = locks
+            return self._apply_only(camera_name, e, rig, cam, start, run_dir,
+                                    semantics, log)
 
         draft_applied = False
         if self.cfg.draft_sampler:
@@ -562,6 +569,41 @@ class Controller:
                    if result.ceiling_converged else ""))
         return result
 
+    def _apply_only(self, camera_name: str, e, rig, cam, start: LightingState,
+                    run_dir: str, semantics: Dict,
+                    log: Callable[[str], None]) -> MatchResult:
+        """no_renders mode: apply the state as ONE undoable change, verify by read-back,
+        report every changed value — never render. 'Applied' is measured, not assumed."""
+        for w in ap.apply_state(rig, self._baselines, start, cam):
+            log("⚠ " + w)
+        back = ap.read_state(rig, self._baselines, cam)
+        drift = {k: v for k, v in back.diff(start).items() if abs(v[0] - v[1]) > 0.51}
+        changes = (sorted(e.pre_match.diff(start).items())
+                   if e.pre_match is not None else [])
+        for key, (before, after) in changes:
+            log(f"applied: {key} {before:.2f} → {after:.2f}")
+        if not changes:
+            log("applied: state matches the pre-match light — nothing to change")
+        if drift:
+            log("⚠ read-back drift on " + ", ".join(sorted(drift))
+                + " — those parameters may not have stuck")
+        else:
+            log(f"verified by read-back: {len(changes)} setting(s) applied, "
+                "0 renders fired")
+        self.session.record_match(camera_name, start, None)
+        self.save_session()
+        result = MatchResult(best_state=start, best_score=None, best_render=None,
+                             stop_reason="applied (no-render mode)")
+        try:
+            with open(os.path.join(run_dir, "run.json"), "w", encoding="utf-8") as f:
+                json.dump({"camera": camera_name, "reference": e.reference,
+                           "semantics": semantics, "no_renders": True,
+                           **result.to_summary()}, f, indent=1)
+        except (OSError, TypeError, ValueError):
+            pass
+        log("match finished: applied (no-render mode)")
+        return result
+
     def refine(
         self,
         camera_name: str,
@@ -587,7 +629,7 @@ class Controller:
         semantics = self._analyze_or_fallback(camera_name, log)  # re-analyzes on ref swap
         ref_stats = self.ref_stats(e.reference)
         ref_block = self._image_block(e.reference)
-        if ref_block is None:
+        if ref_block is None and not getattr(self.cfg, "no_renders", False):
             raise RuntimeError("reference image could not be prepared for the LLM")
 
         base = (e.state.copy() if e.state is not None
@@ -596,6 +638,15 @@ class Controller:
         state0, applied = feedback.apply_note_deltas(base, deltas)
         for k, v in applied.items():
             log(f"note → {k} = {v:.2f} (instant)")
+
+        if getattr(self.cfg, "no_renders", False):
+            if not applied:
+                log("note matched no craft-table nudge — nothing to apply (the LLM "
+                    "ensemble that would interpret it needs probe renders)")
+            if e.pre_match is None:
+                e.pre_match = ap.read_state(rig, self._baselines, cam)
+            return self._apply_only(camera_name, e, rig, cam, state0, run_dir,
+                                    semantics, log)
 
         def probe(st: LightingState, tag: str):
             self._apply_logged(rig, st, cam, log)
@@ -715,6 +766,10 @@ class Controller:
         if not board:
             log("no scenario candidates for this rig")
             return []
+        if getattr(self.cfg, "no_renders", False):
+            log("no-render mode: candidates listed without probes or scores — pick by "
+                "name; ADOPT applies it (the scene is untouched until you adopt)")
+            return [{**cand, "render": None, "score": None} for cand in board]
         ref = self.ref_stats(e.reference) if e.reference else None
         if e.reference and ref is None:
             log("⚠ reference stats unavailable — board renders without scores")
@@ -979,6 +1034,10 @@ class Controller:
         """DEFAULT final-render backend (stock Vantage 3.x has no headless CLI): per
         camera, apply its saved state and production-render through V-Ray at final res.
         MAIN THREAD — renders block Max by nature; progress narrates between shots."""
+        if getattr(self.cfg, "no_renders", False):
+            for name in camera_names:
+                on_progress(name, "skipped — no-render mode is ON (Settings)")
+            return {name: "skipped (no-render mode)" for name in camera_names}
         results: Dict[str, str] = {}
         os.makedirs(out_dir, exist_ok=True)
         for name in camera_names:

@@ -44,6 +44,10 @@ class Config:
     sweep_count: int = 8
     keep_runs: int = 10                      # run folders kept per camera (0 = keep all)
     draft_sampler: bool = False              # opt-in: draft render settings during matches
+    # apply-only mode: MaxGaffer never fires a render. MATCH = analyze → first guess →
+    # apply as ONE undoable change → read-back verification → change report. The loop,
+    # sun sweep, board probes, plan effect measurement and V-Ray finals are all off.
+    no_renders: bool = False
     plan_first: bool = True                  # scene-wide plan (any setting, create lights)
     auto_execute_plan: bool = False          # skip the preview dialog (still one undo)
     show_report_popup: bool = True           # "scene changed" popup after execution

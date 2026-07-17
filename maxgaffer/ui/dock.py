@@ -1181,6 +1181,10 @@ class SettingsDialog(QtWidgets.QDialog):
         res.addWidget(QtWidgets.QLabel("×"))
         res.addWidget(self.sp_h)
         form.addRow("loop render size", res)
+        self.cb_norender = QtWidgets.QCheckBox(
+            "apply settings only — never render (loop, sweep, board probes, finals off)")
+        self.cb_norender.setChecked(bool(getattr(cfg, "no_renders", False)))
+        form.addRow("no-render mode", self.cb_norender)
         self.lbl_status = QtWidgets.QLabel("")
         self.lbl_status.setObjectName("dim")
         form.addRow(self.lbl_status)
@@ -1217,6 +1221,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cfg.loop_height = int(self.sp_h.value())
         self.cfg.max_iterations = int(self.sp_iters.value())
         self.cfg.target_score = float(self.sp_target.value())
+        self.cfg.no_renders = bool(self.cb_norender.isChecked())
         self.accept()
 
 
