@@ -267,6 +267,28 @@ def main():
 
             check("Q/#17", "dome seed end-to-end (v0.9)", dome_seed)
 
+        # ---------- S color management detection (#19) — the judgment stays visual, but
+        # the MODE is queryable (Max 2024+ ColorPipelineMgr): OCIO/ACES means the saved
+        # loop PNG may lack the display transform → biased solver (docs/STRESS.md §1)
+        def color_mode():
+            mgr = getattr(rt, "ColorPipelineMgr", None)
+            if mgr is None:
+                return ("no ColorPipelineMgr (classic gamma workflow) — #19 low risk; "
+                        "still eyeball one probe PNG vs the VFB")
+            out = {}
+            for prop in ("Mode", "mode", "OCIOConfigPath", "displayName", "viewName",
+                         "defaultDisplay", "defaultView", "outputConversion"):
+                try:
+                    v = getattr(mgr, prop)
+                except Exception:
+                    continue
+                if v is not None:
+                    out[prop] = str(v)[:60]
+            return (f"{out} — if Mode says OCIO/ACES, hold a probe PNG next to the VFB "
+                    "BEFORE trusting any score (#19)")
+
+        check("S/#19", "color management mode (detection)", color_mode)
+
         # ---------- R scenario board core (v0.9) — pure, no renders
         def board_core():
             from maxgaffer.core import scenarios as scen
