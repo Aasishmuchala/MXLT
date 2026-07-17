@@ -101,13 +101,16 @@ def read_state(rig: Dict[str, Any], baselines: Dict[str, float],
 
 
 def apply_state(rig: Dict[str, Any], baselines: Dict[str, float], state: LightingState,
-                camera=None) -> List[str]:
-    """Write the state to the scene inside one undo record. Returns warnings (params the
-    rig couldn't take)."""
+                camera=None, undo: bool = True) -> List[str]:
+    """Write the state to the scene — one undo record by default. ``undo=False`` is for
+    loop/probe applies (130+ per deep match would flood the artist's undo stack); their
+    official revert is the pre-match snapshot. Returns warnings (params the rig couldn't
+    take)."""
     import pymxs
 
     warnings: List[str] = []
-    with pymxs.undo(True, "MaxGaffer lighting"):
+    ctx = pymxs.undo(True, "MaxGaffer lighting") if undo else pymxs.undo(False)
+    with ctx:
         _apply_inner(rig, baselines, state, camera, warnings)
     try:
         _rt().redrawViews()

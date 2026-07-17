@@ -183,10 +183,11 @@ class Controller:
                 return omega.image_block_from_file(png)
             return None
         try:
-            from PIL import Image  # type: ignore
+            from PIL import Image, ImageOps  # type: ignore
             import io
 
             with Image.open(path) as im:
+                im = ImageOps.exif_transpose(im)   # the model must see the photo upright
                 im = im.convert("RGB")
                 im.thumbnail((768, 768))
                 buf = io.BytesIO()
@@ -267,6 +268,10 @@ class Controller:
 
     def _llm_deltas_hook(self, ref_block: dict) -> Callable[[Dict], str]:
         def call_llm(ctx: Dict) -> str:
+            if getattr(self, "_llm_down", False):
+                # gateway already failed this run — don't burn 3 backoff retries per
+                # iteration; the analytic solver + metric sweep carry the match alone
+                return '{"assessment": "", "changes": [], "stop": false}'
             render_block = self._image_block(ctx["render_path"])
             content = [ref_block]
             if render_block is not None:
@@ -281,11 +286,32 @@ class Controller:
                 ctx["analytic_applied"], ctx["iteration"], ctx["max_iterations"],
                 ctx.get("rig_notes", ""), ctx.get("param_history", ""),
                 ctx.get("director_note", ""))))
-            return self.io(lambda: omega.call(
-                self.cfg.api_key, prompts.DELTAS_SYSTEM,
-                [{"role": "user", "content": content}],
-                model=self.cfg.model, max_tokens=2048))
+            try:
+                return self.io(lambda: omega.call(
+                    self.cfg.api_key, prompts.DELTAS_SYSTEM,
+                    [{"role": "user", "content": content}],
+                    model=self.cfg.model, max_tokens=2048))
+            except (omega.OmegaError, RuntimeError) as err:
+                self._llm_down = True
+                return ('{"assessment": "LLM offline (%s) — analytic-only from here", '
+                        '"changes": [], "stop": false}' % str(err)[:80].replace('"', "'"))
         return call_llm
+
+    def _analyze_or_fallback(self, camera_name: str, log: Callable[[str], None]) -> Dict:
+        """ANALYZE, or — gateway down — the neutral base semantics with the LLM marked
+        down for this run. The analytic solver, metric-only sweep and critic still run:
+        a dead gateway degrades the match, it must never abort it."""
+        try:
+            return self.analyze_reference(camera_name)
+        except (omega.OmegaError, RuntimeError) as err:
+            self._llm_down = True
+            e = self.session.cameras.get(camera_name)
+            if e is not None and e.semantics:
+                log(f"⚠ gateway unavailable ({err}) — using this camera's cached analysis")
+                return e.semantics
+            log(f"⚠ gateway unavailable ({err}) — ANALYTIC-ONLY run on neutral base "
+                "semantics; steer with BOARD, locks and notes")
+            return dict(scen.DEFAULT_SEMANTICS)
 
     # ------------------------------------------------------------------ scene-wide plan
     def make_plan(self, camera_name: str, log: Callable[[str], None]):
@@ -426,7 +452,8 @@ class Controller:
         self.save_session()
 
         log("analyzing reference…")
-        semantics = self.analyze_reference(camera_name)
+        self._llm_down = False
+        semantics = self._analyze_or_fallback(camera_name, log)
         log(f"reference: {semantics['time_of_day']}, {semantics['sky']} sky, "
             f"sun {semantics['sun_altitude_band']} @ bearing "
             f"{semantics['sun_bearing_deg']:+.0f}°, wb ~{semantics['wb_kelvin_estimate']:.0f}K"
@@ -519,6 +546,13 @@ class Controller:
         e.locks = locks
         self.session.record_match(camera_name, result.best_state, result.best_score)
         self.save_session()
+        try:   # the calibration trail: every run leaves a machine-readable record
+            with open(os.path.join(run_dir, "run.json"), "w", encoding="utf-8") as f:
+                json.dump({"camera": camera_name, "reference": e.reference,
+                           "semantics": semantics, "llm_down": bool(self._llm_down),
+                           **result.to_summary()}, f, indent=1)
+        except (OSError, TypeError, ValueError):
+            pass
         score_txt = f"{result.best_score:.1f}" if result.best_score is not None else "n/a"
         log(f"match finished: {result.stop_reason}, best score {score_txt} "
             f"({len(result.iterations)} iterations)")
@@ -549,7 +583,8 @@ class Controller:
             raise RuntimeError(f"camera '{camera_name}' not found")
         sc.set_active_camera(camera_name)
         run_dir = self._new_run_dir(camera_name)
-        semantics = self.analyze_reference(camera_name)   # re-analyzes if ref was swapped
+        self._llm_down = False
+        semantics = self._analyze_or_fallback(camera_name, log)  # re-analyzes on ref swap
         ref_stats = self.ref_stats(e.reference)
         ref_block = self._image_block(e.reference)
         if ref_block is None:
@@ -758,15 +793,18 @@ class Controller:
         src = e.reference
         if _needs_max_ingest(src):             # EXR/HDR/TIFF ref: Max transcodes first
             src = self._transcode_ref(e.reference) or src
+        parametric = sun_az is not None        # live VRaySun owns direction → no disc
         meta = domeseed.build_seed(out, ref_path=src, semantics=semantics,
                                    cam_yaw_deg=yaw, sun_az_deg=sun_az,
-                                   sun_alt_deg=sun_alt)
+                                   sun_alt_deg=sun_alt,
+                                   parametric_sun_active=parametric)
         if meta is None and src == e.reference:   # plain loader failed (JPEG, no Pillow)
             png = self._transcode_ref(e.reference)
             if png:
                 meta = domeseed.build_seed(out, ref_path=png, semantics=semantics,
                                            cam_yaw_deg=yaw, sun_az_deg=sun_az,
-                                           sun_alt_deg=sun_alt)
+                                           sun_alt_deg=sun_alt,
+                                           parametric_sun_active=parametric)
         if meta is None:
             raise RuntimeError("could not read the reference for seeding")
         how = self.set_dome_hdri(out)
@@ -797,6 +835,9 @@ class Controller:
         if sun:
             log(f"dome seed: sun disc at az {sun['azimuth_deg']:.0f}° / "
                 f"alt {sun['altitude_deg']:.0f}° ({sun['kelvin']:.0f}K)")
+        elif meta.get("disc_policy") == "skipped_parametric_sun":
+            log("dome seed: ambient-only — the live VRaySun owns the direct light "
+                "(a baked disc would double the sun energy)")
         elif meta.get("overcast_lift"):
             log("dome seed: overcast — sky lifted, no disc")
         return meta
@@ -844,13 +885,22 @@ class Controller:
             if block is not None:
                 content.append(block)
         content.append(omega.text_block(prompts.sweep_user_text(azimuths)))
-        return self.io(lambda: omega.call(
-            self.cfg.api_key, prompts.SWEEP_SYSTEM,
-            [{"role": "user", "content": content}],
-            model=self.cfg.model, max_tokens=1024))
+        try:
+            return self.io(lambda: omega.call(
+                self.cfg.api_key, prompts.SWEEP_SYSTEM,
+                [{"role": "user", "content": content}],
+                model=self.cfg.model, max_tokens=1024))
+        except (omega.OmegaError, RuntimeError):
+            self._llm_down = True
+            return ""      # run_sun_sweep falls back to the contrastive-metric winner
 
     def _apply_logged(self, rig, state: LightingState, cam, log) -> None:
-        for w in ap.apply_state(rig, self._baselines, state, cam):
+        """Loop/probe/board applies — UNDO-FREE by design: a deep match plus polish is
+        130+ applies, and recording each would flood the artist's undo stack out of
+        existence (their own work becomes unreachable). The official revert for
+        explorations is the pre-match snapshot + Restore, not Ctrl+Z. Manual paths
+        (sliders, presets, adopt, camera switch) keep normal undo via apply_state."""
+        for w in ap.apply_state(rig, self._baselines, state, cam, undo=False):
             log("⚠ " + w)
 
     # ------------------------------------------------------------------ restore

@@ -130,6 +130,26 @@ class MatchResult:
     ceiling_converged: bool = False     # polish exhausted: no fine move improves — this
                                         # score IS the scene's ceiling for this reference
 
+    def to_summary(self) -> Dict:
+        """JSON-safe run record — the controller writes it to the run dir as run.json.
+        This is the calibration trail: which critic scores humans later accept is the
+        data that turns the proxy metric into a promise."""
+        return {
+            "best_score": self.best_score,
+            "stop_reason": self.stop_reason,
+            "best_render": self.best_render,
+            "polish_gain": self.polish_gain,
+            "polish_probes": self.polish_probes,
+            "ceiling_converged": self.ceiling_converged,
+            "best_state": self.best_state.to_dict(),
+            "iterations": [
+                {"index": r.index, "score": r.score, "render": r.render_path,
+                 "analytic": r.analytic_changes, "llm": r.llm_accepted,
+                 "rejected": r.llm_rejected, "assessment": r.assessment,
+                 "reverted": r.reverted_to_best}
+                for r in self.iterations],
+        }
+
 
 def run_match(
     start_state: LightingState,
@@ -510,36 +530,42 @@ def run_sun_sweep(
             hooks.log(f"sweep: render failed at azimuth {az:.0f}° — skipping")
     if len(paths) < 2:
         return None, "na", "not enough sweep renders"
+    # CONTRASTIVE metric table — computed BEFORE the LLM call so a dead gateway can still
+    # solve direction. Cross-check only when EVERY probe was measurable (a partial table
+    # could crown a probe merely because its rivals went unmeasured). All probes share the
+    # scene's dominant pattern (sky gradient), which swamps the sun's contribution — live
+    # fire showed a SUNLESS probe scoring 0.97 raw similarity — so subtract the probes'
+    # mean grid: only what varies WITH sun direction is compared. Negligible residue
+    # disables the metric entirely.
+    measured_all = all(s is not None for s in dir_scores) and len(probe_grids) == len(kept)
+    metric_idx: Optional[int] = None
+    contrast: List[float] = []
+    if measured_all:
+        mean_grid = [sum(g[i] for g in probe_grids) / len(probe_grids) for i in range(9)]
+        ref_d = [ref_grid[i] - mean_grid[i] for i in range(9)]
+        if sum(abs(v) for v in ref_d) > 0.01:
+            for g in probe_grids:
+                d = [g[i] - mean_grid[i] for i in range(9)]
+                contrast.append((cosine(ref_d, d) + 1.0) / 2.0)
+            metric_idx = max(range(len(contrast)), key=lambda i: contrast[i])
     try:
         picked = validate_sweep(llm_pick(paths, kept), len(paths))
     except ParseError as e:
+        if metric_idx is not None:            # gateway down ≠ direction unsolved
+            az = kept[metric_idx]
+            hooks.log(f"sweep: LLM pick unusable ({e}) — metric-only winner {az:.0f}° "
+                      f"(contrast {contrast[metric_idx]:.2f})")
+            return az, "na", "metric-only pick (LLM unavailable)"
         return None, "na", f"sweep reply unusable: {e}"
     idx = picked["best_index"]
-    # cross-check only when EVERY probe was measurable — a partial score table could
-    # crown a probe merely because its rivals went unmeasured (predictability > cleverness)
-    if all(s is not None for s in dir_scores) and len(probe_grids) == len(kept):
-        # CONTRASTIVE grids: all probes share the scene's dominant pattern (sky gradient),
-        # which swamps the sun's contribution — live fire showed a SUNLESS probe scoring
-        # 0.97 raw similarity. Subtract the probes' mean grid so only what varies WITH sun
-        # direction is compared; skip the override entirely if that residue is negligible.
-        from .metrics import cosine as _cos
-
-        mean_grid = [sum(g[i] for g in probe_grids) / len(probe_grids) for i in range(9)]
-        ref_d = [ref_grid[i] - mean_grid[i] for i in range(9)]
-        contrast = []
-        for g in probe_grids:
-            d = [g[i] - mean_grid[i] for i in range(9)]
-            contrast.append((_cos(ref_d, d) + 1.0) / 2.0)
-        energy = sum(abs(v) for v in ref_d)
-        if energy > 0.01:
-            metric_idx = max(range(len(contrast)), key=lambda i: contrast[i])
-            if metric_idx != idx and contrast[metric_idx] - contrast[idx] > 0.15:
-                hooks.log(f"sweep: direction metric overrides — {kept[metric_idx]:.0f}° "
-                          f"(contrast {contrast[metric_idx]:.2f}) beats the pick of "
-                          f"{kept[idx]:.0f}° ({contrast[idx]:.2f})")
-                idx = metric_idx
-        else:
-            hooks.log("sweep: direction residue too small to cross-check — LLM pick stands")
+    if metric_idx is not None:
+        if metric_idx != idx and contrast[metric_idx] - contrast[idx] > 0.15:
+            hooks.log(f"sweep: direction metric overrides — {kept[metric_idx]:.0f}° "
+                      f"(contrast {contrast[metric_idx]:.2f}) beats the pick of "
+                      f"{kept[idx]:.0f}° ({contrast[idx]:.2f})")
+            idx = metric_idx
+    elif measured_all:
+        hooks.log("sweep: direction residue too small to cross-check — LLM pick stands")
     az = kept[idx]
     hooks.log(f"sweep: azimuth {az:.0f}° — {picked['why']}")
     return az, picked["altitude_hint"], picked["why"]

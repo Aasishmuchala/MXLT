@@ -284,12 +284,19 @@ def build_seed(
     sun_strength: float = 200.0,
     sun_size_deg: float = 4.0,
     ambient_key: float = 0.35,
+    parametric_sun_active: bool = False,
 ) -> Optional[Dict]:
     """Reference (or external pano) → seeded .hdr on disk. → meta dict, None on failure.
 
     Sun placement: explicit (az, alt) wins (pass the solved/matched values); otherwise it
     derives from semantics (camera yaw + bearing, altitude band table) exactly like the
-    first-guess rules do. ``semantics`` also decides disc-vs-overcast."""
+    first-guess rules do. ``semantics`` also decides disc-vs-overcast.
+
+    ``parametric_sun_active``: the hybrid-rig energy rule. When a live VRaySun already
+    provides the direct light, a second sun baked into the dome would DOUBLE the direct
+    energy and cast a second soft shadow — exactly the mistake sunless commercial HDRIs
+    exist to avoid — so the disc is skipped and the seed stays ambient-only. Disc-bearing
+    seeds are for sunless/disabled-sun rigs, where the dome IS the direction."""
     sem = semantics or {}
     src = pano_path or ref_path
     if not src:
@@ -312,6 +319,10 @@ def build_seed(
     sun_active = bool(sem.get("sun_active", True)) and sky != "overcast" \
         and time_of_day != "night"
     sun_meta: Optional[Dict] = None
+    disc_policy = "skipped_parametric_sun" if (sun_active and parametric_sun_active) \
+        else ("disc" if sun_active else "no_sun")
+    if sun_active and parametric_sun_active:
+        sun_active = False                     # ambient-only seed; VRaySun owns direction
     if sun_active:
         if sun_az_deg is None:
             sun_az_deg = cam_yaw_deg + float(sem.get("sun_bearing_deg", 0.0))
@@ -338,6 +349,7 @@ def build_seed(
         "fov_deg": snap_fov(fov_deg),
         "normalize_scale": round(scale, 5),
         "sun": sun_meta,
+        "disc_policy": disc_policy,
         "overcast_lift": (sky == "overcast"),
     }
 

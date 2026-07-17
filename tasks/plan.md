@@ -60,6 +60,12 @@ expected groups; no ⚠ property warnings when moving each RIG slider once.
 `onbox_spikes.py` now runs the core automatically: **Q/#17** seeds from a probe render,
 round-trips the .hdr, binds it, renders under it, and restores the artist's dome in a
 finally; **R** builds the scenario candidates from the live rig. Manual leftovers below.
+0. **#19 COLOR PIPELINE (do this FIRST)**: render one probe via MaxGaffer and open the
+   saved PNG next to the VFB. If Max's color management (OCIO/ACES) means the saved file
+   is NOT display-transformed (darker/flatter than the VFB), every histogram the solver
+   sees is biased — set color management to apply the view transform on save, or note
+   the transform here (a fixed correction in the stats loader is a one-liner once
+   measured). Full reasoning: docs/STRESS.md §1.
 1. Bind any reference → RIG → **Seed dome**: `seed_<cam>.hdr` lands in the camera's run
    folder, the dome renders it (VRayBitmap reads our stdlib RGBE — verify no black dome /
    no gamma double-up; the file is linear, so the texmap should NOT apply sRGB de-gamma).

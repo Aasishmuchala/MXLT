@@ -735,7 +735,11 @@ class MaxGafferDock(QtWidgets.QWidget):
         plan_report = None
         try:
             if mode != 2:
-                ops, lines, meta, _raw = self.ctrl.make_plan(cam, log=self._log)
+                try:
+                    ops, lines, meta, _raw = self.ctrl.make_plan(cam, log=self._log)
+                except (OmegaError, RuntimeError) as err:
+                    self._log(f"⚠ plan skipped ({err}) — continuing with the match loop")
+                    ops, lines, meta = [], [], {}
                 if not ops:
                     self._log("plan: no operations proposed — continuing to the match loop")
                 elif self.act_autoexec.isChecked() or PlanPreviewDialog(

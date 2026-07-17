@@ -26,9 +26,13 @@ def _load_pixels(path: str, max_dim: int = 256):
     """→ (flat [(r,g,b)…], width, height) subsampled, or None. Pillow first, stdlib PNG
     floor second. Dimensions are kept so the key can be center-weighted."""
     try:
-        from PIL import Image  # type: ignore
+        from PIL import Image, ImageOps  # type: ignore
 
         with Image.open(path) as im:
+            # phone references carry EXIF orientation — without honoring it a portrait
+            # shot reads sideways and the DIRECTION grid (where the light lives) is
+            # garbage for both the critic and the sun solve
+            im = ImageOps.exif_transpose(im)
             im = im.convert("RGB")
             im.thumbnail((max_dim, max_dim))
             w, h = im.size

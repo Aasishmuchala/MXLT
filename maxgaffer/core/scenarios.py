@@ -36,6 +36,10 @@ DEFAULT_SEMANTICS: Dict = {
     "practicals_on": False,
     "atmosphere": "none",
     "contrast_character": "balanced",
+    # complete ANALYZE shape — this dict also serves as the gateway-down fallback
+    # semantics, so every key run_match logs or prompts with must exist
+    "key_notes": "neutral base — no reference analysis available",
+    "confidence": 0.0,
 }
 
 # (key, label, why, semantics overrides) — bearing convention matches ANALYZE:
