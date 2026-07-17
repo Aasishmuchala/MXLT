@@ -5,8 +5,9 @@ real gateway). The box session is measurement, not hope.
 
 ## Bring-up (~15 min)
 
-0. Get the code on the box: `git clone https://github.com/Aasishmuchala/MXLT` (or copy
-   `dist/maxgaffer-0.9.6.zip` and unzip).
+0. Get the code on the box: download `maxgaffer-0.9.6.zip` from
+   https://github.com/Aasishmuchala/MXLT/releases/tag/v0.9.6 and unzip
+   (or `git clone https://github.com/Aasishmuchala/MXLT`).
 1. Double-click `scripts\install.bat` → restart Max 2026.
 2. Customize → Customize User Interface → category **MaxGaffer** → drag the action to a
    toolbar → click it. The oc_ key auto-borrows from MaxDirector; otherwise Settings →
