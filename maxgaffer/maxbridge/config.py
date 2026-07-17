@@ -48,6 +48,12 @@ class Config:
     # apply as ONE undoable change → read-back verification → change report. The loop,
     # sun sweep, board probes, plan effect measurement and V-Ray finals are all off.
     no_renders: bool = False
+    # software exposure: V-Ray GPU applies exposure only at the VFB display stage, so
+    # loop renders don't reflect the EV/WB the solver sets (the host is inert in the
+    # saved buffer). When on, EV/WB are applied to each loop frame in software before
+    # scoring, so the analytic solver converges on any renderer. Recommended ON for
+    # V-Ray GPU; harmless where exposure already bakes in (near-identity early frames).
+    software_exposure: bool = False
     plan_first: bool = True                  # scene-wide plan (any setting, create lights)
     auto_execute_plan: bool = False          # skip the preview dialog (still one undo)
     show_report_popup: bool = True           # "scene changed" popup after execution

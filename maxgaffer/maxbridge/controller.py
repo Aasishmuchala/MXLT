@@ -20,8 +20,8 @@ import subprocess
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
-from ..core import (consensus, critic, domeseed, feedback, metrics, omega, planner,
-                    prompts, rules, scenedigest, scenarios as scen)
+from ..core import (consensus, critic, domeseed, expose, feedback, metrics, omega,
+                    planner, prompts, rules, scenedigest, scenarios as scen)
 from ..core.director import Hooks, MatchConfig, MatchResult, run_match, run_sun_sweep
 from ..core.genome import LightingState
 from ..core.parse import ParseError, validate_analysis
@@ -498,15 +498,40 @@ class Controller:
                 log(line)
             draft_applied = df.pending_snapshot()
 
+        # software exposure: V-Ray GPU's exposure host is inert in the saved render, so
+        # apply the state's EV/WB to each loop frame in software before it's scored. The
+        # raw frame corresponds to the START exposure (base) — identity at ev==base_ev.
+        sw_expose = (bool(getattr(self.cfg, "software_exposure", False))
+                     and "exposure.ev" in start.values)
+        base_ev = start.get("exposure.ev", 0.0)
+        base_wb = start.get("exposure.wb_kelvin", 6500.0)
+        self._sw_state = start
+        self._sw_warned = False
+        if sw_expose:
+            log("software exposure ON — EV/WB applied to loop frames before scoring "
+                "(renderer-independent; V-Ray GPU's exposure is display-stage only)")
+
         def render_hook(tag: str):
             path = rd.render_frame(cam, os.path.join(run_dir, f"{tag}.png"),
                                    self.cfg.loop_width, self.cfg.loop_height)
+            if path and sw_expose:
+                st = getattr(self, "_sw_state", None) or start
+                if expose.expose_image_file(
+                        path, path, st.get("exposure.ev", base_ev), base_ev,
+                        st.get("exposure.wb_kelvin", base_wb), base_wb) is None \
+                        and not self._sw_warned:
+                    log("⚠ software exposure needs Pillow — loop frames left un-exposed")
+                    self._sw_warned = True
             if path:
                 log(f"THUMB::{path}")   # UI renders these markers as inline thumbnails
             return path
 
+        def apply_hook(st):
+            self._sw_state = st            # the frame render_hook is about to expose
+            self._apply_logged(rig, st, cam, log)
+
         hooks = Hooks(
-            apply=lambda st: self._apply_logged(rig, st, cam, log),
+            apply=apply_hook,
             render=render_hook,
             stats=self.stats_for,
             llm_deltas=self._llm_deltas_hook(ref_block),
