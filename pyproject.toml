@@ -1,6 +1,6 @@
 [project]
 name = "maxgaffer"
-version = "0.9.3"
+version = "0.9.4"
 description = "Reference-driven lighting matching for 3ds Max 2026 + V-Ray 7 + Chaos Vantage"
 requires-python = ">=3.11"
 

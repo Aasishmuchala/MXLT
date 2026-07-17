@@ -16,6 +16,12 @@ Target: **3ds Max 2026 (Py 3.11, PySide6) + V-Ray 7 + Chaos Vantage 3.x.** Inter
 pipeline tool, sibling of MaxDirector (same Omega gateway, same hexagon architecture, same
 key — borrowed automatically if MaxDirector is installed).
 
+![MaxGaffer dock](docs/ui/dock.png)
+
+*The dock (offscreen-rendered by `scripts/ui_preview.py` — regenerate after any UI change;
+the [scenario board](docs/ui/board.png), [change report](docs/ui/report.png),
+[plan preview](docs/ui/plan.png) and [settings](docs/ui/settings.png) render the same way).*
+
 ## Who does what (the split of powers)
 
 | Job | Owner | Why |

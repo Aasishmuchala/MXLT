@@ -23,58 +23,71 @@ from ..core.omega import OmegaError, ping
 from ..maxbridge import config as cfgmod
 from ..maxbridge.controller import Controller
 
-ACCENT = "#f2f2f2"          # monochrome: the only "color" is contrast
-BG = "#161616"
-PANEL = "#1b1b1b"
-INSET = "#131313"
-ERR = "#d9d9d9"
-OK = "#f2f2f2"
-DIM = "#8f8f8f"
-
-_RAISED = ("border-top:1px solid rgba(255,255,255,0.07);"
-           "border-left:1px solid rgba(255,255,255,0.04);"
-           "border-bottom:1px solid #060606;border-right:1px solid #0a0a0a;")
-_SUNK = ("border-top:1px solid #070707;border-left:1px solid #0a0a0a;"
-         "border-bottom:1px solid rgba(255,255,255,0.06);"
-         "border-right:1px solid rgba(255,255,255,0.04);")
+# Apple-dark design language (macOS system palette): flat surfaces, ONE hairline border
+# everywhere, ONE accent color, no shadows, no gradients — the layout does the talking.
+ACCENT = "#0a84ff"          # systemBlue (dark) — primary actions, selection, links. The
+                            # only color in the app; everything else is a gray.
+BG = "#1c1c1e"              # window
+PANEL = "#2c2c2e"           # cards
+INSET = "#1c1c1e"           # wells: inputs, thumbs, trees, transcript
+FILL = "#3a3a3c"            # neutral controls (buttons, popups)
+HAIR = "1px solid rgba(255,255,255,0.10)"
+TEXT = "#f2f2f7"
+DIM = "#98989d"             # secondary text / captions
+FAINT = "#636366"           # disabled / placeholders
+ERR = "#ff453a"             # systemRed (dark) — error emphasis only
+OK = "#f2f2f7"
 
 STYLE = (
-    f"QWidget{{background:{BG};color:#e8e8e8;font-family:Inter,'Segoe UI';font-size:13px;}}"
-    f"QFrame#card{{background:{PANEL};{_RAISED}border-radius:16px;}}"
-    f"QPushButton{{background:{PANEL};{_RAISED}border-radius:11px;padding:9px 14px;"
-    f"color:#dcdcdc;}}"
-    f"QPushButton:hover{{color:#ffffff;}}"
-    f"QPushButton:pressed{{background:{INSET};{_SUNK}}}"
-    f"QPushButton:disabled{{color:#5a5a5a;}}"
-    f"QPushButton#primary{{background:#f0f0f0;color:#111111;font-weight:600;"
-    f"letter-spacing:1px;border:1px solid #050505;min-height:24px;}}"
-    f"QPushButton#primary:pressed{{background:#cfcfcf;}}"
-    f"QPushButton#ghost{{background:transparent;border:none;color:{DIM};padding:6px 8px;}}"
-    f"QPushButton#ghost:hover{{color:#ffffff;}}"
-    f"QLineEdit,QComboBox,QTextEdit,QTreeWidget,QListWidget,QSpinBox,QDoubleSpinBox"
-    f"{{background:{INSET};{_SUNK}border-radius:10px;padding:6px;"
-    f"selection-background-color:#f0f0f0;selection-color:#111;}}"
-    f"QComboBox::drop-down{{border:none;width:22px;}}"
-    f"QComboBox QAbstractItemView{{background:{PANEL};color:#e8e8e8;"
-    f"selection-background-color:#f0f0f0;selection-color:#111;border:1px solid #0a0a0a;}}"
-    f"QMenu{{background:{PANEL};color:#e8e8e8;border:1px solid #0a0a0a;padding:6px;}}"
-    f"QMenu::item{{padding:6px 22px;border-radius:6px;}}"
-    f"QMenu::item:selected{{background:#f0f0f0;color:#111;}}"
+    f"QWidget{{background:{BG};color:{TEXT};font-family:'SF Pro Text','Segoe UI Variable',"
+    f"'Segoe UI',Inter;font-size:13px;}}"
+    f"QFrame#card{{background:{PANEL};border:{HAIR};border-radius:12px;}}"
+    f"QLabel{{background:transparent;}}"
+    f"QPushButton{{background:{FILL};border:none;border-radius:8px;padding:7px 14px;"
+    f"color:{TEXT};}}"
+    f"QPushButton::menu-indicator{{image:none;width:0;}}"
+    f"QPushButton:hover{{background:#48484a;}}"
+    f"QPushButton:pressed{{background:#2c2c2e;}}"
+    f"QPushButton:disabled{{background:#2c2c2e;color:{FAINT};}}"
+    f"QPushButton#primary{{background:{ACCENT};color:#ffffff;font-weight:600;}}"
+    f"QPushButton#primary:hover{{background:#2f95ff;}}"
+    f"QPushButton#primary:pressed{{background:#0774e8;}}"
+    f"QPushButton#primary:disabled{{background:#2c2c2e;color:{FAINT};}}"
+    f"QPushButton#ghost{{background:transparent;border:none;color:{ACCENT};"
+    f"padding:5px 8px;}}"
+    f"QPushButton#ghost:hover{{color:#66b3ff;}}"
+    f"QPushButton#ghost:pressed{{color:#0774e8;}}"
+    f"QLineEdit,QTextEdit,QPlainTextEdit,QSpinBox,QDoubleSpinBox{{background:{INSET};"
+    f"border:{HAIR};border-radius:8px;padding:5px 8px;"
+    f"selection-background-color:{ACCENT};selection-color:#ffffff;}}"
+    f"QComboBox{{background:{FILL};border:none;border-radius:8px;padding:6px 10px;}}"
+    f"QComboBox:hover{{background:#48484a;}}"
+    f"QComboBox::drop-down{{border:none;width:20px;}}"
+    f"QComboBox QLineEdit{{background:transparent;border:none;padding:0;}}"
+    f"QComboBox QAbstractItemView{{background:{PANEL};border:{HAIR};padding:4px;"
+    f"selection-background-color:{ACCENT};selection-color:#ffffff;}}"
+    f"QMenu{{background:{PANEL};border:{HAIR};border-radius:10px;padding:6px;}}"
+    f"QMenu::item{{padding:6px 24px;border-radius:6px;}}"
+    f"QMenu::item:selected{{background:{ACCENT};color:#ffffff;}}"
+    f"QTreeWidget,QListWidget{{background:{INSET};border:{HAIR};border-radius:10px;"
+    f"padding:4px;selection-background-color:{ACCENT};selection-color:#ffffff;}}"
     f"QLabel#dim{{color:{DIM};}}"
-    f"QLabel#h{{color:#f2f2f2;font-weight:600;letter-spacing:4px;}}"
-    f"QHeaderView::section{{background:{PANEL};color:{DIM};border:none;padding:5px 8px;}}"
-    f"QScrollBar:vertical{{background:transparent;width:10px;}}"
-    f"QScrollBar::handle:vertical{{background:#2a2a2a;border-radius:5px;min-height:30px;}}"
+    f"QLabel#h{{color:{TEXT};font-weight:600;letter-spacing:3px;}}"
+    f"QLabel#cap{{color:{DIM};font-size:11px;font-weight:600;letter-spacing:1px;}}"
+    f"QHeaderView::section{{background:transparent;color:{DIM};border:none;"
+    f"border-bottom:{HAIR};padding:5px 8px;font-size:11px;}}"
+    f"QScrollBar:vertical{{background:transparent;width:8px;margin:2px;}}"
+    f"QScrollBar::handle:vertical{{background:#48484a;border-radius:4px;min-height:30px;}}"
     f"QScrollBar::add-line,QScrollBar::sub-line{{height:0;}}"
+    f"QToolTip{{background:{PANEL};color:{TEXT};border:{HAIR};padding:5px;}}"
 )
 
 
-def _shadow(widget, blur=26, dy=7):
-    eff = QtWidgets.QGraphicsDropShadowEffect(widget)
-    eff.setBlurRadius(blur)
-    eff.setOffset(0, dy)
-    eff.setColor(QtGui.QColor(0, 0, 0, 160))
-    widget.setGraphicsEffect(eff)
+def _cap(text: str) -> QtWidgets.QLabel:
+    """Section caption — the one place small-caps styling lives."""
+    lbl = QtWidgets.QLabel(text)
+    lbl.setObjectName("cap")
+    return lbl
 
 
 class _Worker(QtCore.QThread):
@@ -132,7 +145,6 @@ class MaxGafferDock(QtWidgets.QWidget):
     def _card(self, parent_layout):
         f = QtWidgets.QFrame()
         f.setObjectName("card")
-        _shadow(f)
         lay = QtWidgets.QVBoxLayout(f)
         lay.setContentsMargins(16, 14, 16, 14)
         lay.setSpacing(10)
@@ -182,15 +194,14 @@ class MaxGafferDock(QtWidgets.QWidget):
 
         def _thumb(placeholder, cap):
             wrap = QtWidgets.QVBoxLayout()
+            wrap.setSpacing(6)
             t = QtWidgets.QLabel(placeholder)
             t.setFixedSize(272, 153)
             t.setAlignment(QtCore.Qt.AlignCenter)
-            t.setStyleSheet(f"background:{INSET};{_SUNK}border-radius:12px;color:#5a5a5a;")
+            t.setStyleSheet(f"background:{INSET};border:{HAIR};border-radius:10px;"
+                            f"color:{FAINT};")
             wrap.addWidget(t)
-            c = QtWidgets.QLabel(cap)
-            c.setObjectName("dim")
-            c.setStyleSheet(f"color:{DIM};font-size:10px;letter-spacing:3px;")
-            wrap.addWidget(c, 0, QtCore.Qt.AlignHCenter)
+            wrap.addWidget(_cap(cap), 0, QtCore.Qt.AlignHCenter)
             thumbs.addLayout(wrap)
             return t
 
@@ -278,9 +289,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         # ---- card: CHANGES (the record) + collapsed transcript
         lc = self._card(col)
         crow = QtWidgets.QHBoxLayout()
-        cap = QtWidgets.QLabel("CHANGES")
-        cap.setStyleSheet(f"color:{DIM};font-size:10px;letter-spacing:3px;")
-        crow.addWidget(cap)
+        crow.addWidget(_cap("CHANGES"))
         crow.addStretch(1)
         for label, slot, tip in (("A/B", self._ab_flip, "Flip pre-match ↔ matched."),
                                  ("Restore", self._restore_pre_match,
@@ -333,9 +342,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         # ---- card: rig
         lg = self._card(col)
         grow = QtWidgets.QHBoxLayout()
-        gcap = QtWidgets.QLabel("RIG")
-        gcap.setStyleSheet(f"color:{DIM};font-size:10px;letter-spacing:3px;")
-        grow.addWidget(gcap)
+        grow.addWidget(_cap("RIG"))
         grow.addStretch(1)
         for label, slot in (("Read scene", self.rebuild_rig_controls),
                             ("HDRI…", self._pick_hdri),
@@ -356,9 +363,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         lo = self._card(col)
         orow = QtWidgets.QHBoxLayout()
         orow.setSpacing(10)
-        ocap = QtWidgets.QLabel("OUTPUT")
-        ocap.setStyleSheet(f"color:{DIM};font-size:10px;letter-spacing:3px;")
-        orow.addWidget(ocap)
+        orow.addWidget(_cap("OUTPUT"))
         btn_link = QtWidgets.QPushButton("Live link")
         btn_link.setToolTip("V-Ray's 'Initiate a Live-Link to Chaos Vantage' — a toggle; "
                             "starts Vantage if needed (port 20701).")
@@ -1000,9 +1005,10 @@ class ScenarioBoardDialog(QtWidgets.QDialog):
                     btn.setIcon(QtGui.QIcon(pix))
                     btn.setIconSize(QtCore.QSize(240, 135))
             btn.setStyleSheet(
-                f"QToolButton{{background:{PANEL};{_RAISED}border-radius:12px;"
-                f"padding:10px;color:#dcdcdc;}}"
-                f"QToolButton:checked{{background:#f0f0f0;color:#111111;}}")
+                f"QToolButton{{background:{INSET};border:{HAIR};border-radius:12px;"
+                f"padding:10px;color:{TEXT};}}"
+                f"QToolButton:checked{{border:2px solid {ACCENT};"
+                f"background:rgba(10,132,255,0.12);}}")
             btn.clicked.connect(lambda _=False, idx=i: setattr(self, "chosen", idx))
             grid.addWidget(btn, i // 3, i % 3)
             self._cards.append(btn)
