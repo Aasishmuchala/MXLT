@@ -463,8 +463,15 @@ class Controller:
 
         ref_stats = self.ref_stats(e.reference)
         if ref_stats is None:
-            log("⚠ reference stats unavailable (install Pillow or set system_python) — "
-                "running LLM-visual mode")
+            # distinguish the real cause: a MISSING/unreadable file (ref_stats getmtime
+            # raised OSError) is not a stats-engine problem — telling the user to install
+            # Pillow when their reference path is simply wrong sends them down a dead end
+            if not os.path.exists(e.reference):
+                log(f"⚠ reference file not found: {e.reference} — the analytic EV/WB "
+                    "solver is OFF; re-bind via Load reference…. Running LLM-visual mode")
+            else:
+                log("⚠ reference unreadable by the stats engine (install Pillow or set "
+                    "system_python) — analytic EV/WB solver OFF, LLM-visual mode")
         ref_block = self._image_block(e.reference)
         if ref_block is None and not getattr(self.cfg, "no_renders", False):
             raise RuntimeError("reference image could not be prepared for the LLM")

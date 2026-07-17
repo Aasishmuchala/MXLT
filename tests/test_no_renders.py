@@ -83,6 +83,29 @@ def test_probe_score_refuses(ctrl):
     assert ctrl.probe_score("CamA", "preplan") is None
 
 
+def test_missing_reference_diagnosed_as_missing_not_pillow(ctrl):
+    """A reference path with no file behind it must say 'not found', NOT 'install
+    Pillow' — the exact misdiagnosis that hid the analytic solver being off."""
+    ctrl.session.entry("CamA").reference = r"C:\nope\ghost_reference.jpg"
+    logs = []
+    ctrl.run_match("CamA", logs.append)
+    joined = "\n".join(logs)
+    assert "reference file not found" in joined
+    assert "install Pillow" not in joined
+
+
+def test_present_but_unreadable_reference_points_at_stats_engine(ctrl, tmp_path):
+    """A reference that EXISTS but yields no stats is the real 'install Pillow' case."""
+    ref = tmp_path / "real_but_unreadable.jpg"
+    ref.write_bytes(b"not actually a decodable image")
+    ctrl.session.entry("CamA").reference = str(ref)
+    logs = []
+    ctrl.run_match("CamA", logs.append)
+    joined = "\n".join(logs)
+    assert "unreadable by the stats engine" in joined
+    assert "not found" not in joined
+
+
 def test_refine_applies_note_nudges_only(ctrl):
     ctrl.session.entry("CamA").reference = "ref.jpg"
     logs = []
