@@ -60,7 +60,9 @@ def _find_exposure_control():
     rt = _rt()
     try:
         ec = rt.SceneExposureControl.exposureControl
-        if ec is not None and "vray" in str(rt.classOf(ec)).lower():
+        # class names carry underscores on real boxes (the renderer is
+        # V_Ray_GPU_7__update_2_hotfix_2) — normalize before matching
+        if ec is not None and "vray" in str(rt.classOf(ec)).lower().replace("_", ""):
             return ec
     except Exception:
         pass

@@ -109,3 +109,27 @@ def test_finals_refuse(ctrl, tmp_path):
     assert out == {"CamA": "skipped (no-render mode)",
                    "CamB": "skipped (no-render mode)"}
     assert not (tmp_path / "out").exists()
+
+
+def test_vantage_cli_finals_refuse(ctrl, monkeypatch):
+    monkeypatch.setattr(
+        ctl.vt, "render_stills",
+        lambda *a, **k: pytest.fail("vantage CLI render fired in no-render mode"))
+    jobs = [{"camera": "CamA", "scene_file": "a.vrscene", "output": "a.png"}]
+    assert ctrl.run_vantage_jobs(jobs, lambda n, s: None) == {
+        "CamA": "skipped (no-render mode)"}
+
+
+def test_refine_after_match_reports_only_the_note(ctrl):
+    """A 2nd exploration must resnapshot pre_match: the change report shows ONLY this
+    refine's nudge, and Restore returns to the state right before it — not to the
+    original pre-match light with the whole MATCH lumped in."""
+    ctrl.session.entry("CamA").reference = "ref.jpg"
+    ctrl.run_match("CamA", lambda ln: None)          # exploration 1: first guess
+    m1 = ctrl.session.cameras["CamA"].state.copy()
+    logs = []
+    ctrl.refine("CamA", "exposure is too much", logs.append)
+    e = ctrl.session.cameras["CamA"]
+    assert not e.pre_match.diff(m1)                  # snapshot = state before THIS refine
+    applied = [ln for ln in logs if ln.startswith("applied:")]
+    assert len(applied) == 1 and "exposure.ev" in applied[0]

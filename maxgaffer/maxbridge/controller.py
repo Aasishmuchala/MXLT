@@ -643,8 +643,10 @@ class Controller:
             if not applied:
                 log("note matched no craft-table nudge — nothing to apply (the LLM "
                     "ensemble that would interpret it needs probe renders)")
-            if e.pre_match is None:
-                e.pre_match = ap.read_state(rig, self._baselines, cam)
+            # fresh snapshot EVERY refine (run_match's convention): Restore must return
+            # to the light before THIS note, and the change report must show only it —
+            # a kept older snapshot would report the whole match+refine cumulatively
+            e.pre_match = ap.read_state(rig, self._baselines, cam)
             return self._apply_only(camera_name, e, rig, cam, state0, run_dir,
                                     semantics, log)
 
@@ -1022,6 +1024,11 @@ class Controller:
     def run_vantage_jobs(self, jobs: List[Dict],
                          on_progress: Callable[[str, str], None]) -> Dict[str, str]:
         """LEGACY (Developer-Edition CLI only) — pure subprocess, worker-thread safe."""
+        if getattr(self.cfg, "no_renders", False):
+            for job in jobs:
+                on_progress(job.get("camera", ""),
+                            "skipped — no-render mode is ON (Settings)")
+            return {job.get("camera", ""): "skipped (no-render mode)" for job in jobs}
         return vt.render_stills(jobs, self.cfg.vantage_console,
                                 self.cfg.final_width, self.cfg.final_height, on_progress)
 
