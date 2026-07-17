@@ -80,7 +80,8 @@ def main():
             from pymxs import runtime as rt
 
             r = str(rt.classOf(rt.renderers.current))
-            if "vray" not in r.lower():
+            # class names carry underscores on real boxes (V_Ray_GPU_7__update_2_hotfix_2)
+            if "vray" not in r.lower().replace("_", ""):
                 raise RuntimeError(f"current renderer is {r} — set V-Ray")
             return r
 

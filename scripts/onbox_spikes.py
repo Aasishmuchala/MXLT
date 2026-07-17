@@ -70,7 +70,8 @@ def main():
     # ---------- A environment
     check("A", "V-Ray is the active renderer", lambda: (
         str(rt.classOf(rt.renderers.current)) if "vray" in
-        str(rt.classOf(rt.renderers.current)).lower() else (_ for _ in ()).throw(
+        str(rt.classOf(rt.renderers.current)).lower().replace("_", "")
+        else (_ for _ in ()).throw(
             RuntimeError(f"renderer is {rt.classOf(rt.renderers.current)}"))))
 
     # ---------- B cameras
