@@ -55,10 +55,24 @@ class Controller:
         # pure-I/O runner — the UI swaps in a worker-thread pump so gateway waits never
         # freeze Max; pymxs is NEVER called through this (network/subprocess only)
         self.io: Callable = lambda fn: fn()
+        self._session_gen = sc.scene_generation()
+        sc.register_scene_callbacks()
 
     # ------------------------------------------------------------------ scene / session
+    def _bust_stale_caches(self) -> None:
+        """File new/reset/open invalidates every per-scene cache — the path-keyed check
+        alone can't see a change between two UNSAVED scenes (both path '')."""
+        gen = sc.scene_generation()
+        if gen != self._session_gen:
+            self._session_gen = gen
+            self._session = None
+            self._session_scene = None
+            self._rig = None
+            self._baselines = {}
+
     @property
     def session(self) -> Session:
+        self._bust_stale_caches()
         scene = sc.scene_path()
         if self._session is None or scene != self._session_scene:
             self._session = Session.load(sidecar_path(scene))
@@ -70,6 +84,7 @@ class Controller:
         return self.session.save()
 
     def rig(self, refresh: bool = False):
+        self._bust_stale_caches()
         if self._rig is None or refresh:
             self._rig = sc.classify_rig()
             # adopt-only-new into the session: re-scans NEVER overwrite a known baseline,
@@ -356,6 +371,84 @@ class Controller:
             log("plan rejected: " + r)
         return ops, planner.describe_plan(ops), meta, raw
 
+    # ------------------------------------------------------------- exposed renders
+    def _exposure_anchor(self, entry) -> Tuple[float, float]:
+        """The (ev, wb) the RAW render buffer corresponds to under software exposure —
+        anchored at the camera's ``pre_match`` snapshot, the one state every
+        exploration records before touching anything. Loop frames, board probes, plan
+        probes, refine branches and FINALS all expose relative to this same basis, so
+        their pixels stay mutually consistent AND the finals reproduce the exact
+        exposure the accepted match iteration showed."""
+        base_ev, base_wb = 10.0, 6500.0
+        pre = getattr(entry, "pre_match", None) if entry is not None else None
+        if pre is not None:
+            base_ev = pre.get("exposure.ev", base_ev)
+            base_wb = pre.get("exposure.wb_kelvin", base_wb)
+        return base_ev, base_wb
+
+    def _render_exposed(self, cam, out_path: str, w: int, h: int, state=None,
+                        entry=None, log: Optional[Callable[[str], None]] = None):
+        """``render_frame`` + software exposure when enabled — the ONE render path
+        every probe/loop/board/final goes through, so the EV/WB the plugin sets always
+        reach the scored (and delivered) pixels, even on renderers whose exposure host
+        is display-stage only (V-Ray GPU)."""
+        path = rd.render_frame(cam, out_path, w, h)
+        if not path or not getattr(self.cfg, "software_exposure", False):
+            return path
+        st = state
+        if st is None:
+            try:
+                st = ap.read_state(self.rig(), self._baselines, cam)
+            except Exception:
+                st = None
+        if st is None or "exposure.ev" not in st.values:
+            return path
+        base_ev, base_wb = self._exposure_anchor(entry)
+        if expose.expose_image_file(
+                path, path, st.get("exposure.ev", base_ev), base_ev,
+                st.get("exposure.wb_kelvin", base_wb), base_wb) is None \
+                and not getattr(self, "_sw_warned", False):
+            if log:
+                log("⚠ software exposure needs Pillow — frame left un-exposed")
+            self._sw_warned = True
+        return path
+
+    def _verify_exposure_host(self, cam, run_dir: str,
+                              log: Callable[[str], None]) -> None:
+        """One-time (per Controller) MEASUREMENT: does the renderer bake EV into the
+        saved buffer? Two tiny probes 2 EV apart must move the key ~2 stops; if it
+        barely moves, the host is display-stage only (measured on-box for V-Ray GPU)
+        and software exposure is switched on for the session, loudly."""
+        if getattr(self, "_exposure_host_checked", False) \
+                or getattr(self.cfg, "software_exposure", False) \
+                or getattr(self.cfg, "no_renders", False):
+            return
+        self._exposure_host_checked = True
+        from .exposure import ExposureHost
+
+        host = ExposureHost(cam)
+        ev0 = host.read_ev()
+        if ev0 is None:
+            return
+        try:
+            p1 = rd.render_frame(cam, os.path.join(run_dir, "evcheck_a.png"), 160, 90)
+            s1 = metrics.compute_stats(p1) if p1 else None
+            host.write_ev(ev0 + 2.0)
+            p2 = rd.render_frame(cam, os.path.join(run_dir, "evcheck_b.png"), 160, 90)
+            s2 = metrics.compute_stats(p2) if p2 else None
+        finally:
+            host.write_ev(ev0)
+        if not (s1 and s2):
+            return
+        import math
+
+        moved = abs(math.log2(max(1e-5, s1["log_key"]) / max(1e-5, s2["log_key"])))
+        if moved < 1.0:      # expected ~2 stops; under half = EV not reaching pixels
+            self.cfg.software_exposure = True
+            log(f"⚠ measured: +2 EV moved the render only {moved:.2f} stops — this "
+                "renderer's exposure is display-stage only. Software exposure ON for "
+                "this session (turn it on in Settings to persist).")
+
     def probe_score(self, camera_name: str, tag: str) -> Optional[float]:
         """One loop-res render of the current scene scored against the camera's reference
         — the cheap 'did that help?' measurement."""
@@ -368,9 +461,9 @@ class Controller:
         cam = sc.get_camera(camera_name)
         if ref is None or cam is None:
             return None
-        path = rd.render_frame(
+        path = self._render_exposed(
             cam, os.path.join(self._ensure_run_dir(_safe(camera_name)), f"probe_{tag}.png"),
-            self.cfg.loop_width, self.cfg.loop_height)
+            self.cfg.loop_width, self.cfg.loop_height, entry=e)
         cur = self.stats_for(path) if path else None
         if cur is None:
             return None
@@ -474,6 +567,9 @@ class Controller:
                     "system_python) — analytic EV/WB solver OFF, LLM-visual mode")
         ref_block = self._image_block(e.reference)
         if ref_block is None and not getattr(self.cfg, "no_renders", False):
+            if not os.path.exists(e.reference):
+                raise RuntimeError(f"reference file not found: {e.reference} — "
+                                   "re-bind it via Load reference…")
             raise RuntimeError("reference image could not be prepared for the LLM")
 
         if start_override is not None:
@@ -498,30 +594,26 @@ class Controller:
                 log(line)
             draft_applied = df.pending_snapshot()
 
-        # software exposure: V-Ray GPU's exposure host is inert in the saved render, so
-        # apply the state's EV/WB to each loop frame in software before it's scored. The
-        # raw frame corresponds to the START exposure (base) — identity at ev==base_ev.
-        sw_expose = (bool(getattr(self.cfg, "software_exposure", False))
-                     and "exposure.ev" in start.values)
-        base_ev = start.get("exposure.ev", 0.0)
-        base_wb = start.get("exposure.wb_kelvin", 6500.0)
+        # exposure-host reality check (2 tiny probes, once per session): flips
+        # software_exposure ON automatically when the renderer provably doesn't bake
+        # EV into the saved buffer — nobody should need to know the config flag exists
+        self._verify_exposure_host(cam, run_dir, log)
+
+        # software exposure: apply the just-applied state's EV/WB to each loop frame
+        # before it's scored, anchored at the camera's pre_match snapshot (the same
+        # anchor probes/board/finals use, so all exposed pixels stay consistent)
         self._sw_state = start
         self._sw_warned = False
-        if sw_expose:
+        if getattr(self.cfg, "software_exposure", False) \
+                and "exposure.ev" in start.values:
             log("software exposure ON — EV/WB applied to loop frames before scoring "
                 "(renderer-independent; V-Ray GPU's exposure is display-stage only)")
 
         def render_hook(tag: str):
-            path = rd.render_frame(cam, os.path.join(run_dir, f"{tag}.png"),
-                                   self.cfg.loop_width, self.cfg.loop_height)
-            if path and sw_expose:
-                st = getattr(self, "_sw_state", None) or start
-                if expose.expose_image_file(
-                        path, path, st.get("exposure.ev", base_ev), base_ev,
-                        st.get("exposure.wb_kelvin", base_wb), base_wb) is None \
-                        and not self._sw_warned:
-                    log("⚠ software exposure needs Pillow — loop frames left un-exposed")
-                    self._sw_warned = True
+            path = self._render_exposed(
+                cam, os.path.join(run_dir, f"{tag}.png"),
+                self.cfg.loop_width, self.cfg.loop_height,
+                state=getattr(self, "_sw_state", None) or start, entry=e, log=log)
             if path:
                 log(f"THUMB::{path}")   # UI renders these markers as inline thumbnails
             return path
@@ -596,9 +688,13 @@ class Controller:
         log(f"match finished: {result.stop_reason}, best score {score_txt} "
             f"({len(result.iterations)} iterations)")
         if result.polish_probes:
+            tail = ""
+            if getattr(result, "ceiling_proven", False):
+                tail = " · CEILING PROVEN (no fine move improves)"
+            elif result.ceiling_converged:
+                tail = " · plateau (finer steps untested)"
             log(f"polish: +{result.polish_gain:.2f} over {result.polish_probes} probes"
-                + (" · CEILING PROVEN (no fine move improves)"
-                   if result.ceiling_converged else ""))
+                + tail)
         return result
 
     def _apply_only(self, camera_name: str, e, rig, cam, start: LightingState,
@@ -662,6 +758,9 @@ class Controller:
         ref_stats = self.ref_stats(e.reference)
         ref_block = self._image_block(e.reference)
         if ref_block is None and not getattr(self.cfg, "no_renders", False):
+            if not os.path.exists(e.reference):
+                raise RuntimeError(f"reference file not found: {e.reference} — "
+                                   "re-bind it via Load reference…")
             raise RuntimeError("reference image could not be prepared for the LLM")
 
         base = (e.state.copy() if e.state is not None
@@ -682,10 +781,17 @@ class Controller:
             return self._apply_only(camera_name, e, rig, cam, state0, run_dir,
                                     semantics, log)
 
+        # every branch probe exposes against the same pre-refine anchor, so a
+        # note-only EV/WB nudge is VISIBLE to the ensemble scoring (it wasn't when
+        # probes rendered raw — the user's "darker" branch could silently lose)
+        if e.pre_match is None:
+            e.pre_match = ap.read_state(rig, self._baselines, cam)
+
         def probe(st: LightingState, tag: str):
             self._apply_logged(rig, st, cam, log)
-            path = rd.render_frame(cam, os.path.join(run_dir, f"{tag}.png"),
-                                   self.cfg.loop_width, self.cfg.loop_height)
+            path = self._render_exposed(cam, os.path.join(run_dir, f"{tag}.png"),
+                                        self.cfg.loop_width, self.cfg.loop_height,
+                                        state=st, entry=e, log=log)
             stats = self.stats_for(path) if path else None
             if stats is None or ref_stats is None:
                 return None, path
@@ -697,7 +803,7 @@ class Controller:
             else "branch note-only: unscored")
         branches = [("note-only", state0, score0)]
         render0_block = self._image_block(path0) if path0 else None
-        from ..core.genome import apply_changes, state_table
+        from ..core.genome import apply_changes, rig_keys, state_table
         from ..core.parse import validate_deltas
 
         for lens_name, lens_line in feedback.LENSES:
@@ -720,7 +826,7 @@ class Controller:
                 log(f"lens {lens_name}: unusable ({err})")
                 continue
             cand, accepted, _rej = apply_changes(state0, proposal["changes"], e.locks,
-                                                 limit=True)
+                                                 limit=True, known=rig_keys(state0))
             if not accepted:
                 log(f"lens {lens_name}: no valid changes")
                 continue
@@ -814,9 +920,10 @@ class Controller:
                 log("scenario board cancelled")
                 break
             self._apply_logged(rig, cand["state"], cam, log)
-            path = rd.render_frame(
+            path = self._render_exposed(
                 cam, os.path.join(run_dir, f"scen_{cand['key']}.png"),
-                self.cfg.loop_width, self.cfg.loop_height)
+                self.cfg.loop_width, self.cfg.loop_height,
+                state=cand["state"], entry=e, log=log)
             score = None
             if path:
                 log(f"THUMB::{path}")
@@ -1091,8 +1198,12 @@ class Controller:
                 on_progress(name, results[name])
                 continue
             on_progress(name, f"rendering {self.cfg.final_width}×{self.cfg.final_height} (V-Ray)")
-            out = rd.render_frame(cam, os.path.join(out_dir, f"{_safe(name)}.png"),
-                                  self.cfg.final_width, self.cfg.final_height)
+            # finals go through the SAME exposed path as the loop, anchored at this
+            # camera's pre_match — the delivered PNG carries the exposure the accepted
+            # match iteration showed, even on display-stage-exposure renderers
+            out = self._render_exposed(cam, os.path.join(out_dir, f"{_safe(name)}.png"),
+                                       self.cfg.final_width, self.cfg.final_height,
+                                       state=(e.state if e else None), entry=e)
             results[name] = "ok" if out else "render failed"
             on_progress(name, results[name])
         return results

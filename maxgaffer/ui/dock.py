@@ -755,8 +755,12 @@ class MaxGafferDock(QtWidgets.QWidget):
                 do_sweep=self.act_sweep.isChecked(),
                 deep=(mode == 1))
             score = f"{result.best_score:.1f}" if result.best_score is not None else "n/a"
-            ceiling = (" · ceiling proven — the gap left is content, not lighting"
-                       if result.ceiling_converged and (result.best_score or 0) < 99 else "")
+            ceiling = ""
+            if (result.best_score or 0) < 99:
+                if getattr(result, "ceiling_proven", False):
+                    ceiling = " · ceiling proven — the gap left is content, not lighting"
+                elif result.ceiling_converged:
+                    ceiling = " · plateau (finer steps untested — not a proven ceiling)"
             self._log(f"✓ done ({result.stop_reason}) — best {score}{ceiling}")
             self._set_match_thumb(result.best_render)
             headline = f"{cam} — {result.stop_reason}, score {score}"
@@ -853,8 +857,12 @@ class MaxGafferDock(QtWidgets.QWidget):
             result = self.ctrl.refine(cam, note, log=self._log,
                                       should_cancel=lambda: self._cancel)
             score = f"{result.best_score:.1f}" if result.best_score is not None else "n/a"
-            ceiling = (" · ceiling proven — the gap left is content, not lighting"
-                       if result.ceiling_converged and (result.best_score or 0) < 99 else "")
+            ceiling = ""
+            if (result.best_score or 0) < 99:
+                if getattr(result, "ceiling_proven", False):
+                    ceiling = " · ceiling proven — the gap left is content, not lighting"
+                elif result.ceiling_converged:
+                    ceiling = " · plateau (finer steps untested — not a proven ceiling)"
             self._log(f"✓ refine done ({result.stop_reason}) — best {score}{ceiling}")
             self._set_match_thumb(result.best_render)
             headline = f"{cam} — refined to {score}"
@@ -918,6 +926,9 @@ class MaxGafferDock(QtWidgets.QWidget):
                 else self.ctrl.session.cameras_with_states())
         return [c for c in cams if c]
 
+    def _on_vantage_progress(self, cam: str, status: str):
+        self._log(f"vantage {cam}: {status}")
+
     def _render_finals(self, selected_only: bool):
         if self._busy:
             return
@@ -935,7 +946,11 @@ class MaxGafferDock(QtWidgets.QWidget):
                 jobs = self.ctrl.prepare_vantage_jobs(
                     cams, out_dir, on_progress=lambda c, s: self._log(f"vantage {c}: {s}"))
                 relay = _ProgressRelay()
-                relay.progress.connect(lambda c, s: self._log(f"vantage {c}: {s}"))
+                # bound slot, NOT a lambda: Qt can only marshal the signal onto the
+                # main thread when the receiver is a QObject with thread affinity —
+                # a lambda resolves to DirectConnection and _log would run on the
+                # vantage watcher thread (exactly what _ProgressRelay exists to stop)
+                relay.progress.connect(self._on_vantage_progress)
                 results = self._run_blocking_io(
                     lambda: self.ctrl.run_vantage_jobs(
                         jobs, on_progress=lambda c, s: relay.progress.emit(c, s)))
@@ -1185,6 +1200,17 @@ class SettingsDialog(QtWidgets.QDialog):
             "apply settings only — never render (loop, sweep, board probes, finals off)")
         self.cb_norender.setChecked(bool(getattr(cfg, "no_renders", False)))
         form.addRow("no-render mode", self.cb_norender)
+        self.cb_swexpose = QtWidgets.QCheckBox(
+            "apply EV/WB to frames in software (auto-detected; needed on V-Ray GPU)")
+        self.cb_swexpose.setChecked(bool(getattr(cfg, "software_exposure", False)))
+        form.addRow("software exposure", self.cb_swexpose)
+        self.cmb_backend = QtWidgets.QComboBox()
+        self.cmb_backend.addItems(["vray", "vantage_cli"])
+        self.cmb_backend.setCurrentText(
+            getattr(cfg, "final_render_backend", "vray") or "vray")
+        form.addRow("finals backend", self.cmb_backend)
+        self.ed_vantage_exe = QtWidgets.QLineEdit(getattr(cfg, "vantage_exe", ""))
+        form.addRow("vantage.exe", self.ed_vantage_exe)
         self.lbl_status = QtWidgets.QLabel("")
         self.lbl_status.setObjectName("dim")
         form.addRow(self.lbl_status)
@@ -1222,6 +1248,9 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cfg.max_iterations = int(self.sp_iters.value())
         self.cfg.target_score = float(self.sp_target.value())
         self.cfg.no_renders = bool(self.cb_norender.isChecked())
+        self.cfg.software_exposure = bool(self.cb_swexpose.isChecked())
+        self.cfg.final_render_backend = self.cmb_backend.currentText() or "vray"
+        self.cfg.vantage_exe = self.ed_vantage_exe.text().strip()
         self.accept()
 
 

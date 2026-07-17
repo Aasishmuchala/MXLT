@@ -165,16 +165,26 @@ class LightingState:
         return out
 
 
+def rig_keys(state: LightingState) -> set:
+    """The capability set of the rig ``state`` was read from — the ONLY keys a
+    proposal may touch. ``group.*`` names come from the rig's real layer groups."""
+    return set(state.values) | {GROUP_PREFIX + g for g in state.groups}
+
+
 def apply_changes(
     state: LightingState,
     changes: Dict[str, float],
     locks: Optional[set] = None,
     limit: bool = True,
     step_scale: float = 1.0,
+    known: Optional[set] = None,
 ) -> Tuple[LightingState, Dict[str, float], List[str]]:
     """Validated apply: returns (new_state, accepted{key: value}, rejected[reason...]).
     Unknown keys are dropped, locked keys refused, bounds clamped, steps limited
-    (``step_scale`` anneals the per-iteration budget)."""
+    (``step_scale`` anneals the per-iteration budget). ``known`` (usually
+    ``rig_keys(state)``) rejects genome-valid keys the RIG doesn't have — without it
+    a hallucinated ``dome.*``/``group.*`` on a rig that lacks them would be fabricated
+    at the spec's lower bound and persist into the session as a phantom parameter."""
     locks = locks or set()
     new = state.copy()
     accepted: Dict[str, float] = {}
@@ -183,6 +193,9 @@ def apply_changes(
         spec = spec_for(key)
         if spec is None:
             rejected.append(f"{key}: unknown parameter")
+            continue
+        if known is not None and key not in known:
+            rejected.append(f"{key}: rig has no such parameter")
             continue
         if key in locks:
             rejected.append(f"{key}: locked by user")

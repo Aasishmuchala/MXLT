@@ -25,9 +25,11 @@ def _rt():
 def render_frame(camera, out_path: str, width: int, height: int) -> Optional[str]:
     """One still through the CURRENT renderer at the given size. Returns path or None."""
     rt = _rt()
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     old_w, old_h = None, None
     try:
+        # inside the try: a path-length/permission failure here must degrade to the
+        # same None every other failure mode returns, not raise through the loop
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         try:
             rt.renderSceneDialog.close()   # open dialog blocks programmatic size changes
         except Exception:

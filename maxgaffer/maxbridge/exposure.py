@@ -57,8 +57,8 @@ def _rt():
 
 
 def _find_exposure_control():
-    rt = _rt()
     try:
+        rt = _rt()      # inside the try — ExposureHost must be constructible off-Max
         ec = rt.SceneExposureControl.exposureControl
         # class names carry underscores on real boxes (the renderer is
         # V_Ray_GPU_7__update_2_hotfix_2) — normalize before matching

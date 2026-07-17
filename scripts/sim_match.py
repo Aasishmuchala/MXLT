@@ -300,7 +300,8 @@ def main() -> int:
           f"error {az_err:.0f}°)")
     if result.polish_probes:
         print(f"polish:  +{result.polish_gain:.2f} over {result.polish_probes} probes"
-              + (" · ceiling proven" if result.ceiling_converged else ""))
+              + (" · ceiling proven" if getattr(result, "ceiling_proven", False)
+                 else (" · plateau" if result.ceiling_converged else "")))
     ok = phase_a_ok and phase_c_ok
     print("\nOVERALL:", "PASS ✓ (phases A + C asserted)" if ok else "FAIL ✗")
     return 0 if ok else 1

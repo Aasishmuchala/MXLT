@@ -66,7 +66,9 @@ def read_png_rgb(path: str, max_dim: int = 160) -> Optional[List[List[Tuple[int,
 
     # subsample factor before unfiltering rows we keep — but filters reference the PREVIOUS
     # row, so every row must still be unfiltered in order; we just skip the pixel extraction.
-    step = max(1, max(width, height) // max_dim)
+    # ceil-divide: floor made 480//256 == 1, so the 256..511px band (the DEFAULT loop
+    # render width!) processed every pixel and the "at most max_dim" contract was a lie
+    step = max(1, -(-max(width, height) // max_dim))
     rows: List[List[Tuple[int, int, int]]] = []
     prev = bytearray(stride)
     offset = 0

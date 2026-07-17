@@ -150,13 +150,29 @@ def _apply_inner(rig, baselines, state: LightingState, camera, warnings: List[st
             how = sc.write_dome_rotation(dome, state.get("dome.rotation_deg"))
             if how == "failed":
                 warnings.append("dome.rotation_deg: could not rotate texmap or node")
+    elif any(k.startswith("dome.") for k in state.values):
+        # same contract as the sun branch — an orphaned saved state (dome deleted
+        # or replaced since the match) must never be dropped silently
+        warnings.append("state has dome.* but the rig has no dome light")
 
+    rig_groups = rig.get("groups") or {}
     for group, factor in state.groups.items():
-        for lt in (rig.get("groups") or {}).get(group, []):
+        lights = rig_groups.get(group, [])
+        if not lights:
+            warnings.append(f"group.{group}: no such light group in this rig "
+                            "(layer renamed or lights removed?) — value dropped")
+            continue
+        lit = 0
+        for lt in lights:
+            if bool(sc.get_prop(lt, sc.LIGHT_ON)):
+                lit += 1
             base = baselines.get(_light_name(lt), 1.0)
             if sc.set_prop(lt, sc.LIGHT_MULT, float(base) * float(factor)) is None:
                 warnings.append(f"group.{group}: light '{getattr(lt, 'name', '?')}' "
                                 "has no multiplier")
+        if lit == 0 and float(factor) > 1e-6:
+            warnings.append(f"group.{group}: all {len(lights)} light(s) are DISABLED — "
+                            "the dimmer moves nothing until they're switched on")
 
     host = ExposureHost(camera)
     if "exposure.ev" in state.values:

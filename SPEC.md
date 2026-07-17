@@ -3,7 +3,7 @@
 **Owner:** Aasish Muchala · **Type:** internal Sthyra pipeline tool (not sold) ·
 **Target:** 3ds Max 2026 (Py 3.11, PySide6) + V-Ray 7 + Chaos Vantage 3.x ·
 **Sibling of:** MaxDirector (same Omega gateway, same hexagon, key borrowed automatically) ·
-**Status:** v0.8.0 CONVERSATION 2026-07-16 · refine ensemble + premium UI · · 114 tests · live benchmark: Phase C 99.14 ASSERTED (deterministic legs from basin) · Phase B full live pipeline 98.25, az error 4° · stack doc-verified ·
+**Status:** v0.9.7 SOFTWARE EXPOSURE 2026-07-18 · renderer-independent EV/WB (auto-detected inert hosts) + no-render mode + stress-audit hardening · tests: run `pytest tests -q` for the live count (170+) · live benchmark: Phase C 99.14 ASSERTED (deterministic legs from basin) · Phase B full live pipeline 95.95 (EV landed exactly, ceiling proven) · on-box recovery: EV err 0.00, score 30.6→98.3 ·
 awaiting on-box bring-up (tasks/plan.md P0).
 
 ## 1. Summary
@@ -65,7 +65,8 @@ maxgaffer/api.py      public API (MaxDirector LightMatch stage): match_camera / 
 maxgaffer/ui/dock.py  PySide6 dock: camera board · reference · match/batch · rig · vantage
 maxgaffer/sidecar/    optional Pillow stats/b64 CLI for a system python
 scripts/              install.bat · preflight.py
-tests/                77 pytest, pure core, incl. round-2 stress + v0.3 regressions
+tests/                pure-core pytest suite (170+; `pytest tests -q` is the source of
+                      truth), incl. stress rounds, no-render + software-exposure regressions
 ```
 
 ## 4. The match pipeline (with guard placement)

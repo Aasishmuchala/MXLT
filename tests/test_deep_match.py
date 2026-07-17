@@ -71,14 +71,14 @@ def test_polish_climbs_to_local_optimum_and_proves_ceiling(monkeypatch):
         score=world.score_of(world.current), components={}))
     start = state_full(az=195.0)   # 15° off, size 2 (2 units off) → score 91.5
     start.set("sun.size", 2.0)
-    st, sc, probes, converged = run_polish(
+    st, sc, probes, converged, proven = run_polish(
         start, world.score_of(start), {"any": "ref"}, world.hooks(),
         MatchConfig(polish_rounds=12, polish_stop_at=200.0,
                     polish_max_probes=250))
     assert sc > 99.0                                   # climbed to the peak neighborhood
     assert abs(st.get("sun.azimuth_deg") - 210) <= 3.0
     assert abs(st.get("sun.size") - 4.0) < 1.3
-    assert converged is True                           # exhausted = ceiling proven
+    assert converged is True
     assert probes == world.renders and probes > 10
 
 
@@ -89,7 +89,7 @@ def test_polish_respects_locks_and_stop_score(monkeypatch):
     monkeypatch.setattr(critic, "score", lambda ref, cur, w=None: critic.Verdict(
         score=world.score_of(world.current), components={}))
     start = state_full(az=195.0)
-    st, sc, probes, converged = run_polish(
+    st, sc, probes, converged, _proven = run_polish(
         start, world.score_of(start), {}, world.hooks(),
         MatchConfig(polish_rounds=8, polish_stop_at=200.0),
         locks={"sun.azimuth_deg"})
@@ -101,11 +101,11 @@ def test_polish_respects_locks_and_stop_score(monkeypatch):
         score=world2.score_of(world2.current), components={}))
     start2 = state_full(az=209.0)
     start2.set("sun.size", 4.0)               # at the size optimum; az 1° off → 99.7 reachable
-    st2, sc2, _, conv2 = run_polish(
+    st2, sc2, _, conv2, proven2 = run_polish(
         start2, 99.0, {}, world2.hooks(),
         MatchConfig(polish_rounds=8, polish_stop_at=99.2))
     assert sc2 >= 99.2
-    assert conv2 is False
+    assert conv2 is False and proven2 is False
 
 
 def test_run_match_wires_polish_and_reports_gain():
@@ -149,7 +149,7 @@ def test_polish_closes_a_post_sweep_gap():
     try:
         start = state_full(az=180.0)          # sweep landed a bucket away from 210
         start.set("sun.size", 4.0)
-        st, sc, probes, _ = run_polish(
+        st, sc, probes, _conv, _proven = run_polish(
             start, world.score_of(start), {}, world.hooks(),
             MatchConfig(polish_rounds=6, polish_stop_at=99.8, polish_max_probes=60))
         assert abs(st.get("sun.azimuth_deg") - 210.0) <= 3.0

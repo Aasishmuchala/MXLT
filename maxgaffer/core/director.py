@@ -127,8 +127,11 @@ class MatchResult:
     iterations: List[IterationRecord] = field(default_factory=list)
     polish_gain: float = 0.0            # score added by the coordinate-descent finisher
     polish_probes: int = 0
-    ceiling_converged: bool = False     # polish exhausted: no fine move improves — this
-                                        # score IS the scene's ceiling for this reference
+    ceiling_converged: bool = False     # polish ended in a converged condition (either kind)
+    ceiling_proven: bool = False        # STRONG claim: every step at its fine floor and a
+                                        # full round improved nothing — a proven local
+                                        # optimum. converged without proven = plateau
+                                        # (two low-gain rounds; finer steps untested)
 
     def to_summary(self) -> Dict:
         """JSON-safe run record — the controller writes it to the run dir as run.json.
@@ -141,6 +144,7 @@ class MatchResult:
             "polish_gain": self.polish_gain,
             "polish_probes": self.polish_probes,
             "ceiling_converged": self.ceiling_converged,
+            "ceiling_proven": self.ceiling_proven,
             "best_state": self.best_state.to_dict(),
             "iterations": [
                 {"index": r.index, "score": r.score, "render": r.render_path,
@@ -181,183 +185,213 @@ def run_match(
     leash_wb_lo = start_state.get("exposure.wb_kelvin", 6500.0) - cfg.wb_leash
     leash_wb_hi = start_state.get("exposure.wb_kelvin", 6500.0) + cfg.wb_leash
     leash_hits = 0
+    budget = f"budget: ≤{cfg.max_iterations} loop renders"
+    if cfg.polish:
+        budget += f" + ≤{cfg.polish_max_probes} polish probes"
+    hooks.log(budget)
 
-    for i in range(cfg.max_iterations):
-        if hooks.should_cancel():
-            stop_reason = "cancelled"
-            break
-        rec = IterationRecord(index=i, state=state.to_dict())
-        hooks.apply(state)
-        path = hooks.render(f"iter{i:02d}")
-        rec.render_path = path
-        if path is None:
-            hooks.log(f"iter {i}: render failed — stopping")
-            stop_reason = "render_failed"
-            records.append(rec)
-            break
+    try:
+        import time as _time
 
-        cur_stats = hooks.stats(path) if metrics_ok else None
-        # MEASURED mis-exposure of the frame the LLM is about to judge — drives the
-        # contamination guard directly (the capped/annealed applied delta understates it)
-        misexposure = 0.0
-        if cur_stats is not None and ref_stats is not None:
-            import math as _math
+        for i in range(cfg.max_iterations):
+            if hooks.should_cancel():
+                stop_reason = "cancelled"
+                break
+            rec = IterationRecord(index=i, state=state.to_dict())
+            hooks.apply(state)
+            _t0 = _time.time()
+            path = hooks.render(f"iter{i:02d}")
+            if i == 0 and path is not None:
+                _dt = _time.time() - _t0
+                worst = cfg.max_iterations + (cfg.polish_max_probes if cfg.polish else 0)
+                hooks.log(f"~{_dt:.1f}s/render — worst case ≈ "
+                          f"{_dt * worst / 60.0:.0f} min for this run")
+            rec.render_path = path
+            if path is None:
+                hooks.log(f"iter {i}: render failed — stopping")
+                stop_reason = "render_failed"
+                records.append(rec)
+                break
 
-            misexposure = abs(_math.log2(
-                max(1e-5, float(ref_stats.get("log_key", 0.0)))
-                / max(1e-5, float(cur_stats.get("log_key", 0.0)))))
-        if cur_stats is not None and ref_stats is not None:
-            verdict = critic.score(ref_stats, cur_stats, cfg.weights)
-            rec.score, rec.components = verdict.score, verdict.components
-            score_history.append((i, verdict.score))
-            hooks.log(f"iter {i}: score {verdict.summary()}")
+            cur_stats = hooks.stats(path) if metrics_ok else None
+            # MEASURED mis-exposure of the frame the LLM is about to judge — drives the
+            # contamination guard directly (the capped/annealed applied delta understates it)
+            misexposure = 0.0
+            if cur_stats is not None and ref_stats is not None:
+                import math as _math
 
-            improved = best_score is None or verdict.score > best_score + 1e-9
-            if improved:
-                if best_score is not None and verdict.score < best_score + cfg.stall_delta:
-                    stall_count += 1
-                else:
-                    stall_count = 0
-                best_score, best_state, best_render = verdict.score, state.copy(), path
-                slump_count = 0
-            else:
-                stall_count += 1
-                if verdict.score < (best_score or 0) - cfg.slump_tolerance:
-                    slump_count += 1
-                    if slump_count >= 2:
-                        hooks.log(f"iter {i}: slumping — reverting to best "
-                                  f"({best_score:.1f})")
-                        state = best_state.copy()
-                        rec.reverted_to_best = True
-                        slump_count = 0
-                else:
+                misexposure = abs(_math.log2(
+                    max(1e-5, float(ref_stats.get("log_key", 0.0)))
+                    / max(1e-5, float(cur_stats.get("log_key", 0.0)))))
+            if cur_stats is not None and ref_stats is not None:
+                verdict = critic.score(ref_stats, cur_stats, cfg.weights)
+                rec.score, rec.components = verdict.score, verdict.components
+                score_history.append((i, verdict.score))
+                hooks.log(f"iter {i}: score {verdict.summary()}")
+
+                improved = best_score is None or verdict.score > best_score + 1e-9
+                if improved:
+                    if best_score is not None and verdict.score < best_score + cfg.stall_delta:
+                        stall_count += 1
+                    else:
+                        stall_count = 0
+                    best_score, best_state, best_render = verdict.score, state.copy(), path
                     slump_count = 0
+                else:
+                    if verdict.score < (best_score or 0) - cfg.slump_tolerance:
+                        # slump iterations count toward slump-revert ONLY — feeding them
+                        # into the stall counter too let one marginal gain plus one slump
+                        # end a run as "stalled" before the 2-strike revert ever engaged
+                        slump_count += 1
+                        if slump_count >= 2:
+                            hooks.log(f"iter {i}: slumping — reverting to best "
+                                      f"({best_score:.1f})")
+                            state = best_state.copy()
+                            rec.reverted_to_best = True
+                            slump_count = 0
+                    else:
+                        stall_count += 1
+                        slump_count = 0
 
-            if verdict.score >= cfg.target_score:
-                stop_reason = "target_reached"
+                if verdict.score >= cfg.target_score:
+                    stop_reason = "target_reached"
+                    records.append(rec)
+                    break
+                if stall_count >= cfg.stall_patience and i >= 1:
+                    stop_reason = "stalled"
+                    records.append(rec)
+                    break
+            else:
+                # unscored iteration (LLM-visual mode, or one flaky stats read): while no
+                # score exists to rank by, LATEST is best — a once-only assignment here
+                # left the UI showing iteration 0's *before* frame as the final result
+                if best_score is None or best_render is None:
+                    best_state, best_render = state.copy(), path
+
+            if rec.reverted_to_best:
+                # the stats in hand describe the state we just ABANDONED — solving or asking
+                # the LLM from them would tweak the restored state on stale evidence. Re-render
+                # first; next iteration reasons from coherent measurements.
+                hooks.log(f"iter {i}: reverted — re-measuring before further changes")
+                records.append(rec)
+                continue
+
+            if i == cfg.max_iterations - 1:  # last render measured; no point proposing more
                 records.append(rec)
                 break
-            if stall_count >= cfg.stall_patience and i >= 1:
-                stop_reason = "stalled"
+
+            # ---- analytic solve (deterministic, before/independent of the LLM)
+            # annealed: exploration-sized steps and deadbands shrink as the score climbs
+            anneal = _anneal(best_score)
+            analytic: Dict[str, float] = {}
+            if cfg.analytic and cur_stats is not None and ref_stats is not None:
+                analytic = solver.analytic_pass(state, ref_stats, cur_stats, locks,
+                                                tighten=anneal)
+                if "exposure.ev" in analytic:
+                    leashed = min(leash_ev_hi, max(leash_ev_lo, analytic["exposure.ev"]))
+                    if abs(leashed - analytic["exposure.ev"]) > 1e-6:
+                        leash_hits += 1
+                        hooks.log(f"iter {i}: EV solve hit its leash "
+                                  f"({leashed:+.1f} vs wanted {analytic['exposure.ev']:+.1f})")
+                    analytic["exposure.ev"] = leashed
+                if "exposure.wb_kelvin" in analytic:
+                    leashed = min(leash_wb_hi, max(leash_wb_lo, analytic["exposure.wb_kelvin"]))
+                    if abs(leashed - analytic["exposure.wb_kelvin"]) > 1e-6:
+                        leash_hits += 1
+                        hooks.log(f"iter {i}: WB solve hit its leash ({leashed:.0f}K)")
+                    analytic["exposure.wb_kelvin"] = leashed
+                if analytic:
+                    state, accepted, _ = apply_changes(state, analytic, locks, limit=False)
+                    rec.analytic_changes = accepted
+                    hooks.log("iter %d: analytic %s" % (
+                        i, ", ".join(f"{k}={v:.2f}" for k, v in accepted.items())))
+
+            # ---- LLM deltas
+            if hooks.should_cancel():
+                stop_reason = "cancelled"
                 records.append(rec)
                 break
-        else:
-            if best_render is None:
-                best_state, best_render = state.copy(), path
+            # per-param trajectory — the model sees its own oscillation (live sim showed
+            # altitude ping-ponging 6→-1→6 when each iteration judged in isolation)
+            param_history: Dict[str, List[float]] = {}
+            for r in records:
+                for k, v in list(r.analytic_changes.items()) + list(r.llm_accepted.items()):
+                    param_history.setdefault(k, []).append(round(v, 2))
+            history_txt = "\n".join(
+                f"  {k}: {' → '.join(str(x) for x in vs[-5:])}"
+                for k, vs in sorted(param_history.items()) if len(vs) >= 2)
+            ctx = {
+                "iteration": i,
+                "max_iterations": cfg.max_iterations,
+                "state_table": state_table(state, locks),
+                "semantics": semantics,
+                "score_history": score_history,
+                "analytic_applied": rec.analytic_changes,
+                "param_history": history_txt,
+                "render_path": path,
+                "rig_notes": rig_notes,
+                "director_note": director_note,
+                "max_changes": cfg.max_changes,
+            }
+            try:
+                from .parse import validate_deltas
 
-        if rec.reverted_to_best:
-            # the stats in hand describe the state we just ABANDONED — solving or asking
-            # the LLM from them would tweak the restored state on stale evidence. Re-render
-            # first; next iteration reasons from coherent measurements.
-            hooks.log(f"iter {i}: reverted — re-measuring before further changes")
+                proposal = validate_deltas(hooks.llm_deltas(ctx), cfg.max_changes)
+            except ParseError as e:
+                hooks.log(f"iter {i}: LLM reply unusable ({e}) — keeping analytic-only step")
+                proposal = {"assessment": "", "changes": {}, "reasons": {}, "stop": False}
+            rec.assessment = proposal["assessment"]
+            if proposal["assessment"]:
+                hooks.log(f"iter {i}: gaffer: {proposal['assessment']}")
+            # structural, not just prompted: while the analytic solver is running, ANALYTIC
+            # params are the solver's alone — live fire showed the model overriding a perfect
+            # EV solve and costing two iterations of re-correction (sim_match, 2026-07-16)
+            if cfg.analytic and metrics_ok:
+                from .genome import spec_for
+
+                for k in [k for k in proposal["changes"]
+                          if (spec_for(k) is not None and spec_for(k).analytic)]:
+                    proposal["changes"].pop(k, None)
+                    rec.llm_rejected.append(f"{k}: analytic — the solver owns it")
+                    hooks.log(f"iter {i}: refused {k} (analytic — solver owns it)")
+            # contaminated-iteration guard: the frame the LLM critiqued was MEASURABLY
+            # mis-exposed — its absolute-brightness judgments (intensities, groups) are
+            # contamination regardless of how much of the error the solver corrected
+            if misexposure >= cfg.contaminated_ev_step:
+                dropped = [k for k in proposal["changes"]
+                           if k.endswith(".intensity") or k.startswith("group.")]
+                for k in dropped:
+                    proposal["changes"].pop(k, None)
+                    rec.llm_rejected.append(
+                        f"{k}: dropped — render was {misexposure:.1f} stops mis-exposed, "
+                        "brightness judgment contaminated")
+                if dropped:
+                    hooks.log(f"iter {i}: dropped {len(dropped)} intensity change(s) — "
+                              "the model judged a mis-exposed frame")
+            from .genome import rig_keys
+
+            state, accepted, rejected = apply_changes(state, proposal["changes"], locks,
+                                                      limit=True, step_scale=anneal,
+                                                      known=rig_keys(state))
+            rec.llm_accepted = accepted
+            rec.llm_rejected.extend(rejected)   # extend — the contamination guard logged here too
+            for r in rejected:
+                hooks.log(f"iter {i}: rejected {r}")
+            for k, v in accepted.items():
+                hooks.log(f"iter {i}: Δ {k} → {v:.2f}  ({proposal['reasons'].get(k, '')})")
             records.append(rec)
-            continue
+            if proposal["stop"] and not accepted and not rec.analytic_changes:
+                stop_reason = "llm_satisfied"
+                break
 
-        if i == cfg.max_iterations - 1:  # last render measured; no point proposing more
-            records.append(rec)
-            break
-
-        # ---- analytic solve (deterministic, before/independent of the LLM)
-        # annealed: exploration-sized steps and deadbands shrink as the score climbs
-        anneal = _anneal(best_score)
-        analytic: Dict[str, float] = {}
-        if cfg.analytic and cur_stats is not None and ref_stats is not None:
-            analytic = solver.analytic_pass(state, ref_stats, cur_stats, locks,
-                                            tighten=anneal)
-            if "exposure.ev" in analytic:
-                leashed = min(leash_ev_hi, max(leash_ev_lo, analytic["exposure.ev"]))
-                if abs(leashed - analytic["exposure.ev"]) > 1e-6:
-                    leash_hits += 1
-                    hooks.log(f"iter {i}: EV solve hit its leash "
-                              f"({leashed:+.1f} vs wanted {analytic['exposure.ev']:+.1f})")
-                analytic["exposure.ev"] = leashed
-            if "exposure.wb_kelvin" in analytic:
-                leashed = min(leash_wb_hi, max(leash_wb_lo, analytic["exposure.wb_kelvin"]))
-                if abs(leashed - analytic["exposure.wb_kelvin"]) > 1e-6:
-                    leash_hits += 1
-                    hooks.log(f"iter {i}: WB solve hit its leash ({leashed:.0f}K)")
-                analytic["exposure.wb_kelvin"] = leashed
-            if analytic:
-                state, accepted, _ = apply_changes(state, analytic, locks, limit=False)
-                rec.analytic_changes = accepted
-                hooks.log("iter %d: analytic %s" % (
-                    i, ", ".join(f"{k}={v:.2f}" for k, v in accepted.items())))
-
-        # ---- LLM deltas
-        if hooks.should_cancel():
-            stop_reason = "cancelled"
-            records.append(rec)
-            break
-        # per-param trajectory — the model sees its own oscillation (live sim showed
-        # altitude ping-ponging 6→-1→6 when each iteration judged in isolation)
-        param_history: Dict[str, List[float]] = {}
-        for r in records:
-            for k, v in list(r.analytic_changes.items()) + list(r.llm_accepted.items()):
-                param_history.setdefault(k, []).append(round(v, 2))
-        history_txt = "\n".join(
-            f"  {k}: {' → '.join(str(x) for x in vs[-5:])}"
-            for k, vs in sorted(param_history.items()) if len(vs) >= 2)
-        ctx = {
-            "iteration": i,
-            "max_iterations": cfg.max_iterations,
-            "state_table": state_table(state, locks),
-            "semantics": semantics,
-            "score_history": score_history,
-            "analytic_applied": rec.analytic_changes,
-            "param_history": history_txt,
-            "render_path": path,
-            "rig_notes": rig_notes,
-            "director_note": director_note,
-            "max_changes": cfg.max_changes,
-        }
+    except Exception:
+        # keep-best survives a crash: a hook/critic raise must never leave the
+        # last exploratory state standing in the scene (documented guarantee)
         try:
-            from .parse import validate_deltas
-
-            proposal = validate_deltas(hooks.llm_deltas(ctx), cfg.max_changes)
-        except ParseError as e:
-            hooks.log(f"iter {i}: LLM reply unusable ({e}) — keeping analytic-only step")
-            proposal = {"assessment": "", "changes": {}, "reasons": {}, "stop": False}
-        rec.assessment = proposal["assessment"]
-        if proposal["assessment"]:
-            hooks.log(f"iter {i}: gaffer: {proposal['assessment']}")
-        # structural, not just prompted: while the analytic solver is running, ANALYTIC
-        # params are the solver's alone — live fire showed the model overriding a perfect
-        # EV solve and costing two iterations of re-correction (sim_match, 2026-07-16)
-        if cfg.analytic and metrics_ok:
-            from .genome import spec_for
-
-            for k in [k for k in proposal["changes"]
-                      if (spec_for(k) is not None and spec_for(k).analytic)]:
-                proposal["changes"].pop(k, None)
-                rec.llm_rejected.append(f"{k}: analytic — the solver owns it")
-                hooks.log(f"iter {i}: refused {k} (analytic — solver owns it)")
-        # contaminated-iteration guard: the frame the LLM critiqued was MEASURABLY
-        # mis-exposed — its absolute-brightness judgments (intensities, groups) are
-        # contamination regardless of how much of the error the solver corrected
-        if misexposure >= cfg.contaminated_ev_step:
-            dropped = [k for k in proposal["changes"]
-                       if k.endswith(".intensity") or k.startswith("group.")]
-            for k in dropped:
-                proposal["changes"].pop(k, None)
-                rec.llm_rejected.append(
-                    f"{k}: dropped — render was {misexposure:.1f} stops mis-exposed, "
-                    "brightness judgment contaminated")
-            if dropped:
-                hooks.log(f"iter {i}: dropped {len(dropped)} intensity change(s) — "
-                          "the model judged a mis-exposed frame")
-        state, accepted, rejected = apply_changes(state, proposal["changes"], locks,
-                                                  limit=True, step_scale=anneal)
-        rec.llm_accepted = accepted
-        rec.llm_rejected.extend(rejected)   # extend — the contamination guard logged here too
-        for r in rejected:
-            hooks.log(f"iter {i}: rejected {r}")
-        for k, v in accepted.items():
-            hooks.log(f"iter {i}: Δ {k} → {v:.2f}  ({proposal['reasons'].get(k, '')})")
-        records.append(rec)
-        if proposal["stop"] and not accepted and not rec.analytic_changes:
-            stop_reason = "llm_satisfied"
-            break
-
+            hooks.apply(best_state if best_score is not None else state)
+        except Exception:
+            pass
+        raise
     if leash_hits >= 2:
         hooks.log("⚠ the exposure/WB solver kept hitting its leash — the reference and "
                   "this scene likely disagree in albedo (e.g. white room vs dark wood). "
@@ -380,16 +414,22 @@ def run_match(
     # ---- DEEP-MATCH finisher: squeeze to the scene's ceiling, then prove it
     if (cfg.polish and best_score is not None and ref_stats is not None
             and best_score < cfg.polish_stop_at and stop_reason != "cancelled"):
-        p_state, p_score, probes, converged = run_polish(
+        p_state, p_score, probes, converged, proven = run_polish(
             best_state, best_score, ref_stats, hooks, cfg, locks)
         result.polish_gain = round(p_score - best_score, 2)
         result.polish_probes = probes
         result.ceiling_converged = converged
+        result.ceiling_proven = proven
         result.best_state, result.best_score = p_state, p_score
         hooks.apply(p_state)
         if converged and p_score < cfg.polish_stop_at:
-            hooks.log(f"ceiling: no fine move improves {p_score:.1f} — that score IS this "
-                      "scene's optimum for this reference (content gap, not lighting)")
+            if proven:
+                hooks.log(f"ceiling: no fine move improves {p_score:.1f} — that score IS "
+                          "this scene's optimum for this reference (content gap, not "
+                          "lighting)")
+            else:
+                hooks.log(f"polish: plateau at {p_score:.1f} — two consecutive low-gain "
+                          "rounds (finer steps untested; a plateau, not a proven ceiling)")
     return result
 
 
@@ -403,9 +443,11 @@ def run_polish(
 ) -> Tuple[LightingState, float, int, bool]:
     """LLM-free ADAPTIVE coordinate line search. Per parameter: nudge, keep climbing in a
     direction while each rendered probe measurably improves the score; when neither
-    direction improves, that parameter's step halves next round. Converged when every
-    unlocked parameter's step is at its fine floor and a full round changed nothing — a
-    provable local optimum. → (best_state, best_score, probes_rendered, converged)."""
+    direction improves, that parameter's step halves next round.
+    → (best_state, best_score, probes_rendered, converged, proven): ``proven`` is the
+    STRONG claim (every step at its fine floor + a full no-improve round = provable
+    local optimum); ``converged`` without ``proven`` is the diminishing-returns
+    plateau exit (two consecutive low-gain rounds; finer steps untested)."""
     locks = locks or set()
     best = state.copy()
     best_score = score_now
@@ -431,61 +473,68 @@ def run_polish(
         probes += 1
         return critic.score(ref_stats, st, cfg.weights).score
 
-    low_gain_rounds = 0
-    for rnd in range(cfg.polish_rounds):
-        improved_any = False
-        round_start = best_score
-        for key, _init, is_log, floor in POLISH_PARAMS:
-            if hooks.should_cancel() or best_score >= cfg.polish_stop_at \
-                    or probes >= cfg.polish_max_probes:
+    try:
+        low_gain_rounds = 0
+        for rnd in range(cfg.polish_rounds):
+            improved_any = False
+            round_start = best_score
+            for key, _init, is_log, floor in POLISH_PARAMS:
+                if hooks.should_cancel() or best_score >= cfg.polish_stop_at \
+                        or probes >= cfg.polish_max_probes:
+                    hooks.apply(best)
+                    return best, best_score, probes, False, False
+                if key in locks or key not in best.values:
+                    continue
+                step = steps[key]
+                if dead.get(key) == (step, best_score):
+                    continue    # same step, same landscape — the answer hasn't changed
+                param_moved = False
+                for direction in (1.0, -1.0):
+                    climbing = True
+                    stride = step        # accelerating line search: consecutive keeps
+                    while climbing and probes < cfg.polish_max_probes \
+                            and best_score < cfg.polish_stop_at:
+                        cand = best.copy()
+                        v = cand.get(key)
+                        cand.set(key, v * (2.0 ** (direction * stride)) if is_log
+                                 else v + direction * stride)
+                        if abs(cand.get(key) - v) < 1e-6:
+                            break            # clamped to a bound — nowhere to go
+                        sc = measure(cand, f"polish{rnd}_{key.split('.')[-1]}")
+                        if sc is not None and sc > best_score + cfg.polish_min_gain:
+                            hooks.log(f"polish: {key} {v:.2f}→{cand.get(key):.2f} · "
+                                      f"{best_score:.2f}→{sc:.2f} ✓")
+                            best, best_score = cand, sc
+                            improved_any = True
+                            param_moved = True
+                            stride *= 1.6          # keep riding the slope, faster
+                        else:
+                            climbing = False
+                    if param_moved:
+                        break                # THIS param rode uphill; its mirror is downhill
+                if not param_moved:
+                    dead[key] = (step, best_score)
+            low_gain_rounds = (low_gain_rounds + 1
+                               if best_score - round_start < cfg.polish_round_eps else 0)
+            if low_gain_rounds >= 2:
                 hooks.apply(best)
-                return best, best_score, probes, False
-            if key in locks or key not in best.values:
-                continue
-            step = steps[key]
-            if dead.get(key) == (step, best_score):
-                continue    # same step, same landscape — the answer hasn't changed
-            param_moved = False
-            for direction in (1.0, -1.0):
-                climbing = True
-                stride = step        # accelerating line search: consecutive keeps
-                while climbing and probes < cfg.polish_max_probes \
-                        and best_score < cfg.polish_stop_at:
-                    cand = best.copy()
-                    v = cand.get(key)
-                    cand.set(key, v * (2.0 ** (direction * stride)) if is_log
-                             else v + direction * stride)
-                    if abs(cand.get(key) - v) < 1e-6:
-                        break            # clamped to a bound — nowhere to go
-                    sc = measure(cand, f"polish{rnd}_{key.split('.')[-1]}")
-                    if sc is not None and sc > best_score + cfg.polish_min_gain:
-                        hooks.log(f"polish: {key} {v:.2f}→{cand.get(key):.2f} · "
-                                  f"{best_score:.2f}→{sc:.2f} ✓")
-                        best, best_score = cand, sc
-                        improved_any = True
-                        param_moved = True
-                        stride *= 1.6          # keep riding the slope, faster
-                    else:
-                        climbing = False
-                if param_moved:
-                    break                # THIS param rode uphill; its mirror is downhill
-            if not param_moved:
-                dead[key] = (step, best_score)
-        low_gain_rounds = (low_gain_rounds + 1
-                           if best_score - round_start < cfg.polish_round_eps else 0)
-        if low_gain_rounds >= 2:
+                return best, best_score, probes, True, False   # plateau — NOT proven
+            if not improved_any:
+                all_floored = all(steps[k] <= floor + 1e-9
+                                  for k, _s, _l, floor in POLISH_PARAMS)
+                if all_floored:
+                    hooks.apply(best)
+                    return best, best_score, probes, True, True   # proven local optimum
+                for k, _s, _l, floor in POLISH_PARAMS:
+                    steps[k] = max(floor, steps[k] / 2.0)
+        hooks.apply(best)
+        return best, best_score, probes, False, False
+    except Exception:
+        try:
             hooks.apply(best)
-            return best, best_score, probes, True   # diminishing returns = ceiling
-        if not improved_any:
-            all_floored = all(steps[k] <= floor + 1e-9
-                              for k, _s, _l, floor in POLISH_PARAMS)
-            if all_floored:
-                hooks.apply(best)
-                return best, best_score, probes, True   # proven local optimum
-            for k, _s, _l, floor in POLISH_PARAMS:
-                steps[k] = max(floor, steps[k] / 2.0)
-    hooks.apply(best)
-    return best, best_score, probes, False
+        except Exception:
+            pass
+        raise
 
 
 def run_sun_sweep(

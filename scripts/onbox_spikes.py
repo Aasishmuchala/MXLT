@@ -174,7 +174,15 @@ def main():
             k2 = probe("ev_plus2")["log_key"]
             if k2 >= k1:
                 raise RuntimeError(f"INVERTED: key rose {k1:.4f}→{k2:.4f} after +2 EV")
-            return f"+2 EV darkened key {k1:.4f} → {k2:.4f} ✓"
+            import math as _m
+
+            moved = _m.log2(max(1e-5, k1) / max(1e-5, k2))
+            if moved < 1.0:   # sign alone can pass on a near-zero delta (V-Ray GPU did)
+                raise RuntimeError(
+                    f"INERT: +2 EV moved the render only {moved:.2f} stops — this "
+                    "renderer's exposure is display-stage only; enable "
+                    "software_exposure (Settings) — the runtime check also auto-flips it")
+            return f"+2 EV darkened key {k1:.4f} → {k2:.4f} ({moved:.2f} stops) ✓"
 
         check("H", "EV direction (measured)", ev_direction)
 

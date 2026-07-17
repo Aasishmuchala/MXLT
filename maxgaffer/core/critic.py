@@ -59,23 +59,35 @@ def score(ref: Dict, cur: Dict, weights: Dict[str, float] = None) -> Verdict:
     if weights:
         w.update({k: float(v) for k, v in weights.items() if k in w})
 
-    key_ref = max(1e-5, float(ref.get("log_key", 0.0)))
-    key_cur = max(1e-5, float(cur.get("log_key", 0.0)))
-    s_key = 1.0 - min(1.0, abs(math.log2(key_ref / key_cur)) / 3.0)
+    # every component joins ONLY when its source data is present on both sides —
+    # absent data must never default to a perfect sub-score (a present-but-empty
+    # stats dict once scored a false 100.0 and stopped a match as target_reached)
+    comps: Dict[str, float] = {}
 
-    d5 = abs(_sub(ref, "p", "5") - _sub(cur, "p", "5"))
-    d95 = abs(_sub(ref, "p", "95") - _sub(cur, "p", "95"))
-    s_env = 1.0 - min(1.0, (d5 + d95) / 0.5)
+    if "log_key" in ref and "log_key" in cur:
+        key_ref = max(1e-5, float(ref["log_key"]))
+        key_cur = max(1e-5, float(cur["log_key"]))
+        comps["key"] = 1.0 - min(1.0, abs(math.log2(key_ref / key_cur)) / 3.0)
 
-    s_hist = 1.0 - min(1.0, hist_emd(ref.get("lum_hist", []), cur.get("lum_hist", [])) * 4.0)
+    if isinstance(ref.get("p"), dict) and isinstance(cur.get("p"), dict):
+        d5 = abs(_sub(ref, "p", "5") - _sub(cur, "p", "5"))
+        d95 = abs(_sub(ref, "p", "95") - _sub(cur, "p", "95"))
+        comps["envelope"] = 1.0 - min(1.0, (d5 + d95) / 0.5)
 
-    lr, lc = ref.get("lab_mean", [0, 0, 0]), cur.get("lab_mean", [0, 0, 0])
-    d_col = math.sqrt(0.4 * (lr[0] - lc[0]) ** 2 + (lr[1] - lc[1]) ** 2 + (lr[2] - lc[2]) ** 2)
-    s_col = 1.0 - min(1.0, d_col / 30.0)
+    if ref.get("lum_hist") and cur.get("lum_hist"):
+        comps["histogram"] = 1.0 - min(
+            1.0, hist_emd(ref["lum_hist"], cur["lum_hist"]) * 4.0)
 
-    s_hue = max(0.0, cosine(ref.get("hue_hist", []), cur.get("hue_hist", [])))
+    lr, lc = ref.get("lab_mean"), cur.get("lab_mean")
+    if (isinstance(lr, (list, tuple)) and len(lr) >= 3
+            and isinstance(lc, (list, tuple)) and len(lc) >= 3):
+        d_col = math.sqrt(0.4 * (lr[0] - lc[0]) ** 2 + (lr[1] - lc[1]) ** 2
+                          + (lr[2] - lc[2]) ** 2)
+        comps["color"] = 1.0 - min(1.0, d_col / 30.0)
 
-    comps = {"key": s_key, "envelope": s_env, "histogram": s_hist, "color": s_col, "hue": s_hue}
+    hr, hc = ref.get("hue_hist") or [], cur.get("hue_hist") or []
+    if (hr or hc) and (any(v > 1e-9 for v in hr) or any(v > 1e-9 for v in hc)):
+        comps["hue"] = max(0.0, cosine(hr, hc))
     # prefer the finer 5×5 grid when both sides carry it (better azimuth acuity);
     # 3×3 remains for stats produced by older engine versions
     g_ref, g_cur = ref.get("grid5"), cur.get("grid5")
@@ -83,7 +95,10 @@ def score(ref: Dict, cur: Dict, weights: Dict[str, float] = None) -> Verdict:
         g_ref, g_cur = ref.get("grid"), cur.get("grid")
     if g_ref and g_cur and len(g_ref) == len(g_cur) and any(abs(v) > 1e-6 for v in g_ref):
         comps["direction"] = max(0.0, (cosine(g_ref, g_cur) + 1.0) / 2.0)
-    # only weigh what was measurable — old stats without a grid renormalize cleanly
+    # only weigh what was measurable — old stats without a grid renormalize cleanly;
+    # NOTHING measurable = unmeasurable comparison, scored 0 (never a false perfect)
+    if not comps:
+        return Verdict(score=0.0, components={})
     total_w = sum(w[k] for k in comps) or 1.0
     total = sum(w[k] * comps[k] for k in comps) / total_w
     return Verdict(score=round(100.0 * total, 2), components=comps)

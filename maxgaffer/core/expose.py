@@ -16,6 +16,7 @@ match start): at ev == base_ev, wb == base_wb the transform is the identity.
 from __future__ import annotations
 
 import math
+import os
 from typing import List, Optional, Sequence, Tuple
 
 from .metrics import _srgb_to_linear
@@ -106,7 +107,9 @@ def expose_image_file(src: str, dst: str, ev: float, base_ev: float,
                                     wb_kelvin, base_wb)
             out = Image.new("RGB", im.size)
             out.putdata(exposed)
-            out.save(dst)
+            tmp = dst + ".tmp"
+            out.save(tmp, format="PNG")
+        os.replace(tmp, dst)      # atomic even when src == dst (in-place expose)
         return dst
     except Exception:
         return None

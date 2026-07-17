@@ -2,7 +2,7 @@
 
 Import inside 3ds Max (any tool, MaxDirector's pipeline, a listener one-liner):
 
-    from maxgaffer.api import match_camera, apply_camera_state, render_cameras_vantage
+    from maxgaffer.api import match_camera, apply_camera_state, render_cameras
 
     result = match_camera("PhysCam_Hero", r"D:/refs/dusk.jpg", log=print)
     # → {"score": 84.2, "stop_reason": "target_reached", "iterations": 4,
@@ -71,6 +71,7 @@ def match_camera(
         "renders": [r.render_path for r in result.iterations if r.render_path],
         "polish_gain": result.polish_gain,
         "ceiling_converged": result.ceiling_converged,
+        "ceiling_proven": getattr(result, "ceiling_proven", False),
     }
 
 
