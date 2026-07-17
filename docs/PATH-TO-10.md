@@ -1,5 +1,15 @@
 # Path to 10 — consolidated stress-test findings (2026-07-18)
 
+> **STATUS — EXECUTED (commit ca18eff, same day).** Every Tier 1 item (1–10), every
+> Tier 2 item (11–15), and Tier 3 items 16 (dedupe + png_min), 19, 20 and 21 are
+> closed, covered by 20 new regressions (`tests/test_path_to_10.py`, suite 189
+> green) and re-verified live on the box: the recovery experiment now runs with
+> `software_exposure` OFF and the new runtime check auto-detects the inert V-Ray
+> GPU host ("+2 EV moved the render only 0.00 stops"), flips the flag, and the
+> loop converges — EV err 0.00, score 30.6→98.3. Remaining as future speed work
+> (explicitly outside the 10 bar): numpy fast path, EXR loop renders, and the
+> skip-render-for-EV/WB-probes optimization (do it together with EXR).
+
 Sources: 3 independent adversarial code reviews (exposure/controller integration ·
 director core engine · integration/UX/perf), a 10-probe live battery in a real Max
 2026 + V-Ray GPU session, and measured perf benches. Live battery: **10/10 PASS**
