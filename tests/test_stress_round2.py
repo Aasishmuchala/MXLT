@@ -21,9 +21,11 @@ def near(log_key):
 
 def start_state(ev=12.0):
     st = LightingState()
+    # a real sun rig always carries turbidity/size — read_state includes every
+    # rig-supported param, and apply_changes now capability-gates on exactly that
     for k, v in {"sun.enabled": 1, "sun.azimuth_deg": 100.0, "sun.altitude_deg": 30.0,
-                 "sun.intensity": 1.0, "exposure.ev": ev,
-                 "exposure.wb_kelvin": 6500.0}.items():
+                 "sun.intensity": 1.0, "sun.size": 3.0, "sun.turbidity": 3.0,
+                 "exposure.ev": ev, "exposure.wb_kelvin": 6500.0}.items():
         st.set(k, v)
     return st
 

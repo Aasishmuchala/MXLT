@@ -27,8 +27,8 @@ def _num(d: Dict, key: str, lo: float, hi: float, default: float) -> float:
         v = float(d.get(key))
     except (TypeError, ValueError):
         return default
-    if not math.isfinite(v):                # bare NaN/Infinity parse via json defaults
-        return default
+    if not math.isfinite(v):                # bare NaN/Infinity parse via json — they must
+        return default                      # land on the DEFAULT, not min/max-coerce to lo
     return min(hi, max(lo, v))
 
 
@@ -74,6 +74,9 @@ def validate_deltas(reply_text: str, max_changes: int = 4) -> Dict:
     changes: Dict[str, float] = {}
     reasons: Dict[str, str] = {}
     raw = obj.get("changes")
+    if isinstance(raw, dict):
+        # a common deviation from the prompted schema — accept it rather than drop silently
+        raw = [{"param": k, "value": v} for k, v in raw.items()]
     if isinstance(raw, list):
         for item in raw[:max_changes]:
             if not isinstance(item, dict):

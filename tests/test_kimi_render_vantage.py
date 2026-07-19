@@ -386,11 +386,12 @@ def test_create_light_rolls_back_orphan_on_failure(monkeypatch):
     rt = _ExecRT()
     _install_pymxs(monkeypatch, rt)
     op = {"op": "create_light", "light_type": "VRayLight_plane", "name": "MG_x"}
-    # no "placement" key → KeyError after the ctor created a live scene node
+    # no "placement" key → the pre-create validation refuses the op BEFORE the ctor
+    # runs, so no orphan ever exists — stronger than the old create-then-roll-back
     rep = ex.execute_plan([op], camera=None)
     assert rep["created"] == []
-    assert rt.nodes and rt.deleted == rt.nodes         # orphan removed from the scene
-    assert any("node removed" in w for w in rep["warnings"])
+    assert rt.nodes == [] and rt.deleted == []         # nothing created at all
+    assert any("op failed" in w for w in rep["warnings"])
 
 
 def test_create_sun_target_failure_deletes_helper(monkeypatch):

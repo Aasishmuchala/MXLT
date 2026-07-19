@@ -181,6 +181,10 @@ def phase_a_solver_only(world, ref_path, ref_stats) -> bool:
     )
     res = run_match(state_of(a_start), ref_stats, {}, hooks,
                     MatchConfig(max_iterations=6, target_score=99.0))
+    if res.best_score is None:
+        # cancelled/failed before any successful render — a clean FAIL, not a TypeError
+        print("A: no score produced (render or stats failed before iteration 0) — FAIL ✗")
+        return False
     ev_f = res.best_state.get("exposure.ev")
     wb_f = res.best_state.get("exposure.wb_kelvin")
     first = next((r.score for r in res.iterations if r.score is not None), 0.0)
@@ -338,7 +342,8 @@ def main() -> int:
           f"error {az_err:.0f}°)")
     if result.polish_probes:
         print(f"polish:  +{result.polish_gain:.2f} over {result.polish_probes} probes"
-              + (" · ceiling proven" if result.ceiling_converged else ""))
+              + (" · ceiling proven" if getattr(result, "ceiling_proven", False)
+                 else (" · plateau" if result.ceiling_converged else "")))
     ok = phase_a_ok and phase_c_ok
     print("\nOVERALL:", "PASS ✓ (phases A + C asserted)" if ok else "FAIL ✗")
     return 0 if ok else 1

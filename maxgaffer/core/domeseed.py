@@ -68,6 +68,14 @@ def snap_fov(fov_deg: float) -> float:
 
 
 # --------------------------------------------------------------------------- synthesis
+def _fnum(value, default: float) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
+
+
 def synthesize_pano(
     pixels: Sequence[Tuple[int, int, int]],
     w: int,
@@ -78,6 +86,9 @@ def synthesize_pano(
     fov_deg: float = 90.0,
 ) -> Rows:
     """Reference pixels (8-bit RGB, row-major) → world-oriented equirect linear rows."""
+    if w < 1 or h < 1 or len(pixels) < w * h:
+        return []
+    cam_yaw_deg = _fnum(cam_yaw_deg, 0.0)   # a degenerate camera transform ≠ crash
     fov = snap_fov(fov_deg)
     half = fov / 2.0
     lin = [( _SRGB_LUT[p[0]], _SRGB_LUT[p[1]], _SRGB_LUT[p[2]]) for p in pixels]
@@ -157,10 +168,12 @@ def ingest_pano(
 ) -> Rows:
     """An EXTERNAL equirect pano (camera-forward at u=0.5, e.g. DiffusionLight output) →
     world-oriented linear rows: resample + rotate so column azimuth 0 lands at north."""
+    if w < 1 or h < 1 or len(pixels) < w * h:
+        return []
     return _reorient(
         lambda i: (_SRGB_LUT[pixels[i][0]], _SRGB_LUT[pixels[i][1]],
                    _SRGB_LUT[pixels[i][2]]),
-        w, h, cam_yaw_deg, out_w, out_h)
+        w, h, _fnum(cam_yaw_deg, 0.0), out_w, out_h)
 
 
 def ingest_pano_hdr(
@@ -177,7 +190,7 @@ def ingest_pano_hdr(
     if not w:
         return []
     flat = [p for r in hdr_rows for p in r]
-    return _reorient(lambda i: flat[i], w, h, cam_yaw_deg, out_w, out_h)
+    return _reorient(lambda i: flat[i], w, h, _fnum(cam_yaw_deg, 0.0), out_w, out_h)
 
 
 # --------------------------------------------------------------------------- filtering
@@ -234,8 +247,8 @@ def normalize_key(rows: Rows, target_mean: float = 0.35) -> Tuple[Rows, float]:
     total = sum(_lum(p) for r in rows for p in r)
     n = sum(len(r) for r in rows)
     mean = total / n if n else 0.0
-    if mean <= 1e-6:
-        return rows, 1.0
+    if not math.isfinite(mean) or mean <= 1e-6:
+        return rows, 1.0      # all-black (or NaN/inf-poisoned) pano — pass through
     s = target_mean / mean
     return [[(p[0] * s, p[1] * s, p[2] * s) for p in r] for r in rows], s
 
@@ -317,6 +330,7 @@ def build_seed(
     sun_strength: float = 200.0,
     sun_size_deg: float = 4.0,
     ambient_key: float = 0.35,
+    parametric_sun_active: bool = False,
 ) -> Optional[Dict]:
     """Reference (or external pano) → seeded .hdr on disk. → meta dict, None when the
     source can't be read. Raises SeedError when the source read FINE but the seed can't
@@ -325,8 +339,15 @@ def build_seed(
 
     Sun placement: explicit (az, alt) wins (pass the solved/matched values); otherwise it
     derives from semantics (camera yaw + bearing, altitude band table) exactly like the
-    first-guess rules do. ``semantics`` also decides disc-vs-overcast."""
+    first-guess rules do. ``semantics`` also decides disc-vs-overcast.
+
+    ``parametric_sun_active``: the hybrid-rig energy rule. When a live VRaySun already
+    provides the direct light, a second sun baked into the dome would DOUBLE the direct
+    energy and cast a second soft shadow — exactly the mistake sunless commercial HDRIs
+    exist to avoid — so the disc is skipped and the seed stays ambient-only. Disc-bearing
+    seeds are for sunless/disabled-sun rigs, where the dome IS the direction."""
     sem = semantics or {}
+    cam_yaw_deg = _fnum(cam_yaw_deg, 0.0)
     src = pano_path or ref_path
     if not src:
         return None
@@ -359,9 +380,13 @@ def build_seed(
     sun_active = bool(sem.get("sun_active", True)) and sky != "overcast" \
         and time_of_day != "night"
     sun_meta: Optional[Dict] = None
+    disc_policy = "skipped_parametric_sun" if (sun_active and parametric_sun_active) \
+        else ("disc" if sun_active else "no_sun")
+    if sun_active and parametric_sun_active:
+        sun_active = False                     # ambient-only seed; VRaySun owns direction
     if sun_active:
         if sun_az_deg is None:
-            sun_az_deg = cam_yaw_deg + float(sem.get("sun_bearing_deg", 0.0))
+            sun_az_deg = cam_yaw_deg + _fnum(sem.get("sun_bearing_deg"), 0.0)
         if sun_alt_deg is None:
             from .rules import ALTITUDE_DEG, TIME_FALLBACK_ALTITUDE
 
@@ -369,7 +394,13 @@ def build_seed(
             sun_alt_deg = ALTITUDE_DEG.get(band, 35.0)
             if band == "na":
                 sun_alt_deg = TIME_FALLBACK_ALTITUDE.get(time_of_day, 35.0)
-        sun_meta = inject_sun(rows, sun_az_deg % 360.0, max(-4.0, sun_alt_deg),
+        # clamp BOTH ways — above 90° cos(e) goes negative and the disc mirrors to the
+        # opposite azimuth while the metadata claims otherwise (found by fuzz sweep)
+        sun_alt_deg = min(90.0, max(-4.0, _fnum(sun_alt_deg, 35.0)))
+        sun_az_deg = _fnum(sun_az_deg, 0.0) % 360.0
+        if not math.isfinite(sun_strength):
+            sun_strength = 200.0
+        sun_meta = inject_sun(rows, sun_az_deg, sun_alt_deg,
                               sun_strength, sun_size_deg)
     elif sky == "overcast":
         lift_sky(rows)
@@ -387,6 +418,7 @@ def build_seed(
         "fov_deg": snap_fov(fov_deg),
         "normalize_scale": round(scale, 5),
         "sun": sun_meta,
+        "disc_policy": disc_policy,
         "overcast_lift": (sky == "overcast"),
     }
 

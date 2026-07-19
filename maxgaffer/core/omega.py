@@ -37,7 +37,9 @@ class OmegaError(RuntimeError):
 def extract_text(payload: dict) -> str:
     if not isinstance(payload, dict):       # a 200 proxy/error page can parse as a list
         return ""
-    blocks = payload.get("content") or []
+    blocks = payload.get("content")
+    if not isinstance(blocks, list):
+        return ""     # a 200 carrying `null`/[] degrades into the retry path, not a crash
     return "\n".join(
         str(b.get("text") or "")            # text:null / non-string text coerces, never raises
         for b in blocks if isinstance(b, dict) and b.get("type") == "text"

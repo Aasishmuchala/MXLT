@@ -68,6 +68,24 @@ def _probe_live_link(rt):
     return None
 
 
+LIVE_LINK_PORTS = (20701, 20703)   # 20701 stock · 20703 on V-Ray 7.3 DR2
+
+
+def link_running(ports: Tuple[int, ...] = LIVE_LINK_PORTS) -> Optional[int]:
+    """The port a live link is streaming on, or None. A listener there means Vantage is
+    attached — the only non-destructive way to tell (the V-Ray action is a toggle, so
+    asking by executing it would FLIP the state). Pure stdlib socket, safe anywhere."""
+    import socket
+
+    for port in ports:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                return port
+        except OSError:
+            continue
+    return None
+
+
 def start_live_link() -> Tuple[bool, str]:
     """Execute V-Ray's 'Initiate a Live-Link to Chaos Vantage' action. That action is a
     TOGGLE (it also stops an active link), so we probe the link state first and never
@@ -269,18 +287,25 @@ def render_stills(
     """LEGACY/Developer-Edition ONLY: sequential vantage_console CLI batch. Stock Vantage
     2.0+ removed these flags — use the V-Ray backend or the in-app batch queue instead.
 
-    Every job gets a result entry — a failed camera never abandons the rest of the batch.
-    ``should_cancel`` (a pollable callable, e.g. ``threading.Event.is_set``) is checked
-    between jobs and while a console runs, and kills the running child. Each job is
-    capped at ``timeout_s`` seconds (default DEFAULT_JOB_TIMEOUT_S = 20 min — a hung
-    console is killed, not waited on for an hour). A pre-existing exact output is deleted
-    before launch and the post-run check requires a fresh mtime, so a stale render from
-    a previous batch is never accepted as this run's."""
+    Every job gets a result entry — a failed OR MALFORMED job never abandons the rest
+    of the batch (one bad shot must not cost the rest of the night). ``should_cancel``
+    (a pollable callable, e.g. ``threading.Event.is_set``) is checked between jobs and
+    while a console runs, and kills the running child. Each job is capped at
+    ``timeout_s`` seconds (default DEFAULT_JOB_TIMEOUT_S = 20 min — a hung console is
+    killed, not waited on for an hour). A pre-existing exact output is deleted before
+    launch and the post-run check requires a fresh mtime, so a stale render from a
+    previous batch is never accepted as this run's."""
+    def _cam(job, idx) -> str:
+        if isinstance(job, dict) and job.get("camera"):
+            return str(job["camera"])
+        return f"job{idx}"
+
     results: Dict[str, str] = {}
     if not os.path.exists(console_exe):
-        return {j["camera"]: f"vantage_console not found: {console_exe}" for j in jobs}
-    for job in jobs:
-        cam = job["camera"]
+        return {_cam(j, i): f"vantage_console not found: {console_exe}"
+                for i, j in enumerate(jobs)}
+    for i, job in enumerate(jobs):
+        cam = _cam(job, i)
         if should_cancel is not None and should_cancel():
             results[cam] = "cancelled"
             if on_progress:
@@ -288,15 +313,15 @@ def render_stills(
             continue
         if on_progress:
             on_progress(cam, "rendering (vantage)")
-        out = job["output"]
-        try:                                # never accept a stale file as this run's
-            if os.path.exists(out):
-                os.remove(out)
-        except OSError:
-            pass
         spawned = time.time()
-        cmd = vantage_command(console_exe, job["scene_file"], out, width, height)
         try:
+            out = job["output"]             # inside the try — a malformed job dict is
+            try:                            # an error entry, not a dead batch; never
+                if os.path.exists(out):     # accept a stale file as this run's
+                    os.remove(out)
+            except OSError:
+                pass
+            cmd = vantage_command(console_exe, job["scene_file"], out, width, height)
             status, rc = _run_console(cmd, timeout_s, should_cancel)
             if status == "cancelled":
                 results[cam] = "cancelled"
@@ -308,7 +333,7 @@ def render_stills(
                 results[cam] = "vantage exit 0 but no output written"
             else:
                 results[cam] = f"vantage exit {rc}"
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 one bad job must not kill the batch
             results[cam] = f"error: {e}"
         if on_progress:
             on_progress(cam, "done" if results[cam] == "ok" else results[cam])

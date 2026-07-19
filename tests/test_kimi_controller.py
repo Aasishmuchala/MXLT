@@ -17,7 +17,6 @@ Covered findings (audit_briefs/H_controller_api.txt):
 import contextlib
 import os
 import sys
-import time
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -93,7 +92,13 @@ def test_safe_strips_windows_reserved_device_names():
     assert _safe("trail.") == "trail"          # Win32 strips trailing dots
     assert _safe("...") == "unnamed"
     assert _safe("") == "unnamed"
-    assert _safe("Cam 01/hero") == "Cam_01_hero"
+    # char-rewritten names carry a stable 6-hex hash of the RAW name, so raw names
+    # that sanitize to the same string ("Cam 01/hero" vs "Cam-01\hero") can no longer
+    # share a run dir — the union keeps the box-day collision guard
+    s = _safe("Cam 01/hero")
+    assert s.startswith("Cam_01_hero_") and len(s) == len("Cam_01_hero_") + 6
+    assert _safe("Cam 01/hero") == s                      # deterministic
+    assert _safe("Cam-01\\hero") != s                     # collision separated
 
 
 def test_prune_old_files_keeps_newest(tmp_path):
@@ -179,7 +184,9 @@ def test_analyze_agreement_flag_lifecycle(monkeypatch, tmp_path):
     c._last_analyze_agreement = 0.4                      # leftover from another camera
     _stub_llm(monkeypatch, cm, semantics={"c": 1})       # agreement defaults to 1.0
     c.analyze_reference("CamC")
-    assert c._last_analyze_agreement == 1.0              # fresh 100% read RESETS the flag
+    # fresh 100% read RESETS the flag — unanimous reads store None (the flag only
+    # ever carries a real contest), so run_match can never log a ghost warning
+    assert c._last_analyze_agreement is None
 
 
 # --------------------------------------------------------------------- refine
@@ -246,7 +253,7 @@ def test_scenarios_restore_found_state_on_exception(monkeypatch, tmp_path):
     monkeypatch.setattr(cm.ap, "read_state", lambda *a, **k: found)
     applied = []
     monkeypatch.setattr(cm.ap, "apply_state",
-                        lambda rig, base, st, cam=None: applied.append(st) or [])
+                        lambda rig, base, st, cam=None, **k: applied.append(st) or [])
     board = [{"key": k, "label": k, "why": "w", "state": LightingState()}
              for k in ("a", "b")]
     monkeypatch.setattr(cm.scen, "build_scenarios", lambda *a, **k: board)
@@ -357,7 +364,7 @@ def test_render_finals_restores_found_light(monkeypatch, tmp_path):
     monkeypatch.setattr(cm.ap, "read_state", lambda *a, **k: found)
     applied = []
     monkeypatch.setattr(cm.ap, "apply_state",
-                        lambda rig, base, st, cam=None: applied.append(st) or [])
+                        lambda rig, base, st, cam=None, **k: applied.append(st) or [])
     monkeypatch.setattr(cm.rd, "render_frame", lambda *a, **k: "frame.png")
     for name in ("CamA", "CamB"):
         c.session.entry(name).state = LightingState()
@@ -375,12 +382,14 @@ def test_render_finals_restores_even_when_a_render_raises(monkeypatch, tmp_path)
     monkeypatch.setattr(cm.ap, "read_state", lambda *a, **k: found)
     applied = []
     monkeypatch.setattr(cm.ap, "apply_state",
-                        lambda rig, base, st, cam=None: applied.append(st) or [])
+                        lambda rig, base, st, cam=None, **k: applied.append(st) or [])
     monkeypatch.setattr(cm.rd, "render_frame",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("vray blew up")))
     c.session.entry("CamA").state = LightingState()
-    with pytest.raises(RuntimeError, match="vray blew up"):
-        c.render_finals_vray(["CamA"], str(tmp_path / "out"), lambda c_, s: None)
+    # union contract: one camera's raise is fault-isolated (recorded, batch continues)
+    # AND the found light is still restored by the finally
+    res = c.render_finals_vray(["CamA"], str(tmp_path / "out"), lambda c_, s: None)
+    assert res["CamA"].startswith("error:") and "vray blew up" in res["CamA"]
     assert applied[-1] is found
 
 
@@ -391,7 +400,7 @@ def test_prepare_vantage_jobs_restores_found_light(monkeypatch, tmp_path):
     monkeypatch.setattr(cm.ap, "read_state", lambda *a, **k: found)
     applied = []
     monkeypatch.setattr(cm.ap, "apply_state",
-                        lambda rig, base, st, cam=None: applied.append(st) or [])
+                        lambda rig, base, st, cam=None, **k: applied.append(st) or [])
     monkeypatch.setattr(cm.vt, "export_vrscene", lambda path, name: path)
     c.session.entry("CamA").state = LightingState()
     jobs = c.prepare_vantage_jobs(["CamA"], str(tmp_path), lambda c_, s: None)

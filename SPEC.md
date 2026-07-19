@@ -3,8 +3,8 @@
 **Owner:** Aasish Muchala · **Type:** internal Sthyra pipeline tool (not sold) ·
 **Target:** 3ds Max 2026 (Py 3.11, PySide6) + V-Ray 7 + Chaos Vantage 3.x ·
 **Sibling of:** MaxDirector (same Omega gateway, same hexagon, key borrowed automatically) ·
-**Status:** v0.9.4 ROUND-4 AUDIT · adversarial swarm fixes (113 findings resolved) · 3154 tests · live benchmark: Phase C 99.14 ASSERTED (deterministic legs from basin) · Phase B full live pipeline 98.25, az error 4° · stack doc-verified ·
-awaiting on-box bring-up (tasks/plan.md P0).
+**Status:** v0.10.0 UNION 2026-07-20 · merges the box-day line (software exposure with auto-detected inert hosts · no-render mode · PATH-TO-10 · round-3 stress, 50+ fixes) with the audit-swarm line (round-4: 113 findings · hostile-mock pymxs harness · measured exposure-host port) · tests: run `pytest tests -q` for the live count · live benchmark: Phase C 99.14 ASSERTED (deterministic legs from basin) · Phase B full live pipeline 98.25, az error 4° · on-box recovery: EV err 0.00, score 30.6→98.3 ·
+on-box bring-up COMPLETE (13/13 harness + box-day live runs; see AUDIT_ROUND4.md).
 
 ## 1. Summary
 Pick a camera from the shot board, bind a lighting reference image, press MATCH LIGHTING.
@@ -71,7 +71,9 @@ maxgaffer/api.py      public API (MaxDirector LightMatch stage): match_camera / 
 maxgaffer/ui/dock.py  PySide6 dock: camera board · reference · match/batch · rig · vantage
 maxgaffer/sidecar/    optional Pillow stats/b64 CLI for a system python
 scripts/              install.bat · preflight.py
-tests/                3154 pytest, pure core, incl. round-4 audit + round-2 stress + v0.3 regressions
+tests/                pure-core pytest suite (`pytest tests -q` is the source of truth),
+                      incl. round-4 audit + hostile-mock harness + stress rounds +
+                      no-render + software-exposure regressions
 ```
 
 ## 4. The match pipeline (with guard placement)

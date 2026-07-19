@@ -109,5 +109,8 @@ def to_text(raw: Dict, max_chars: int = 12000) -> str:
 
     text = "\n".join(lines)
     if len(text) > max_chars:
-        text = text[:max_chars - 22] + "\n…digest truncated…"
+        suffix = "\n…digest truncated…"
+        text = text[:max(0, max_chars - len(suffix))] + suffix
+        if len(text) > max_chars:      # max_chars smaller than the suffix itself
+            text = text[:max_chars]
     return text

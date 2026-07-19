@@ -51,12 +51,12 @@ def read_png_rgb(path: str, max_dim: int = 160) -> Optional[List[List[Tuple[int,
         chunk = data[pos + 8:pos + 8 + length]
         pos += 12 + length  # length + type + data + crc
         if ctype == b"IHDR":
-            if length != 13:                # malformed IHDR: not a PNG we can trust
-                return None
+            if length != 13 or len(chunk) != 13:    # truncated/malformed IHDR: not a
+                return None                         # PNG we can trust
             try:
                 width, height, bit_depth, color_type, _, _, interlace = struct.unpack(
                     ">IIBBBBB", chunk)
-            except struct.error:            # truncated chunk — anything odd returns None
+            except struct.error:            # unreachable after the length gate — belt
                 return None
         elif ctype == b"IDAT":
             idat.extend(chunk)
@@ -82,7 +82,9 @@ def read_png_rgb(path: str, max_dim: int = 160) -> Optional[List[List[Tuple[int,
 
     # subsample factor before unfiltering rows we keep — but filters reference the PREVIOUS
     # row, so every row must still be unfiltered in order; we just skip the pixel extraction.
-    step = max(1, max(width, height) // max(1, max_dim))
+    # ceil-divide: floor made 480//256 == 1, so the 256..511px band (the DEFAULT loop
+    # render width!) processed every pixel and the "at most max_dim" contract was a lie
+    step = max(1, -(-max(width, height) // max(1, max_dim)))
     rows: List[List[Tuple[int, int, int]]] = []
     prev = bytearray(stride)
     offset = 0

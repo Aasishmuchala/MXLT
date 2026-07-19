@@ -81,10 +81,26 @@ def main():
     tmp = tempfile.mkdtemp(prefix="maxgaffer_spike_")
     print(f"\n=== MaxGaffer on-box spikes · probes → {tmp} ===\n")
 
+    # ---------- 0 CRASH-risk advisory (#14): this script renders ~15 probes — with a
+    # Vantage live link up AND V-Ray GPU on one card, that's the documented VRAM crash
+    try:
+        from maxgaffer.maxbridge import vantage as _vt
+
+        _port = _vt.link_running()
+        _rcls = str(rt.classOf(rt.renderers.current)).lower()
+        if _port is not None and "gpu" in _rcls:
+            print("  [!!] advisory: Vantage live link is UP (port "
+                  f"{_port}) and the renderer is V-Ray GPU — probe renders while the "
+                  "link streams can VRAM-crash Max (checklist #14). Close the link or "
+                  "switch V-Ray to CPU before continuing.\n")
+    except Exception:
+        pass
+
     # ---------- A environment
     check("A", "V-Ray is the active renderer", lambda: (
         str(rt.classOf(rt.renderers.current)) if "vray" in
-        str(rt.classOf(rt.renderers.current)).lower() else (_ for _ in ()).throw(
+        str(rt.classOf(rt.renderers.current)).lower().replace("_", "")
+        else (_ for _ in ()).throw(
             RuntimeError(f"renderer is {rt.classOf(rt.renderers.current)}"))))
 
     # ---------- B cameras
@@ -193,7 +209,15 @@ def main():
             if darkened != (delta > 0):
                 raise RuntimeError(f"INVERTED: key moved {k1:.4f}→{k2:.4f} after "
                                    f"{delta:+.0f} EV (higher EV must darken)")
-            return f"{delta:+.0f} EV moved key {k1:.4f} → {k2:.4f} the right way ✓"
+            import math as _m
+
+            moved = abs(_m.log2(max(1e-5, k1) / max(1e-5, k2)))
+            if moved < 0.5 * abs(delta):   # sign alone can pass on a near-zero delta (V-Ray GPU did)
+                raise RuntimeError(
+                    f"INERT: {delta:+.0f} EV moved the render only {moved:.2f} stops — this "
+                    "renderer's exposure is display-stage only; enable "
+                    "software_exposure (Settings) — the runtime check also auto-flips it")
+            return f"{delta:+.0f} EV moved key {k1:.4f} → {k2:.4f} ({moved:.2f} stops) ✓"
 
         check("H", "EV direction (measured)", ev_direction)
 
@@ -251,6 +275,8 @@ def main():
 
                 pre_file = sc.get_dome_texture(rig["dome"])
                 pre_rot = sc.read_dome_rotation(rig["dome"])
+                pre_texmap = sc.get_prop(rig["dome"], ("texmap",))
+                pre_tex_on = sc.get_prop(rig["dome"], sc.DOME_TEX_ON)
                 ref_png = os.path.join(tmp, "base.png")
                 if not os.path.exists(ref_png) and not render_frame(cam, ref_png, 160, 90):
                     raise RuntimeError("no probe render to seed from")
@@ -274,7 +300,16 @@ def main():
                 finally:   # the artist's dome comes back even if the check raises
                     if pre_file:
                         sc.set_dome_texture(rig["dome"], pre_file)
+                    elif pre_texmap is not None:
+                        # the spike only overwrote the FILE on the artist's own texmap —
+                        # blank it back and restore the on/off switch
+                        sc.set_prop(pre_texmap, sc.DOME_TEX_FILE, "")
+                        if pre_tex_on is not None:
+                            sc.set_prop(rig["dome"], sc.DOME_TEX_ON, pre_tex_on)
                     else:
+                        # the spike CREATED the texmap — merely disabling it leaves the
+                        # tmp .hdr bound (a later re-enable resurrects the spike's sky)
+                        sc.set_prop(rig["dome"], ("texmap",), None)
                         sc.set_prop(rig["dome"], sc.DOME_TEX_ON, False)
                     sc.write_dome_rotation(rig["dome"], pre_rot)
                 if bound != out:
@@ -286,6 +321,28 @@ def main():
                         "rendered ✓ (u-origin #18 stays a visual check)")
 
             check("Q/#17", "dome seed end-to-end (v0.9)", dome_seed)
+
+        # ---------- S color management detection (#19) — the judgment stays visual, but
+        # the MODE is queryable (Max 2024+ ColorPipelineMgr): OCIO/ACES means the saved
+        # loop PNG may lack the display transform → biased solver (docs/STRESS.md §1)
+        def color_mode():
+            mgr = getattr(rt, "ColorPipelineMgr", None)
+            if mgr is None:
+                return ("no ColorPipelineMgr (classic gamma workflow) — #19 low risk; "
+                        "still eyeball one probe PNG vs the VFB")
+            out = {}
+            for prop in ("Mode", "mode", "OCIOConfigPath", "displayName", "viewName",
+                         "defaultDisplay", "defaultView", "outputConversion"):
+                try:
+                    v = getattr(mgr, prop)
+                except Exception:
+                    continue
+                if v is not None:
+                    out[prop] = str(v)[:60]
+            return (f"{out} — if Mode says OCIO/ACES, hold a probe PNG next to the VFB "
+                    "BEFORE trusting any score (#19)")
+
+        check("S/#19", "color management mode (detection)", color_mode)
 
         # ---------- R scenario board core (v0.9) — pure, no renders
         def board_core():
@@ -308,11 +365,22 @@ def main():
             RESULTS.append(("REST", "scene restored after spikes", "FAIL",
                             f"{type(e).__name__}: {e} — MANUAL RESTORE NEEDED"))
 
-    # ---------- L vrscene export (#7)
+    # ---------- L vrscene export (#7) — the export switches the active viewport camera;
+    # put the artist's back afterwards
+    pre_vp_cam = None
+    try:
+        pre_vp_cam = rt.viewport.getCamera()
+    except Exception:
+        pass
     check("L/#7", "vrscene export", lambda: (
         vt.export_vrscene(os.path.join(tmp, "spike.vrscene"),
                           cams[0]["name"] if cams else None)
         or (_ for _ in ()).throw(RuntimeError("vrayExportVRScene missing/failed"))))
+    if pre_vp_cam is not None:
+        try:
+            rt.viewport.setCamera(pre_vp_cam)
+        except Exception:
+            pass
 
     # ---------- M vantage executable (#8) — stock 3.x has NO render CLI; finals default
     # to the V-Ray backend, vantage.exe is only needed for live link / manual batch queue
@@ -326,11 +394,35 @@ def main():
             cfg.vantage_console if os.path.exists(cfg.vantage_console)
             else (_ for _ in ()).throw(RuntimeError(f"not found: {cfg.vantage_console}"))))
 
-    # ---------- N live link probe (#9) — NOTE: the V-Ray action is a TOGGLE; executing it
-    # here may genuinely start (or stop) a link session
-    ok, how = vt.start_live_link()
-    RESULTS.append(("N/#9", "vantage live link (toggle action)", "PASS" if ok else "MANUAL", how))
-    print(f"  [{'PASS' if ok else 'MANUAL'}] N/#9 vantage live link — {how}")
+    # ---------- N live link probe (#9) — the V-Ray action is a TOGGLE: probing while an
+    # artist's link is up would KILL it. The link streams on port 20701 (20703 on V-Ray
+    # 7.3 DR2) — a listener there means a link is already running: report it, never
+    # touch it. With nothing listening the toggle can only START a link, which is what
+    # the probe exists to verify — and the manual stop instruction is printed.
+    def _link_listening(ports=(20701, 20703)):
+        import socket
+
+        for port in ports:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                    return port
+            except OSError:
+                continue
+        return None
+
+    live_port = _link_listening()
+    if live_port is not None:
+        detail = f"port {live_port} already listening — a link is running; left untouched"
+        RESULTS.append(("N/#9", "vantage live link (toggle action)", "PASS", detail))
+        print(f"  [PASS] N/#9 vantage live link — {detail}")
+    else:
+        ok, how = vt.start_live_link()
+        RESULTS.append(("N/#9", "vantage live link (toggle action)",
+                        "PASS" if ok else "MANUAL", how))
+        print(f"  [{'PASS' if ok else 'MANUAL'}] N/#9 vantage live link — {how}")
+        if ok:
+            print("       note: the probe STARTED a link — to stop it, run V-Ray's "
+                  "'Initiate a Live-Link to Chaos Vantage' action once more")
 
     # ---------- O draft sampler props (#15) — names only, nothing changed
     check("O/#15", "draft sampler property names", lambda: {

@@ -26,8 +26,7 @@ import sys
 import pytest
 
 from tests.mock_pymxs import (CHAOS_SEED, UNDEFINED, FakeMaxRuntime, MockColor,
-                              MockNode, MockObject, MockPoint3, MockRtError,
-                              MockTextureMap, install)
+                              MockNode, MockObject, MockPoint3, MockTextureMap, install)
 
 from maxgaffer.core.genome import LightingState
 from maxgaffer.maxbridge import apply as ap

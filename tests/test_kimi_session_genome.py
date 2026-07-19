@@ -131,12 +131,15 @@ def test_one_bad_camera_does_not_kill_the_load(tmp_path, caplog):
     p.write_text(json.dumps({"cameras": {
         "good": {"reference": "r.jpg",
                  "state": {"values": {"sun.intensity": "bright", "sun.altitude_deg": 10.0}}},
-        "broken": {"locks": 5},                          # int is not iterable → raises
+        "broken": {"locks": 5},                          # int locks: junk field
     }}))
-    with caplog.at_level(logging.WARNING, logger="maxgaffer.core.session"):
-        s = Session.load(str(p))
-    assert set(s.cameras) == {"good"}                   # the broken entry is skipped
-    assert "broken" in caplog.text
+    s = Session.load(str(p))
+    # the union hardening ABSORBS junk fields instead of discarding the camera: both
+    # cameras survive the load, and the int locks neutralize to an empty set (less
+    # data loss than the old skip-the-whole-entry behavior; the skip path remains as
+    # a belt for from_dict raises)
+    assert set(s.cameras) == {"good", "broken"}
+    assert s.entry("broken").locks == set()
     st = s.entry("good").state                          # and inside an entry, only the
     assert "sun.intensity" not in st.values             # bad KEY is dropped — the camera
     assert st.get("sun.altitude_deg") == 10.0           # and its good values survive

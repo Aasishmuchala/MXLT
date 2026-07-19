@@ -100,7 +100,18 @@ def main():
         def _vantage():
             from maxgaffer.maxbridge import config as cfgmod
 
-            p = cfgmod.load().vantage_exe
+            cfg = cfgmod.load()
+            # stock Vantage 3.x HAS no render CLI (Chaos-confirmed) — the Developer
+            # Edition console is only required when the artist explicitly chose the
+            # vantage_cli backend; otherwise check the GUI exe used for the live link
+            if cfg.final_render_backend == "vantage_cli":
+                p = cfg.vantage_console
+                if not os.path.exists(p):
+                    raise RuntimeError(f"not found: {p} — the vantage_cli backend needs "
+                                       "the Developer Edition console "
+                                       "(config.vantage_console)")
+                return p
+            p = cfg.vantage_exe
             if not os.path.exists(p):
                 raise RuntimeError(f"not found: {p} — set config.vantage_exe; the live "
                                    "link can still start Vantage via V-Ray's toolbar action")

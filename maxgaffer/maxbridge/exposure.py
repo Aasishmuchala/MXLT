@@ -59,16 +59,18 @@ def _rt():
 def _scene_exposure_control():
     """Whatever is assigned to the scene exposure slot, ANY class (native
     Photographic/Logarithmic included), None when the slot is truly empty."""
-    try:
+    try:                # _rt() inside the try — ExposureHost must be constructible off-Max
         return _rt().SceneExposureControl.exposureControl
     except Exception:
         return None
 
 
 def _find_exposure_control():
-    """The scene's V-RAY exposure control, or None — MaxGaffer only drives V-Ray's."""
+    """The scene's V-RAY exposure control, or None — MaxGaffer only drives V-Ray's.
+    Class names carry underscores on real boxes (the renderer is
+    V_Ray_GPU_7__update_2_hotfix_2) — normalize before matching."""
     ec = _scene_exposure_control()
-    if ec is not None and "vray" in str(_rt().classOf(ec)).lower():
+    if ec is not None and "vray" in str(_rt().classOf(ec)).lower().replace("_", ""):
         return ec
     return None
 
@@ -174,7 +176,13 @@ class ExposureHost:
             # native Physical in Target mode: exposure_value IS the EV (verified)
             gain_type = get_prop(self.cam, CAM_EV_TYPE)
             ev_direct = get_prop(self.cam, CAM_EV)
-            if ev_direct is not None and (gain_type is None or int(gain_type) == 1):
+            try:
+                target_mode = gain_type is None or int(gain_type) == 1
+            except (TypeError, ValueError):
+                # a non-int enum (broken plugin prop) must not kill read_state —
+                # treat as not-Target and fall through to the exposure triangle
+                target_mode = False
+            if ev_direct is not None and target_mode:
                 try:
                     return float(ev_direct)
                 except (TypeError, ValueError):

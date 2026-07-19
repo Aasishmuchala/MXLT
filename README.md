@@ -16,6 +16,12 @@ Target: **3ds Max 2026 (Py 3.11, PySide6) + V-Ray 7 + Chaos Vantage 3.x.** Inter
 pipeline tool, sibling of MaxDirector (same Omega gateway, same hexagon architecture, same
 key — borrowed automatically if MaxDirector is installed).
 
+![MaxGaffer dock](docs/ui/dock.png)
+
+*The dock (offscreen-rendered by `scripts/ui_preview.py` — regenerate after any UI change;
+the [scenario board](docs/ui/board.png), [change report](docs/ui/report.png),
+[plan preview](docs/ui/plan.png) and [settings](docs/ui/settings.png) render the same way).*
+
 ## Who does what (the split of powers)
 
 | Job | Owner | Why |
@@ -119,9 +125,11 @@ Tick **deep match → 99** for hero shots. The precise promise, measured live:
   engine lands **≥99**: annealed steps and tightening solver deadbands finish what
   exploration started, then an LLM-free **adaptive coordinate line search** (climb while a
   rendered nudge measurably improves the critic, accelerate on streaks, halve on failure,
-  EV/WB are axes too so geometry can never fake exposure) squeezes to the optimum.
-  Live benchmark, asserted: **99.14 from the basin, deterministic legs only**; full live
-  pipeline **14.3 → 98.25 with a 4° sun-direction error**.
+  EV/WB are axes too so geometry can never fake exposure — and when single axes stall, the
+  coupled pairs are probed **diagonally** so a tonal↔geometry compensation ridge can't
+  trap the search) squeezes to the optimum.
+  Live benchmark, asserted: **99.01 from the basin, deterministic legs only**; full live
+  pipeline **18.7 → 99.3** (2026-07-18, post round-3 stress audit).
 * when the reference is a **different scene**, no lighting can produce its histogram —
   the engine converges to the scene's own optimum and the report SAYS SO: *"ceiling
   proven — the gap left is content, not lighting."* Two consecutive diminishing-return
@@ -227,6 +235,23 @@ structurally refused, not just prompted).
 | 14 | GPU contention: Vantage live link + V-Ray GPU loop renders on one card | run a match with the link up on a heavy scene; if VRAM-starved, set V-Ray to CPU for matching or close the link during MATCH | workflow note, no code |
 | 15 | Draft-sampler property names (opt-in checkbox) | tick "draft sampler", run a 1-iteration match: log shows which props changed + restored; `showProperties renderers.current` if none matched | `draft.DRAFT_PROPS` |
 | 16 | Dome HDRI file property + photometric light intensity prop | RIG → HDRI… on a dome; dim a photometric group slider | `scene.DOME_TEX_FILE`, `scene.LIGHT_MULT` |
+| 17 | Dome seed end-to-end: build .hdr from the reference, bind, render, restore | automated (spike Q) | `core.domeseed`, `scene.set_dome_texture` |
+| 18 | Seeded pano u-origin: the sun disc lands where the solved azimuth says | visual — compare disc position vs `sun.azimuth_deg` in Vantage | `domeseed.build_seed` yaw math |
+| 19 | Color management: OCIO/ACES display transform vs saved loop PNGs | automated detection (spike S); if Mode ≠ gamma, eyeball one probe vs the VFB | `docs/STRESS.md` §1 |
+
+## Modes (config.json / Settings)
+
+* **`software_exposure`** — V-Ray GPU applies camera/exposure-control EV only at the
+  VFB display stage, so saved loop renders don't reflect the EV/WB the solver sets
+  (measured on-box: 5 stops of EV moved the saved key < 2e-5). With this on, MaxGaffer
+  applies EV/WB to every loop/board/probe/final frame in software (anchored at the
+  camera's pre-match snapshot), making the analytic solver renderer-independent. A
+  runtime 2-probe check at match start **auto-enables it** when the host is measured
+  inert, so the flag mostly documents itself.
+* **`no_renders`** — apply-only mode: MATCH = analyze → first guess → ONE undoable
+  apply → read-back verification → change report. Loop, sweep, board probes, plan
+  measurement and finals are all off. For live-link-driven workflows (Vantage mirrors
+  every apply) and boxes where renders are unavailable.
 
 ## Known failure modes (stress-tested, round 2)
 
@@ -257,10 +282,10 @@ ingest via Max's own bitmap I/O, overcast can dim instead of disable the sun
 ## API (MaxDirector integration / any pipeline tool)
 
 ```python
-from maxgaffer.api import match_camera, match_all_cameras, render_cameras_vantage
+from maxgaffer.api import match_camera, match_all_cameras, render_cameras
 result = match_camera("PhysCam_Hero", r"D:/refs/dusk.jpg", log=print)   # → score/state/renders
 match_all_cameras(log=print)                                            # overnight queue
-render_cameras_vantage(["PhysCam_Hero"], r"D:/out", print)              # vantage batch
+render_cameras(["PhysCam_Hero"], r"D:/out", print)     # finals (V-Ray backend by default)
 ```
 Main-thread only (drives pymxs); state persists in the same session sidecar the dock uses,
 so UI and API are interchangeable mid-project. This module IS the "LightMatch engine"
@@ -270,7 +295,7 @@ MaxDirector's SPEC deferred to its P2.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install pytest pillow
-.venv/bin/python -m pytest tests/ -q          # 3154 tests, all pure core
+.venv/bin/python -m pytest tests/ -q          # full pure-core suite (see SPEC for count)
 ```
 
 The suite catches the classics: EV/WB sign conventions, the 180°-wrap ambiguity, LLM junk

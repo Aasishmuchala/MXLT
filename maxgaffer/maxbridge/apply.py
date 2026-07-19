@@ -43,6 +43,23 @@ def _baseline_of(baselines: Dict[str, float], name: str) -> float:
     return base if abs(base) > BASELINE_EPSILON else 1.0
 
 
+def _authored_off(baselines: Dict[str, float], name: str, current_mult) -> bool:
+    """True for a light whose 0 baseline is REAL: the artist authored it off (baseline 0
+    AND the light sits at ~0 right now). Its dimmer carries no signal — reads report 0,
+    writes keep it pinned at 0. A 0 baseline on a light that is visibly lit is legacy
+    POISON instead (stale sidecar / hand edit) and is treated as authored 1.0 by
+    ``_baseline_of`` — same discriminator on the read and apply paths."""
+    try:
+        if not (name in baselines and float(baselines[name]) == 0.0):
+            return False
+    except (TypeError, ValueError):
+        return False
+    try:
+        return current_mult is None or abs(float(current_mult)) <= BASELINE_EPSILON
+    except (TypeError, ValueError):
+        return True
+
+
 def _state_float(state: LightingState, key: str, warnings: List[str]):
     """float() of a state value, fault-isolated — states are clamped floats via set()/
     from_dict, but the dicts are public, so a bad raw value downgrades to a warning
@@ -123,11 +140,19 @@ def read_state(rig: Dict[str, Any], baselines: Dict[str, float],
     for group, lights in (rig.get("groups") or {}).items():
         factors: List[float] = []
         for lt in lights:
-            base = _baseline_of(baselines, _light_name(lt))
+            name = _light_name(lt)
+            base = _baseline_of(baselines, name)
             v = sc.get_prop(lt, sc.LIGHT_MULT, base)
+            if _authored_off(baselines, name, v):
+                # authored-off light (baseline 0 AND sitting at 0): writes pin it at
+                # 0 × factor = 0, so it carries no dimmer signal — read it as 0, not
+                # against a phantom 1.0 baseline. A 0 baseline on a VISIBLY LIT light
+                # is legacy poison instead: _baseline_of reads it as authored 1.0.
+                factors.append(0.0)
+                continue
             try:
-                factors.append(float(v) / base)
-            except (TypeError, ValueError, ZeroDivisionError):
+                factors.append(float(v) / base)   # base is never 0 (_baseline_of floor)
+            except (TypeError, ValueError):
                 factors.append(1.0)
         if factors:
             st.groups[group] = sum(factors) / len(factors)
@@ -144,18 +169,24 @@ def read_state(rig: Dict[str, Any], baselines: Dict[str, float],
 
 
 def apply_state(rig: Dict[str, Any], baselines: Dict[str, float], state: LightingState,
-                camera=None) -> List[str]:
-    """Write the state to the scene inside one undo record. Returns warnings (params the
-    rig couldn't take)."""
+                camera=None, undo: bool = True) -> List[str]:
+    """Write the state to the scene — one undo record by default. ``undo=False`` is for
+    loop/probe applies (130+ per deep match would flood the artist's undo stack); their
+    official revert is the pre-match snapshot. Returns warnings (params the rig couldn't
+    take)."""
     import pymxs
 
     warnings: List[str] = []
-    with pymxs.undo(True, "MaxGaffer lighting"):
+    ctx = pymxs.undo(True, "MaxGaffer lighting") if undo else pymxs.undo(False)
+    with ctx:
         _apply_inner(rig, baselines, state, camera, warnings)
-    try:
-        _rt().redrawViews()
-    except Exception:
-        pass
+    if undo:
+        # probe/loop applies (undo=False) fire 130+ times per deep match — redrawing the
+        # viewport for each is a redraw storm; manual applies stay live
+        try:
+            _rt().redrawViews()
+        except Exception:
+            pass
     return warnings
 
 
@@ -198,20 +229,39 @@ def _apply_inner(rig, baselines, state: LightingState, camera, warnings: List[st
             how = sc.write_dome_rotation(dome, state.get("dome.rotation_deg"))
             if how == "failed":
                 warnings.append("dome.rotation_deg: could not rotate texmap or node")
+    elif any(k.startswith("dome.") for k in state.values):
+        # same contract as the sun branch — an orphaned saved state (dome deleted
+        # or replaced since the match) must never be dropped silently
+        warnings.append("state has dome.* but the rig has no dome light")
 
+    rig_groups = rig.get("groups") or {}
     for group, factor in state.groups.items():
-        lights = (rig.get("groups") or {}).get(group, [])
+        lights = rig_groups.get(group, [])
+        if not lights:
+            warnings.append(f"group.{group}: no such light group in this rig "
+                            "(layer renamed or lights removed?) — value dropped")
+            continue
         try:
             factor = float(factor)
         except (TypeError, ValueError):
-            if lights:
-                warnings.append(f"group.{group}: non-numeric factor {factor!r} — skipped")
+            warnings.append(f"group.{group}: non-numeric factor {factor!r} — skipped")
             continue
+        lit = 0
         for lt in lights:
-            base = _baseline_of(baselines, _light_name(lt))
+            if bool(sc.get_prop(lt, sc.LIGHT_ON)):
+                lit += 1
+            name = _light_name(lt)
+            if _authored_off(baselines, name, sc.get_prop(lt, sc.LIGHT_MULT, None)):
+                # authored-off light: 0 × factor = 0 — the dimmer must not switch it on
+                sc.set_prop(lt, sc.LIGHT_MULT, 0.0)
+                continue
+            base = _baseline_of(baselines, name)
             if sc.set_prop(lt, sc.LIGHT_MULT, base * factor) is None:
                 warnings.append(f"group.{group}: light '{getattr(lt, 'name', '?')}' "
                                 "has no multiplier")
+        if lit == 0 and float(factor) > 1e-6:
+            warnings.append(f"group.{group}: all {len(lights)} light(s) are DISABLED — "
+                            "the dimmer moves nothing until they're switched on")
 
     host = ExposureHost(camera)
     if "exposure.ev" in state.values:

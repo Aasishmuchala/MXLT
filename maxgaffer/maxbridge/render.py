@@ -29,14 +29,16 @@ def render_frame(camera, out_path: str, width: int, height: int) -> Optional[str
     file from an earlier run; the bitmap is closed in a finally, so a failed ``save``
     leaks no framebuffer."""
     rt = _rt()
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     try:
-        if os.path.exists(out_path):
+        if os.path.exists(out_path):   # success can never be a stale file from an earlier run
             os.remove(out_path)
     except OSError:
         pass
     old_w, old_h = None, None
     try:
+        # inside the try: a path-length/permission failure here must degrade to the
+        # same None every other failure mode returns, not raise through the loop
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         try:
             rt.renderSceneDialog.close()   # open dialog blocks programmatic size changes
         except Exception:

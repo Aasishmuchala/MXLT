@@ -69,6 +69,7 @@ def initial_state(
     locks = locks or set()
     st = current.copy()
     why: List[str] = []
+    camera_yaw_deg = _num(camera_yaw_deg, 0.0)   # a degenerate camera transform ≠ crash
 
     def put(key: str, value: float, note: str) -> None:
         has = (key in st.values) or (

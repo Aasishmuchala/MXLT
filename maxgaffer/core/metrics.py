@@ -26,9 +26,13 @@ def _load_pixels(path: str, max_dim: int = 256):
     """→ (flat [(r,g,b)…], width, height) subsampled, or None. Pillow first, stdlib PNG
     floor second. Dimensions are kept so the key can be center-weighted."""
     try:
-        from PIL import Image  # type: ignore
+        from PIL import Image, ImageOps  # type: ignore
 
         with Image.open(path) as im:
+            # phone references carry EXIF orientation — without honoring it a portrait
+            # shot reads sideways and the DIRECTION grid (where the light lives) is
+            # garbage for both the critic and the sun solve
+            im = ImageOps.exif_transpose(im)
             im = im.convert("RGB")
             im.thumbnail((max_dim, max_dim))
             w, h = im.size
@@ -55,14 +59,20 @@ def _f_lab(t: float) -> float:
     return t ** (1.0 / 3.0) if t > 0.008856 else (7.787 * t + 16.0 / 116.0)
 
 
-def _rgb_to_lab(r8: int, g8: int, b8: int) -> Tuple[float, float, float]:
-    r, g, b = (_srgb_to_linear(v / 255.0) for v in (r8, g8, b8))
+def _lab_from_linear(r: float, g: float, b: float) -> Tuple[float, float, float]:
+    """LAB from LINEAR-light rgb — lets the hot loop reuse its linear conversion
+    instead of paying the sRGB decode twice per pixel."""
     # sRGB D65
     x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047
     y = 0.2126 * r + 0.7152 * g + 0.0722 * b
     z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883
     fx, fy, fz = _f_lab(x), _f_lab(y), _f_lab(z)
     return 116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)
+
+
+def _rgb_to_lab(r8: int, g8: int, b8: int) -> Tuple[float, float, float]:
+    r, g, b = (_srgb_to_linear(v / 255.0) for v in (r8, g8, b8))
+    return _lab_from_linear(r, g, b)
 
 
 def _rgb_to_hue_chroma(r: int, g: int, b: int) -> Tuple[float, float]:
@@ -86,6 +96,8 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
         return None
     pixels, w, h = loaded
     n = len(pixels)
+    if n == 0:      # degenerate decode — every other failure mode returns None too
+        return None
     # center-weighted key (photographic AE practice): the subject usually sits in the
     # middle half of the frame, so weighting it 60/40 over the full frame damps sky/floor
     # albedo contamination of the exposure solve
@@ -109,9 +121,11 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
         mean_rgb[0] += r
         mean_rgb[1] += g
         mean_rgb[2] += b
-        lin_l = (0.2126 * _srgb_to_linear(r / 255.0)
-                 + 0.7152 * _srgb_to_linear(g / 255.0)
-                 + 0.0722 * _srgb_to_linear(b / 255.0))
+        # ONE sRGB decode per channel per pixel — reused for luminance AND LAB
+        lin_r = _srgb_to_linear(r / 255.0)
+        lin_g = _srgb_to_linear(g / 255.0)
+        lin_b = _srgb_to_linear(b / 255.0)
+        lin_l = 0.2126 * lin_r + 0.7152 * lin_g + 0.0722 * lin_b
         log_l = math.log(max(lin_l, 1e-5))
         log_sum += log_l
         x, y = idx % w, idx // w
@@ -126,7 +140,7 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
         c5 = min(4, x * 5 // max(1, w)) + 5 * min(4, y * 5 // max(1, h))
         g5_sum[c5] += lum
         g5_n[c5] += 1
-        L, a, bb = _rgb_to_lab(r, g, b)
+        L, a, bb = _lab_from_linear(lin_r, lin_g, lin_b)
         for i, v in enumerate((L, a, bb)):
             lab_sum[i] += v
             lab_sq[i] += v * v
@@ -139,13 +153,31 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
     hi_thresh = lums[max(0, int(0.75 * len(lums)) - 1)]
     hi_sum = [0.0, 0.0, 0.0]
     hi_n = 0
+    hi_clipped = 0
+    incl_sum = [0.0, 0.0, 0.0]   # INCLUSIVE mean (clipped pixels counted) — the symmetric
+    incl_n = 0                   # same-scene signal; see lab_mean_hi_full below
     for r, g, b in pixels:
         if (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0 >= hi_thresh:
+            # per-channel-saturated pixels read as NEUTRAL in LAB (a*=b*=0) — the
+            # illuminant color they once carried is gone, and counting them drags the
+            # highlight-quartile b* toward 0 (software-exposed 8-bit frames clip
+            # exactly this way, over-driving the WB solve). Excluded unless the whole
+            # quartile is clipped, in which case the old behavior is the only signal.
             L, a, bb = _rgb_to_lab(r, g, b)
+            incl_sum[0] += L
+            incl_sum[1] += a
+            incl_sum[2] += bb
+            incl_n += 1
+            if max(r, g, b) >= 254:
+                hi_clipped += 1
+                continue
             hi_sum[0] += L
             hi_sum[1] += a
             hi_sum[2] += bb
             hi_n += 1
+    hi_clip_frac = hi_clipped / max(1, incl_n)
+    if hi_n == 0 and hi_clipped:      # fully blown quartile — fall back, don't zero out
+        hi_sum, hi_n = incl_sum, incl_n
 
     def pct(p: float) -> float:
         return lums[min(n - 1, int(p / 100.0 * n))]
@@ -169,6 +201,12 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
         "grid": [round(g, 5) for g in grid],   # mean-centered 3×3 luminance pattern
         "grid5": [round(g, 5) for g in grid5],  # 5×5 — finer directional acuity
         "lab_mean_hi": ([s / hi_n for s in hi_sum] if hi_n else lab_mean),
+        # INCLUSIVE highlight mean (clipped pixels counted, neutral-drag and all) — the
+        # solver switches to it when BOTH images clip heavily: same-scene matches need
+        # symmetric highlight populations or the WB anchor drifts cool (v0.9.7 regression:
+        # per-image exclusion mismatched the populations and stalled deep match at 97.8)
+        "lab_mean_hi_full": ([s / incl_n for s in incl_sum] if incl_n else lab_mean),
+        "hi_clip_frac": hi_clip_frac,
         # geometric mean of LINEAR luminance, 60% center-weighted (blend in log space)
         "log_key": math.exp(0.6 * key_center + 0.4 * key_full),
         "p": {"5": pct(5), "25": pct(25), "50": pct(50), "75": pct(75), "95": pct(95)},

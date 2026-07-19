@@ -125,7 +125,10 @@ def test_compute_stats_corrupt_png_returns_none_not_raise(tmp_path):
 # --------------------------------------------------------------------------- hdr_min
 def test_float_to_rgbe_huge_finite_saturates():
     px = hdr_min.float_to_rgbe(2e38, 0.0, 0.0)        # exp byte would be 256 pre-fix
-    assert px == (255, 255, 255, 255)
+    # saturates to the hottest exponent with channel RATIOS preserved — a huge red
+    # pixel stays red (the old fix flattened it to white)
+    assert px[0] == 255 and px[3] == 255
+    assert px[1] == 0 and px[2] == 0
     assert all(0 <= b <= 255 for b in px)
     # ordinary values untouched
     r, g, b, e = hdr_min.float_to_rgbe(1.0, 0.5, 0.25)

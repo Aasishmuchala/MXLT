@@ -28,10 +28,22 @@ echo [1/3] optional: installing Pillow into Max's Python user-site...
 if errorlevel 1 echo     (Pillow install failed — fine, MaxGaffer runs without it)
 
 echo [2/3] registering the startup macro...
-set "STARTUP=%LOCALAPPDATA%\Autodesk\3dsMax\2026 - 64bit\ENU\scripts\startup"
-if not exist "%STARTUP%" mkdir "%STARTUP%"
-copy /Y "%REPO%\maxgaffer\startup\maxgaffer_startup.py" "%STARTUP%\" >nul
-if errorlevel 1 ( echo [!] could not copy the startup script & pause & exit /b 1 )
+rem language folder is ENU only on English installs — copy into every initialized
+rem language profile, fall back to creating ENU when none exist yet
+set "MAXUSER=%LOCALAPPDATA%\Autodesk\3dsMax\2026 - 64bit"
+set "COPIED=0"
+for /d %%L in ("%MAXUSER%\*") do (
+  if exist "%%L\scripts" (
+    if not exist "%%L\scripts\startup" mkdir "%%L\scripts\startup"
+    copy /Y "%REPO%\maxgaffer\startup\maxgaffer_startup.py" "%%L\scripts\startup\" >nul && set "COPIED=1"
+  )
+)
+if "!COPIED!"=="0" (
+  set "STARTUP=%MAXUSER%\ENU\scripts\startup"
+  if not exist "!STARTUP!" mkdir "!STARTUP!"
+  copy /Y "%REPO%\maxgaffer\startup\maxgaffer_startup.py" "!STARTUP!\" >nul
+  if errorlevel 1 ( echo [!] could not copy the startup script & pause & exit /b 1 )
+)
 
 echo [3/3] recording the clone path...
 rem A pre-existing CORRUPT config.json (crash-truncated) must not kill this step:

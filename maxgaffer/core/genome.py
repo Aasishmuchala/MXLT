@@ -109,6 +109,8 @@ def clamp(key: str, value: float) -> float:
         return fallback
     if spec.wrap:
         return _wrap_deg(v)
+    if math.isnan(v):
+        return spec.lo
     return min(spec.hi, max(spec.lo, v))
 
 
@@ -124,6 +126,12 @@ def limit_step(key: str, current: float, proposed: float, scale: float = 1.0) ->
         raise KeyError(f"unknown lighting parameter: {key}")
     step = spec.step * max(0.05, float(scale))
     cur, prop = float(current), float(proposed)
+    if not math.isfinite(prop):
+        # a NaN/∞ proposal must never become a move — min/max ordering would otherwise
+        # silently coerce it into a FULL step in one direction (found by stress fuzzing)
+        return clamp(key, cur)
+    if not math.isfinite(cur):
+        cur = spec.lo
     if spec.wrap:
         delta = (prop - cur + 180.0) % 360.0 - 180.0
         if delta == -180.0:   # antipode is ambiguous — deterministically go clockwise
@@ -171,10 +179,16 @@ class LightingState:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "LightingState":
-        """Load from json. Corrupt entries are DROPPED per-key (never raise): one bad
-        value in a hand-edited sidecar must not take the rest of the state with it."""
+        """Load from json. Hand-edited files are INVITED (the sidecar is documented as
+        human-readable): a non-dict shell yields an empty state, and corrupt entries are
+        DROPPED per-key with a warning (never raise) — one bad value must not take the
+        rest of the state with it."""
         st = cls()
-        for k, v in (d.get("values") or {}).items():
+        if not isinstance(d, dict):
+            return st
+        values = d.get("values")
+        groups = d.get("groups")
+        for k, v in (values.items() if isinstance(values, dict) else ()):
             if spec_for(k) is None:
                 continue
             if not _coercible_number(v):
@@ -182,7 +196,7 @@ class LightingState:
                             "finite number", k, v)
                 continue
             st.values[k] = clamp(k, v)
-        for g, v in (d.get("groups") or {}).items():
+        for g, v in (groups.items() if isinstance(groups, dict) else ()):
             if not _coercible_number(v):
                 log.warning("genome: dropping group %r value %r from loaded state — "
                             "not a finite number", g, v)
@@ -205,16 +219,26 @@ class LightingState:
         return out
 
 
+def rig_keys(state: LightingState) -> set:
+    """The capability set of the rig ``state`` was read from — the ONLY keys a
+    proposal may touch. ``group.*`` names come from the rig's real layer groups."""
+    return set(state.values) | {GROUP_PREFIX + g for g in state.groups}
+
+
 def apply_changes(
     state: LightingState,
     changes: Dict[str, float],
     locks: Optional[set] = None,
     limit: bool = True,
     step_scale: float = 1.0,
+    known: Optional[set] = None,
 ) -> Tuple[LightingState, Dict[str, float], List[str]]:
     """Validated apply: returns (new_state, accepted{key: value}, rejected[reason...]).
     Unknown keys are dropped, locked keys refused, bounds clamped, steps limited
-    (``step_scale`` anneals the per-iteration budget)."""
+    (``step_scale`` anneals the per-iteration budget). ``known`` (usually
+    ``rig_keys(state)``) rejects genome-valid keys the RIG doesn't have — without it
+    a hallucinated ``dome.*``/``group.*`` on a rig that lacks them would be fabricated
+    at the spec's lower bound and persist into the session as a phantom parameter."""
     locks = locks or set()
     new = state.copy()
     accepted: Dict[str, float] = {}
@@ -224,6 +248,9 @@ def apply_changes(
         if spec is None:
             rejected.append(f"{key}: unknown parameter")
             continue
+        if known is not None and key not in known:
+            rejected.append(f"{key}: rig has no such parameter")
+            continue
         if key in locks:
             rejected.append(f"{key}: locked by user")
             continue
@@ -231,6 +258,9 @@ def apply_changes(
             value = float(raw)
         except (TypeError, ValueError):
             rejected.append(f"{key}: non-numeric value {raw!r}")
+            continue
+        if not math.isfinite(value):
+            rejected.append(f"{key}: non-finite value {raw!r}")
             continue
         if limit:
             value = limit_step(key, new.get(key, spec.lo), value, step_scale)

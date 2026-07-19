@@ -123,9 +123,15 @@ def test_critic_achromatic_pair_renormalizes_hue_out():
     assert v.score < 1.0  # every remaining component sees the maximal mismatch
 
 
-def test_critic_hue_skipped_when_only_one_side_achromatic():
+def test_critic_hue_one_sided_achromatic_is_signal_not_skipped():
+    # a grey render of a COLORFUL reference is a real mismatch: the hue component
+    # joins at 0 (cosine vs zeros) and pulls the score down — skipping it would
+    # inflate exactly the renders that lost the reference's color
     v = critic.score(stats(), stats(hue_hist=[0.0] * 12))
-    assert "hue" not in v.components
+    assert v.components.get("hue") == 0.0
+    # two ACHROMATIC images carry no hue information — skipped and renormalized
+    both = critic.score(stats(hue_hist=[0.0] * 12), stats(hue_hist=[0.0] * 12))
+    assert "hue" not in both.components
     # identical chromatic stats keep the hue component at full marks
     same = critic.score(stats(), stats())
     assert same.components["hue"] == 1.0 and same.score == 100.0

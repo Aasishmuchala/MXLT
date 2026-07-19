@@ -180,6 +180,35 @@ def scene_path() -> str:
         return ""
 
 
+# every unsaved scene stringifies to "" — a path-keyed cache can't tell scene A
+# (unsaved) from scene B (a different, also-unsaved scene) across File > New/Reset,
+# so cached sessions could silently apply one scene's lighting in another. The
+# generation counter, bumped by Max's file callbacks, is the missing cache key.
+_generation = 0
+
+
+def scene_generation() -> int:
+    return _generation
+
+
+def _bump_generation() -> None:
+    global _generation
+    _generation += 1
+
+
+def register_scene_callbacks() -> None:
+    """Idempotent: file new/reset/open bump the generation counter (no-op off-Max)."""
+    try:
+        rt = _rt()
+        rt.callbacks.removeScripts(id=rt.Name("MaxGafferSceneGen"))
+        code = ('python.Execute "import maxgaffer.maxbridge.scene as _mgs; '
+                '_mgs._bump_generation()"')
+        for ev in ("systemPostNew", "systemPostReset", "filePostOpen"):
+            rt.callbacks.addScript(rt.Name(ev), code, id=rt.Name("MaxGafferSceneGen"))
+    except Exception:
+        pass
+
+
 # ------------------------------------------------------------------ rig classification
 def _is_class(obj, class_names: Tuple[str, ...]) -> bool:
     return _class_name(obj).lower() in tuple(c.lower() for c in class_names)

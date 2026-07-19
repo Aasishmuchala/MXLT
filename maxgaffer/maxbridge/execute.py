@@ -151,6 +151,10 @@ def execute_plan(ops: List[Dict], camera=None) -> Dict[str, Any]:
                         "why": op.get("why", "")})
                 elif op["op"] == "create_light":
                     maker, presets = LIGHT_MAKERS[op["light_type"]]
+                    # validate BEFORE creating anything — a malformed op must not leak
+                    # an untracked orphan light into the scene
+                    name = op["name"]
+                    placement = op["placement"]
                     try:
                         node = getattr(rt, maker)()
                     except Exception as e:  # noqa: BLE001
@@ -161,18 +165,17 @@ def execute_plan(ops: List[Dict], camera=None) -> Dict[str, Any]:
                     # here and the layer-add must delete it, or it leaks off MG_lights
                     tgt = None
                     try:
-                        node.name = op["name"]
+                        node.name = name
                         for k, v in presets.items():
                             sc.set_prop(node, (k,), v)
-                        if basis is not None or "at_node" in op["placement"]:
+                        if basis is not None or "at_node" in placement:
                             try:
                                 node.pos = _place_from(basis or {"pos": [0, 0, 0],
                                                                  "yaw_deg": 0.0,
                                                                  "look": [0, 200, 0]},
-                                                       op["placement"])
+                                                       placement)
                             except Exception:
-                                report["warnings"].append(
-                                    f"{op['name']}: placement failed")
+                                report["warnings"].append(f"{name}: placement failed")
                         if op["light_type"] == "VRaySun" and basis is not None:
                             # a targetless scripted VRaySun aims straight down — give it
                             # a target at the camera's subject so its direction is real
@@ -180,7 +183,7 @@ def execute_plan(ops: List[Dict], camera=None) -> Dict[str, Any]:
                                 tgt = rt.Targetobject()
                                 lx, ly, lz = basis["look"]
                                 tgt.pos = rt.Point3(lx, ly, lz)
-                                tgt.name = op["name"] + "_target"
+                                tgt.name = name + "_target"
                                 node.target = tgt
                             except Exception:
                                 if tgt is not None:     # don't leak the named helper
@@ -190,7 +193,7 @@ def execute_plan(ops: List[Dict], camera=None) -> Dict[str, Any]:
                                         pass
                                     tgt = None
                                 report["warnings"].append(
-                                    f"{op['name']}: could not create a sun target")
+                                    f"{name}: could not create a sun target")
                         if op.get("aim_at_camera_target") and basis is not None:
                             try:
                                 lx, ly, lz = basis["look"]
@@ -199,14 +202,14 @@ def execute_plan(ops: List[Dict], camera=None) -> Dict[str, Any]:
                                               lz - float(p.z))
                                 node.dir = d
                             except Exception:
-                                report["warnings"].append(f"{op['name']}: aim failed")
+                                report["warnings"].append(f"{name}: aim failed")
                         for prop, value in (op.get("props") or {}).items():
                             try:
                                 setattr(node, prop,
                                         _coerce(getattr(node, prop, None), value))
                             except Exception:
                                 report["warnings"].append(
-                                    f"{op['name']}.{prop}: not settable on "
+                                    f"{name}.{prop}: not settable on "
                                     f"{op['light_type']}")
                         layer = _ensure_mg_layer()
                         if layer is not None:
@@ -217,11 +220,11 @@ def execute_plan(ops: List[Dict], camera=None) -> Dict[str, Any]:
                                     layer.addNode(n)
                                 except Exception:
                                     pass
-                        where = (op["placement"].get("at_node")
-                                 or f"{op['placement'].get('bearing_deg', 0):+.0f}° / "
-                                    f"{op['placement'].get('distance', 0):.0f}u / "
-                                    f"h{op['placement'].get('height', 0):+.0f}")
-                        report["created"].append({"name": op["name"],
+                        where = (placement.get("at_node")
+                                 or f"{placement.get('bearing_deg', 0):+.0f}° / "
+                                    f"{placement.get('distance', 0):.0f}u / "
+                                    f"h{placement.get('height', 0):+.0f}")
+                        report["created"].append({"name": name,
                                                   "type": op["light_type"], "at": where,
                                                   "why": op.get("why", "")})
                     except Exception as e:  # noqa: BLE001 — roll back the orphan node

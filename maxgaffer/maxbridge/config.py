@@ -20,19 +20,22 @@ def _warn(msg: str) -> None:
         pass
 
 
-def _appdata_dir(name: str) -> str:
-    """Path only — directory creation is deferred to first use. Importing this module
-    must never touch the disk (an unwritable profile, or a FILE named 'MaxGaffer' in
-    %LOCALAPPDATA%, would otherwise kill the whole plugin load at import time)."""
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    return os.path.join(base, name)
-
-
 def _ensure_dir(d: str) -> None:
     try:
         os.makedirs(d, exist_ok=True)
     except OSError as e:
         _warn(f"could not create {d} ({e})")
+
+
+def _appdata_dir(name: str, create: bool = False) -> str:
+    """Path only by default — directory creation is deferred to first use. Importing this
+    module must never touch the disk (an unwritable profile, or a FILE named 'MaxGaffer'
+    in %LOCALAPPDATA%, would otherwise kill the whole plugin load at import time)."""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    d = os.path.join(base, name)
+    if create:
+        _ensure_dir(d)
+    return d
 
 
 CONFIG_PATH = os.path.join(_appdata_dir("MaxGaffer"), "config.json")
@@ -60,6 +63,16 @@ class Config:
     sweep_count: int = 8
     keep_runs: int = 10                      # run folders kept per camera (0 = keep all)
     draft_sampler: bool = False              # opt-in: draft render settings during matches
+    # apply-only mode: MaxGaffer never fires a render. MATCH = analyze → first guess →
+    # apply as ONE undoable change → read-back verification → change report. The loop,
+    # sun sweep, board probes, plan effect measurement and V-Ray finals are all off.
+    no_renders: bool = False
+    # software exposure: V-Ray GPU applies exposure only at the VFB display stage, so
+    # loop renders don't reflect the EV/WB the solver sets (the host is inert in the
+    # saved buffer). When on, EV/WB are applied to each loop frame in software before
+    # scoring, so the analytic solver converges on any renderer. Recommended ON for
+    # V-Ray GPU; harmless where exposure already bakes in (near-identity early frames).
+    software_exposure: bool = False
     plan_first: bool = True                  # scene-wide plan (any setting, create lights)
     auto_execute_plan: bool = False          # skip the preview dialog (still one undo)
     show_report_popup: bool = True           # "scene changed" popup after execution

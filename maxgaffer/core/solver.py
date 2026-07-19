@@ -31,6 +31,23 @@ EV_MAX_STEP = 2.5
 WB_DEADBAND_B = 1.5          # LAB b* units
 WB_KELVIN_PER_B = 90.0
 WB_MAX_STEP = 1500.0
+# both images clipping ≥ this share of the highlight quartile = same-scene regime →
+# switch to the inclusive (symmetric) highlight mean; see solve_wb
+SYMMETRIC_CLIP_FRAC = 0.15
+
+
+def _finite(value) -> Optional[float]:
+    """float() + finiteness in one — junk stats (None, short lists, NaN) mean the solver
+    has NO opinion, and a coerced blind slam is the worst possible answer."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _vec3(value) -> bool:
+    return isinstance(value, (list, tuple)) and len(value) == 3
 
 
 def _finite(value) -> Optional[float]:
@@ -45,23 +62,15 @@ def _finite(value) -> Optional[float]:
     return v if math.isfinite(v) else None
 
 
-def _lab_b(stats: Dict, key: str) -> Optional[float]:
-    """b* of a LAB mean field, or None when the field is absent or not a 3-vector."""
-    v = stats.get(key)
-    if not (isinstance(v, (list, tuple)) and len(v) == 3):
-        return None
-    return _finite(v[2])
-
-
 def solve_ev(ref_stats: Dict, cur_stats: Dict, current_ev: float,
              tighten: float = 1.0) -> Optional[float]:
     """New EV that matches the render's key to the reference's, or None if close enough.
     ``tighten`` < 1 shrinks the deadband (and the per-step cap) as the match converges —
     a 0.15-stop tolerance is exploration slack, not a finishing standard."""
-    key_ref = _finite(ref_stats.get("log_key", 0.0))
-    key_cur = _finite(cur_stats.get("log_key", 0.0))
+    key_ref = _finite(ref_stats.get("log_key"))
+    key_cur = _finite(cur_stats.get("log_key"))
     if key_ref is None or key_cur is None:
-        return None     # metrics unavailable — skip, never invent a max-step move
+        return None     # metrics unavailable (or absent) — skip, never invent a max-step move
     key_ref, key_cur = max(1e-5, key_ref), max(1e-5, key_cur)
     d_ev = math.log2(key_ref / key_cur)
     if abs(d_ev) < EV_DEADBAND * max(0.1, tighten):
@@ -70,7 +79,10 @@ def solve_ev(ref_stats: Dict, cur_stats: Dict, current_ev: float,
     # measured 2-stop error deserves a 2-stop fix regardless of how well the rest of the
     # match is going (the cap is a stability rail, not a convergence knob)
     d_ev = max(-EV_MAX_STEP, min(EV_MAX_STEP, d_ev))
-    return clamp("exposure.ev", current_ev - d_ev)
+    new = clamp("exposure.ev", current_ev - d_ev)
+    # pinned at a genome bound (or a zeroed slope): the solved value IS the current one —
+    # None means "skip a no-op scene write", not "keep solving"
+    return None if abs(new - current_ev) < 1e-9 else new
 
 
 def solve_wb(ref_stats: Dict, cur_stats: Dict, current_kelvin: float,
@@ -81,24 +93,40 @@ def solve_wb(ref_stats: Dict, cur_stats: Dict, current_kelvin: float,
     highlights carry the illuminant, the full mean carries the furniture). This is the
     direct counter to the albedo trap; falls back to full-frame means on old stats.
 
-    The highlight path is chosen from the VALIDITY of both sides' ``lab_mean_hi``
+    The highlight path is chosen from the VALIDITY of both sides' highlight mean
     (never key presence — a ``null``/short field is as absent as a missing key), and
     the solve abstains (None) when the chosen source is unusable on either side:
     comparing a highlight mean against a full mean would mix two different quantities,
     and a missing mean must not silently read as b* = 0."""
-    b_ref = _lab_b(ref_stats, "lab_mean_hi")
-    b_cur = _lab_b(cur_stats, "lab_mean_hi")
+    # Which highlight mean: the clip-EXCLUSIVE one is the cross-scene default (blown
+    # pixels carry no chroma). But when BOTH images clip a large share of the quartile,
+    # the match is same-scene (a relight/hero shot) and the populations must stay
+    # SYMMETRIC — per-image exclusion measures different pixel sets on each side and
+    # drags the WB anchor cool (measured: deep match stalled at 97.8 on a reachable
+    # target; symmetric-inclusive lands 99+).
+    hi_key = "lab_mean_hi"
+    if (float(ref_stats.get("hi_clip_frac", 0.0) or 0.0) >= SYMMETRIC_CLIP_FRAC
+            and float(cur_stats.get("hi_clip_frac", 0.0) or 0.0) >= SYMMETRIC_CLIP_FRAC):
+        hi_key = "lab_mean_hi_full"
+    # highlight-vs-highlight only when BOTH sides carry a well-formed one — comparing a
+    # highlight mean against a full-frame mean is apples-to-oranges (different quantities)
+    hi_both = _vec3(ref_stats.get(hi_key)) and _vec3(cur_stats.get(hi_key))
+
+    def b_of(stats: Dict) -> Optional[float]:
+        src = stats.get(hi_key) if hi_both else stats.get("lab_mean")
+        if not _vec3(src):
+            return None
+        return _finite(src[2])
+
+    b_ref, b_cur = b_of(ref_stats), b_of(cur_stats)
     if b_ref is None or b_cur is None:
-        # never compare a highlight mean against a full mean — different quantities
-        b_ref = _lab_b(ref_stats, "lab_mean")
-        b_cur = _lab_b(cur_stats, "lab_mean")
-        if b_ref is None or b_cur is None:
-            return None     # metrics unavailable — skip, never invent a move
+        return None
     db = b_ref - b_cur
     if abs(db) < WB_DEADBAND_B * max(0.1, tighten):
         return None
     delta = max(-WB_MAX_STEP, min(WB_MAX_STEP, db * kelvin_per_b))
-    return clamp("exposure.wb_kelvin", current_kelvin + delta)
+    new = clamp("exposure.wb_kelvin", current_kelvin + delta)
+    return None if abs(new - current_kelvin) < 1e-9 else new
 
 
 def analytic_pass(

@@ -16,6 +16,7 @@ Values are LINEAR radiance floats, rows top-first, ``rows[y][x] = (r, g, b)``.
 from __future__ import annotations
 
 import math
+import os
 from typing import List, Optional, Sequence, Tuple
 
 _HEADER_MAGIC = (b"#?RADIANCE", b"#?RGBE")
@@ -33,8 +34,8 @@ def float_to_rgbe(r: float, g: float, b: float) -> Tuple[int, int, int, int]:
     if m < 1e-9:
         return 0, 0, 0, 0
     _mant, exp = math.frexp(m)              # m = mant * 2**exp, mant in [0.5, 1)
-    if exp + 128 > 255:                     # finite but beyond RGBE range: saturate to the
-        return 255, 255, 255, 255           # hottest representable pixel (keeps bytes valid)
+    if exp > 127:                           # finite but beyond RGBE range: saturate to the
+        exp = 127                           # hottest exponent, channel ratios preserved
     scale = math.ldexp(1.0, 8 - exp)        # component * scale lands in [0, 256)
     return (
         min(255, max(0, int(r * scale))),
@@ -108,7 +109,11 @@ def write_hdr(path: str, rows: Sequence[Sequence[Tuple[float, float, float]]]) -
                 else:
                     f.write(bytes(b for p in px for b in p))
         return True
-    except (OSError, ValueError):           # documented contract: False, never raise
+    except (OSError, TypeError, ValueError):   # documented contract: False, never raise
+        try:
+            os.remove(path)               # never leave a truncated .hdr behind
+        except OSError:
+            pass
         return False
 
 
@@ -186,23 +191,34 @@ def read_hdr(path: str) -> Optional[List[List[Tuple[float, float, float]]]]:
         return None
     width, height, pos = head
     # Old-style RLE honesty: scanlines in the 8..32767 band without the 2,2,w>>8,w marker
-    # are only decodable as flat data when the payload is EXACTLY flat-sized — anything
-    # else is old-style RLE, which we refuse (None) rather than silently misdecode.
+    # are only decodable as flat data when the payload is EXACTLY flat-sized AND free of
+    # old-style repeat markers — (1,1,1,n) pixels mean the file is old-style RLE, which
+    # flat-decodes into garbage; we refuse (None) rather than silently misdecode.
+    in_band = _MIN_RLE_WIDTH <= width <= _MAX_RLE_WIDTH
+    flat_exact = len(data) - pos == height * width * 4
+    if flat_exact and in_band:
+        flat_exact = not any(
+            data[pos + i * 4] == 1 and data[pos + i * 4 + 1] == 1
+            and data[pos + i * 4 + 2] == 1
+            for i in range(height * width))
     if (
-        _MIN_RLE_WIDTH <= width <= _MAX_RLE_WIDTH
+        in_band
         and not (pos + 4 <= len(data) and data[pos] == 2 and data[pos + 1] == 2
                  and ((data[pos + 2] << 8) | data[pos + 3]) == width)
-        and len(data) - pos != height * width * 4
+        and not flat_exact
     ):
         return None
     rows: List[List[Tuple[float, float, float]]] = []
     for _y in range(height):
         is_rle = (
-            _MIN_RLE_WIDTH <= width <= _MAX_RLE_WIDTH
+            in_band
             and pos + 4 <= len(data)
             and data[pos] == 2 and data[pos + 1] == 2
             and ((data[pos + 2] << 8) | data[pos + 3]) == width
         )
+        if in_band and not is_rle and not flat_exact:
+            return None     # in-band scanlines are new-style RLE by spec — anything else
+                            # here is old-style RLE, which flat-decodes into garbage
         if is_rle:
             decoded = _decode_rle_scanline(data, pos + 4, width)
             if decoded is None:

@@ -23,58 +23,112 @@ from ..core.omega import OmegaError, ping
 from ..maxbridge import config as cfgmod
 from ..maxbridge.controller import Controller
 
-ACCENT = "#f2f2f2"          # monochrome: the only "color" is contrast
-BG = "#161616"
-PANEL = "#1b1b1b"
-INSET = "#131313"
-ERR = "#d9d9d9"
-OK = "#f2f2f2"
-DIM = "#8f8f8f"
-
-_RAISED = ("border-top:1px solid rgba(255,255,255,0.07);"
-           "border-left:1px solid rgba(255,255,255,0.04);"
-           "border-bottom:1px solid #060606;border-right:1px solid #0a0a0a;")
-_SUNK = ("border-top:1px solid #070707;border-left:1px solid #0a0a0a;"
-         "border-bottom:1px solid rgba(255,255,255,0.06);"
-         "border-right:1px solid rgba(255,255,255,0.04);")
+# Apple-dark design language (macOS system palette): flat surfaces, ONE hairline border
+# everywhere, ONE accent color, no shadows, no gradients — the layout does the talking.
+ACCENT = "#0a84ff"          # systemBlue (dark) — primary actions, selection, links. The
+                            # only color in the app; everything else is a gray.
+BG = "#1c1c1e"              # window
+PANEL = "#2c2c2e"           # cards
+INSET = "#1c1c1e"           # wells: inputs, thumbs, trees, transcript
+FILL = "#3a3a3c"            # neutral controls (buttons, popups)
+HAIR = "1px solid rgba(255,255,255,0.10)"
+TEXT = "#f2f2f7"
+DIM = "#98989d"             # secondary text / captions
+FAINT = "#636366"           # disabled / placeholders
+ERR = "#ff453a"             # systemRed (dark) — error emphasis only
+OK = "#f2f2f7"
 
 STYLE = (
-    f"QWidget{{background:{BG};color:#e8e8e8;font-family:Inter,'Segoe UI';font-size:13px;}}"
-    f"QFrame#card{{background:{PANEL};{_RAISED}border-radius:16px;}}"
-    f"QPushButton{{background:{PANEL};{_RAISED}border-radius:11px;padding:9px 14px;"
-    f"color:#dcdcdc;}}"
-    f"QPushButton:hover{{color:#ffffff;}}"
-    f"QPushButton:pressed{{background:{INSET};{_SUNK}}}"
-    f"QPushButton:disabled{{color:#5a5a5a;}}"
-    f"QPushButton#primary{{background:#f0f0f0;color:#111111;font-weight:600;"
-    f"letter-spacing:1px;border:1px solid #050505;min-height:24px;}}"
-    f"QPushButton#primary:pressed{{background:#cfcfcf;}}"
-    f"QPushButton#ghost{{background:transparent;border:none;color:{DIM};padding:6px 8px;}}"
-    f"QPushButton#ghost:hover{{color:#ffffff;}}"
-    f"QLineEdit,QComboBox,QTextEdit,QTreeWidget,QListWidget,QSpinBox,QDoubleSpinBox"
-    f"{{background:{INSET};{_SUNK}border-radius:10px;padding:6px;"
-    f"selection-background-color:#f0f0f0;selection-color:#111;}}"
-    f"QComboBox::drop-down{{border:none;width:22px;}}"
-    f"QComboBox QAbstractItemView{{background:{PANEL};color:#e8e8e8;"
-    f"selection-background-color:#f0f0f0;selection-color:#111;border:1px solid #0a0a0a;}}"
-    f"QMenu{{background:{PANEL};color:#e8e8e8;border:1px solid #0a0a0a;padding:6px;}}"
-    f"QMenu::item{{padding:6px 22px;border-radius:6px;}}"
-    f"QMenu::item:selected{{background:#f0f0f0;color:#111;}}"
+    f"QWidget{{background:{BG};color:{TEXT};font-family:'SF Pro Text','Segoe UI Variable',"
+    f"'Segoe UI',Inter;font-size:13px;}}"
+    f"QFrame#card{{background:{PANEL};border:{HAIR};border-radius:12px;}}"
+    f"QLabel{{background:transparent;}}"
+    f"QPushButton{{background:{FILL};border:none;border-radius:8px;padding:7px 14px;"
+    f"color:{TEXT};}}"
+    f"QPushButton::menu-indicator{{image:none;width:0;}}"
+    f"QPushButton:hover{{background:#48484a;}}"
+    f"QPushButton:pressed{{background:#2c2c2e;}}"
+    f"QPushButton:disabled{{background:#2c2c2e;color:{FAINT};}}"
+    f"QPushButton#primary{{background:{ACCENT};color:#ffffff;font-weight:600;}}"
+    f"QPushButton#primary:hover{{background:#2f95ff;}}"
+    f"QPushButton#primary:pressed{{background:#0774e8;}}"
+    f"QPushButton#primary:disabled{{background:#2c2c2e;color:{FAINT};}}"
+    f"QPushButton#ghost{{background:transparent;border:none;color:{ACCENT};"
+    f"padding:5px 8px;}}"
+    f"QPushButton#ghost:hover{{color:#66b3ff;}}"
+    f"QPushButton#ghost:pressed{{color:#0774e8;}}"
+    f"QLineEdit,QTextEdit,QPlainTextEdit,QSpinBox,QDoubleSpinBox{{background:{INSET};"
+    f"border:{HAIR};border-radius:8px;padding:5px 8px;"
+    f"selection-background-color:{ACCENT};selection-color:#ffffff;}}"
+    f"QComboBox{{background:{FILL};border:none;border-radius:8px;padding:6px 10px;}}"
+    f"QComboBox:hover{{background:#48484a;}}"
+    f"QComboBox::drop-down{{border:none;width:20px;}}"
+    f"QComboBox QLineEdit{{background:transparent;border:none;padding:0;}}"
+    f"QComboBox QAbstractItemView{{background:{PANEL};border:{HAIR};padding:4px;"
+    f"selection-background-color:{ACCENT};selection-color:#ffffff;}}"
+    f"QMenu{{background:{PANEL};border:{HAIR};border-radius:10px;padding:6px;}}"
+    f"QMenu::item{{padding:6px 24px;border-radius:6px;}}"
+    f"QMenu::item:selected{{background:{ACCENT};color:#ffffff;}}"
+    f"QTreeWidget,QListWidget{{background:{INSET};border:{HAIR};border-radius:10px;"
+    f"padding:4px;selection-background-color:{ACCENT};selection-color:#ffffff;}}"
     f"QLabel#dim{{color:{DIM};}}"
-    f"QLabel#h{{color:#f2f2f2;font-weight:600;letter-spacing:4px;}}"
-    f"QHeaderView::section{{background:{PANEL};color:{DIM};border:none;padding:5px 8px;}}"
-    f"QScrollBar:vertical{{background:transparent;width:10px;}}"
-    f"QScrollBar::handle:vertical{{background:#2a2a2a;border-radius:5px;min-height:30px;}}"
+    f"QLabel#h{{color:{TEXT};font-weight:600;letter-spacing:3px;}}"
+    f"QLabel#cap{{color:{DIM};font-size:11px;font-weight:600;letter-spacing:1px;}}"
+    f"QHeaderView::section{{background:transparent;color:{DIM};border:none;"
+    f"border-bottom:{HAIR};padding:5px 8px;font-size:11px;}}"
+    f"QScrollBar:vertical{{background:transparent;width:8px;margin:2px;}}"
+    f"QScrollBar::handle:vertical{{background:#48484a;border-radius:4px;min-height:30px;}}"
     f"QScrollBar::add-line,QScrollBar::sub-line{{height:0;}}"
+    f"QToolTip{{background:{PANEL};color:{TEXT};border:{HAIR};padding:5px;}}"
 )
 
 
-def _shadow(widget, blur=26, dy=7):
-    eff = QtWidgets.QGraphicsDropShadowEffect(widget)
-    eff.setBlurRadius(blur)
-    eff.setOffset(0, dy)
-    eff.setColor(QtGui.QColor(0, 0, 0, 160))
-    widget.setGraphicsEffect(eff)
+def _cap(text: str) -> QtWidgets.QLabel:
+    """Section caption — the one place small-caps styling lives."""
+    lbl = QtWidgets.QLabel(text)
+    lbl.setObjectName("cap")
+    return lbl
+
+
+# ---------------------------------------------------------------- crash forensics + safe decode
+_LOG_MIRROR = os.path.join(os.path.dirname(cfgmod.CONFIG_PATH), "last_session.log")
+
+
+def _reset_log_mirror() -> None:
+    """Truncate the crash-forensics log at dock open. A native Max crash bypasses every
+    Python try/except — but every log line is mirrored+flushed here, so after a crash the
+    LAST line of %LOCALAPPDATA%/MaxGaffer/last_session.log names the step that died."""
+    try:
+        with open(_LOG_MIRROR, "w", encoding="utf-8") as f:
+            f.write("MaxGaffer session log (crash forensics — last line = last step)\n")
+    except OSError:
+        pass
+
+
+def _mirror_log(msg: str) -> None:
+    try:
+        with open(_LOG_MIRROR, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except OSError:
+        pass
+
+
+def _bounded_pixmap(path: str, target: QtCore.QSize) -> QtGui.QPixmap:
+    """Decode an image for a thumbnail WITHOUT the full-resolution transient — a
+    QPixmap(path) on a 50-100 MP reference spikes 0.5-1+ GB, which is an OOM-crash risk
+    at match end on a box already loaded with V-Ray + Vantage. QImageReader scales JPEGs
+    DURING decode (never materializes full res); anything still huge is rejected."""
+    reader = QtGui.QImageReader(path)
+    size = reader.size()
+    if size.isValid():
+        # >120 MP even defeats a scaled decode's scratch buffers on some formats — skip
+        if size.width() * size.height() > 120_000_000:
+            return QtGui.QPixmap()
+        reader.setScaledSize(size.scaled(target, QtCore.Qt.KeepAspectRatio))
+    img = reader.read()
+    if img.isNull():
+        return QtGui.QPixmap()
+    return QtGui.QPixmap.fromImage(img)
 
 
 class _Worker(QtCore.QThread):
@@ -112,6 +166,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         self._busy = False
         self._active_camera = ""
         self._sliders: Dict[str, QtWidgets.QDoubleSpinBox] = {}
+        _reset_log_mirror()   # crash forensics: last_session.log starts fresh per dock
         self._build()
         self.refresh_cameras()
         self._recover_draft_snapshot()
@@ -136,7 +191,6 @@ class MaxGafferDock(QtWidgets.QWidget):
     def _card(self, parent_layout):
         f = QtWidgets.QFrame()
         f.setObjectName("card")
-        _shadow(f)
         lay = QtWidgets.QVBoxLayout(f)
         lay.setContentsMargins(16, 14, 16, 14)
         lay.setSpacing(10)
@@ -186,15 +240,14 @@ class MaxGafferDock(QtWidgets.QWidget):
 
         def _thumb(placeholder, cap):
             wrap = QtWidgets.QVBoxLayout()
+            wrap.setSpacing(6)
             t = QtWidgets.QLabel(placeholder)
             t.setFixedSize(272, 153)
             t.setAlignment(QtCore.Qt.AlignCenter)
-            t.setStyleSheet(f"background:{INSET};{_SUNK}border-radius:12px;color:#5a5a5a;")
+            t.setStyleSheet(f"background:{INSET};border:{HAIR};border-radius:10px;"
+                            f"color:{FAINT};")
             wrap.addWidget(t)
-            c = QtWidgets.QLabel(cap)
-            c.setObjectName("dim")
-            c.setStyleSheet(f"color:{DIM};font-size:10px;letter-spacing:3px;")
-            wrap.addWidget(c, 0, QtCore.Qt.AlignHCenter)
+            wrap.addWidget(_cap(cap), 0, QtCore.Qt.AlignHCenter)
             thumbs.addLayout(wrap)
             return t
 
@@ -282,9 +335,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         # ---- card: CHANGES (the record) + collapsed transcript
         lc = self._card(col)
         crow = QtWidgets.QHBoxLayout()
-        cap = QtWidgets.QLabel("CHANGES")
-        cap.setStyleSheet(f"color:{DIM};font-size:10px;letter-spacing:3px;")
-        crow.addWidget(cap)
+        crow.addWidget(_cap("CHANGES"))
         crow.addStretch(1)
         for label, slot, tip in (("A/B", self._ab_flip, "Flip pre-match ↔ matched."),
                                  ("Restore", self._restore_pre_match,
@@ -337,9 +388,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         # ---- card: rig
         lg = self._card(col)
         grow = QtWidgets.QHBoxLayout()
-        gcap = QtWidgets.QLabel("RIG")
-        gcap.setStyleSheet(f"color:{DIM};font-size:10px;letter-spacing:3px;")
-        grow.addWidget(gcap)
+        grow.addWidget(_cap("RIG"))
         grow.addStretch(1)
         for label, slot in (("Read scene", self.rebuild_rig_controls),
                             ("HDRI…", self._pick_hdri),
@@ -360,9 +409,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         lo = self._card(col)
         orow = QtWidgets.QHBoxLayout()
         orow.setSpacing(10)
-        ocap = QtWidgets.QLabel("OUTPUT")
-        ocap.setStyleSheet(f"color:{DIM};font-size:10px;letter-spacing:3px;")
-        orow.addWidget(ocap)
+        orow.addWidget(_cap("OUTPUT"))
         btn_link = QtWidgets.QPushButton("Live link")
         btn_link.setToolTip("V-Ray's 'Initiate a Live-Link to Chaos Vantage' — a toggle; "
                             "starts Vantage if needed (port 20701).")
@@ -417,6 +464,7 @@ class MaxGafferDock(QtWidgets.QWidget):
 
     # ================================================================= helpers
     def _log(self, msg: str):
+        _mirror_log(msg)
         if msg.startswith("THUMB::"):
             url = QtCore.QUrl.fromLocalFile(msg[len("THUMB::"):]).toString()
             self.log.append(f'<img src="{url}" width="240">')
@@ -533,6 +581,7 @@ class MaxGafferDock(QtWidgets.QWidget):
     # ================================================================= reference
     def _pick_reference(self):
         if self._busy:
+            self._log("busy — reference swap ignored until the current run finishes")
             return
         cam = self._current_camera()
         if not cam:
@@ -553,11 +602,9 @@ class MaxGafferDock(QtWidgets.QWidget):
         e = self.ctrl.session.cameras.get(cam)
         ref = e.reference if e else ""
         if ref and os.path.exists(ref):
-            pix = QtGui.QPixmap(ref)
+            pix = _bounded_pixmap(ref, self.ref_thumb.size())
             if not pix.isNull():
-                self.ref_thumb.setPixmap(pix.scaled(
-                    self.ref_thumb.size(), QtCore.Qt.KeepAspectRatio,
-                    QtCore.Qt.SmoothTransformation))
+                self.ref_thumb.setPixmap(pix)
                 info = os.path.basename(ref)
                 if e and e.semantics:
                     s = e.semantics
@@ -714,6 +761,9 @@ class MaxGafferDock(QtWidgets.QWidget):
             self._log("board closed — current light kept (it was re-applied already)")
 
     def _save_preset(self):
+        if self._busy:
+            self._log("busy — preset save ignored until the current run finishes")
+            return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save lighting preset", "", "MaxGaffer preset (*.json)")
         if not path:
@@ -778,7 +828,14 @@ class MaxGafferDock(QtWidgets.QWidget):
         plan_report = None
         try:
             if mode != 2:
-                ops, lines, meta, _raw = self.ctrl.make_plan(cam, log=self._log)
+                try:
+                    plan = self.ctrl.make_plan(cam, log=self._log)
+                except (OmegaError, RuntimeError) as err:
+                    self._log(f"⚠ plan skipped ({err}) — continuing with the match loop")
+                    plan = None
+                # None = junk plan reply twice (controller already logged it) —
+                # the match proceeds plan-less
+                ops, lines, meta = plan[:3] if plan is not None else ([], [], {})
                 if not ops:
                     self._log("plan: no operations proposed — continuing to the match loop")
                 elif self.act_autoexec.isChecked() or PlanPreviewDialog(
@@ -794,13 +851,18 @@ class MaxGafferDock(QtWidgets.QWidget):
                 do_sweep=self.act_sweep.isChecked(),
                 deep=(mode == 1))
             score = f"{result.best_score:.1f}" if result.best_score is not None else "n/a"
-            ceiling = (" · ceiling proven — the gap left is content, not lighting"
-                       if result.ceiling_converged and (result.best_score or 0) < 99 else "")
+            ceiling = ""
+            if (result.best_score or 0) < 99:
+                if getattr(result, "ceiling_proven", False):
+                    ceiling = " · ceiling proven — the gap left is content, not lighting"
+                elif result.ceiling_converged:
+                    ceiling = " · plateau (finer steps untested — not a proven ceiling)"
             self._log(f"✓ done ({result.stop_reason}) — best {score}{ceiling}")
             self._set_match_thumb(result.best_render)
             headline = f"{cam} — {result.stop_reason}, score {score}"
             self._fill_changes(plan_report, self.ctrl.state_change_rows(cam), headline)
             if self.act_popup.isChecked():
+                self._log("· showing the change report…")   # crash breadcrumb
                 ChangeReportDialog(plan_report, self.ctrl.state_change_rows(cam),
                                    headline, self).exec()
         except (OmegaError, RuntimeError) as err:
@@ -815,6 +877,7 @@ class MaxGafferDock(QtWidgets.QWidget):
             self.btn_cancel.setEnabled(False)
             self.refresh_cameras()
             self._show_reference(cam)
+            self._log("· match UI settled")   # crash breadcrumb: last healthy step
     def _start_match_all(self):
         if self._busy:
             return
@@ -861,11 +924,9 @@ class MaxGafferDock(QtWidgets.QWidget):
 
     def _set_match_thumb(self, path):
         if path and os.path.exists(path):
-            pix = QtGui.QPixmap(path)
+            pix = _bounded_pixmap(path, self.match_thumb.size())
             if not pix.isNull():
-                self.match_thumb.setPixmap(pix.scaled(
-                    self.match_thumb.size(), QtCore.Qt.KeepAspectRatio,
-                    QtCore.Qt.SmoothTransformation))
+                self.match_thumb.setPixmap(pix)
                 return
         self.match_thumb.setPixmap(QtGui.QPixmap())
         self.match_thumb.setText("no match yet")
@@ -890,10 +951,15 @@ class MaxGafferDock(QtWidgets.QWidget):
         self._log(f"— refine: {cam} — “{note}”")
         try:
             result = self.ctrl.refine(cam, note, log=self._log,
-                                      should_cancel=lambda: self._cancel)
+                                      should_cancel=lambda: self._cancel,
+                                      locks=self._locks())
             score = f"{result.best_score:.1f}" if result.best_score is not None else "n/a"
-            ceiling = (" · ceiling proven — the gap left is content, not lighting"
-                       if result.ceiling_converged and (result.best_score or 0) < 99 else "")
+            ceiling = ""
+            if (result.best_score or 0) < 99:
+                if getattr(result, "ceiling_proven", False):
+                    ceiling = " · ceiling proven — the gap left is content, not lighting"
+                elif result.ceiling_converged:
+                    ceiling = " · plateau (finer steps untested — not a proven ceiling)"
             self._log(f"✓ refine done ({result.stop_reason}) — best {score}{ceiling}")
             self._set_match_thumb(result.best_render)
             headline = f"{cam} — refined to {score}"
@@ -915,6 +981,9 @@ class MaxGafferDock(QtWidgets.QWidget):
             self.refresh_cameras()
             self._show_reference(cam)
     def _open_run_dir(self):
+        if self._busy:
+            self._log("busy — run folder opens when the current run finishes")
+            return
         d = self.ctrl._run_dir or cfgmod.sessions_dir()
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(d))
 
@@ -952,6 +1021,9 @@ class MaxGafferDock(QtWidgets.QWidget):
 
     # ================================================================= vantage
     def _start_live_link(self):
+        if self._busy:
+            self._log("busy — live-link toggle ignored until the current run finishes")
+            return
         ok, how = self.ctrl.start_live_link()
         self.lbl_link.setText(("link: started — " if ok else "link: ") + how)
         self._log(("vantage live link: " if ok else "⚠ vantage live link: ") + how)
@@ -960,6 +1032,9 @@ class MaxGafferDock(QtWidgets.QWidget):
         cams = ([self._current_camera()] if selected_only
                 else self.ctrl.session.cameras_with_states())
         return [c for c in cams if c]
+
+    def _on_vantage_progress(self, cam: str, status: str):
+        self._log(f"vantage {cam}: {status}")
 
     def _render_finals(self, selected_only: bool):
         if self._busy:
@@ -980,13 +1055,19 @@ class MaxGafferDock(QtWidgets.QWidget):
                 jobs = self.ctrl.prepare_vantage_jobs(
                     cams, out_dir, on_progress=lambda c, s: self._log(f"vantage {c}: {s}"))
                 relay = _ProgressRelay()
-                relay.progress.connect(lambda c, s: self._log(f"vantage {c}: {s}"))
+                # bound slot, NOT a lambda: Qt can only marshal the signal onto the
+                # main thread when the receiver is a QObject with thread affinity —
+                # a lambda resolves to DirectConnection and _log would run on the
+                # vantage watcher thread (exactly what _ProgressRelay exists to stop)
+                relay.progress.connect(self._on_vantage_progress)
                 results = self._run_blocking_io(
                     lambda: self.ctrl.run_vantage_jobs(
-                        jobs, on_progress=lambda c, s: relay.progress.emit(c, s)))
+                        jobs, on_progress=lambda c, s: relay.progress.emit(c, s),
+                        should_cancel=lambda: self._cancel))
             else:
                 results = self.ctrl.render_finals_vray(
-                    cams, out_dir, on_progress=lambda c, s: self._log(f"final {c}: {s}"))
+                    cams, out_dir, on_progress=lambda c, s: self._log(f"final {c}: {s}"),
+                    should_cancel=lambda: self._cancel)
             for cam, status in results.items():
                 self._log(f"{'✓' if status == 'ok' else '✗'} {cam}: {status}")
         except Exception as e:  # noqa: BLE001
@@ -1019,6 +1100,9 @@ class MaxGafferDock(QtWidgets.QWidget):
 
     # ================================================================= settings
     def _open_settings(self):
+        if self._busy:
+            self._log("busy — settings ignored until the current run finishes")
+            return
         dlg = SettingsDialog(self.cfg, self)
         if dlg.exec():
             self.ctrl.cfg = self.cfg
@@ -1053,14 +1137,15 @@ class ScenarioBoardDialog(QtWidgets.QDialog):
             btn.setToolTip(c.get("why", ""))
             render = c.get("render")
             if render and os.path.exists(render):
-                pix = QtGui.QPixmap(render)
+                pix = _bounded_pixmap(render, QtCore.QSize(240, 135))
                 if not pix.isNull():
                     btn.setIcon(QtGui.QIcon(pix))
                     btn.setIconSize(QtCore.QSize(240, 135))
             btn.setStyleSheet(
-                f"QToolButton{{background:{PANEL};{_RAISED}border-radius:12px;"
-                f"padding:10px;color:#dcdcdc;}}"
-                f"QToolButton:checked{{background:#f0f0f0;color:#111111;}}")
+                f"QToolButton{{background:{INSET};border:{HAIR};border-radius:12px;"
+                f"padding:10px;color:{TEXT};}}"
+                f"QToolButton:checked{{border:2px solid {ACCENT};"
+                f"background:rgba(10,132,255,0.12);}}")
             btn.clicked.connect(lambda _=False, idx=i: setattr(self, "chosen", idx))
             grid.addWidget(btn, i // 3, i % 3)
             self._cards.append(btn)
@@ -1229,6 +1314,21 @@ class SettingsDialog(QtWidgets.QDialog):
         res.addWidget(QtWidgets.QLabel("×"))
         res.addWidget(self.sp_h)
         form.addRow("loop render size", res)
+        self.cb_norender = QtWidgets.QCheckBox(
+            "apply settings only — never render (loop, sweep, board probes, finals off)")
+        self.cb_norender.setChecked(bool(getattr(cfg, "no_renders", False)))
+        form.addRow("no-render mode", self.cb_norender)
+        self.cb_swexpose = QtWidgets.QCheckBox(
+            "apply EV/WB to frames in software (auto-detected; needed on V-Ray GPU)")
+        self.cb_swexpose.setChecked(bool(getattr(cfg, "software_exposure", False)))
+        form.addRow("software exposure", self.cb_swexpose)
+        self.cmb_backend = QtWidgets.QComboBox()
+        self.cmb_backend.addItems(["vray", "vantage_cli"])
+        self.cmb_backend.setCurrentText(
+            getattr(cfg, "final_render_backend", "vray") or "vray")
+        form.addRow("finals backend", self.cmb_backend)
+        self.ed_vantage_exe = QtWidgets.QLineEdit(getattr(cfg, "vantage_exe", ""))
+        form.addRow("vantage.exe", self.ed_vantage_exe)
         self.lbl_status = QtWidgets.QLabel("")
         self.lbl_status.setObjectName("dim")
         form.addRow(self.lbl_status)
@@ -1276,6 +1376,10 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cfg.loop_height = int(self.sp_h.value())
         self.cfg.max_iterations = int(self.sp_iters.value())
         self.cfg.target_score = float(self.sp_target.value())
+        self.cfg.no_renders = bool(self.cb_norender.isChecked())
+        self.cfg.software_exposure = bool(self.cb_swexpose.isChecked())
+        self.cfg.final_render_backend = self.cmb_backend.currentText() or "vray"
+        self.cfg.vantage_exe = self.ed_vantage_exe.text().strip()
         self.accept()
 
 

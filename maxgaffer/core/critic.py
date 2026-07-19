@@ -64,6 +64,16 @@ def _num(value, default: float = 0.0) -> float:
     return v if math.isfinite(v) else default
 
 
+def _finite(value):
+    """Finite float or None — for component gates, where a junk field must read as
+    ABSENT (component skipped + renormalized), never as a fabricated measurement."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
 def _seq(value) -> List[float]:
     """Numeric-list coercion (histograms, grids): anything else → empty list."""
     if not isinstance(value, (list, tuple)):
@@ -81,8 +91,10 @@ def _lab(value) -> List[float]:
 def score(ref: Dict, cur: Dict, weights: Dict[str, float] = None) -> Verdict:
     w = dict(DEFAULT_WEIGHTS)
     if isinstance(weights, dict):
-        # config.json is user-editable (tasks/plan.md says so) — accept only known keys
-        # with finite, non-negative floats; anything else keeps the default weight
+        # config.json is user-editable — accept only known keys with finite, non-negative
+        # floats (a NaN weight makes every accept/revert comparison silently False);
+        # anything else keeps the default weight
+
         for k, v in weights.items():
             if k not in w:
                 continue
@@ -93,26 +105,44 @@ def score(ref: Dict, cur: Dict, weights: Dict[str, float] = None) -> Verdict:
             if math.isfinite(fv) and fv >= 0.0:
                 w[k] = fv
 
-    key_ref = max(1e-5, _num(ref.get("log_key", 0.0)))
-    key_cur = max(1e-5, _num(cur.get("log_key", 0.0)))
-    s_key = 1.0 - min(1.0, abs(math.log2(key_ref / key_cur)) / 3.0)
+    # every component joins ONLY when its source data is present AND coercible on both
+    # sides — absent data must never default to a perfect sub-score (a present-but-empty
+    # stats dict once scored a false 100.0 and stopped a match as target_reached), and a
+    # present-but-mistyped field reads as UNMEASURED, never raising mid-loop
+    comps: Dict[str, float] = {}
 
-    d5 = abs(_num(_sub(ref, "p", "5")) - _num(_sub(cur, "p", "5")))
-    d95 = abs(_num(_sub(ref, "p", "95")) - _num(_sub(cur, "p", "95")))
-    s_env = 1.0 - min(1.0, (d5 + d95) / 0.5)
+    key_ref, key_cur = _finite(ref.get("log_key")), _finite(cur.get("log_key"))
+    if key_ref is not None and key_cur is not None:
+        comps["key"] = 1.0 - min(1.0, abs(
+            math.log2(max(1e-5, key_ref) / max(1e-5, key_cur))) / 3.0)
 
-    s_hist = 1.0 - min(1.0, hist_emd(_seq(ref.get("lum_hist")), _seq(cur.get("lum_hist"))) * 4.0)
+    if isinstance(ref.get("p"), dict) and isinstance(cur.get("p"), dict):
+        p_vals = (_finite(_sub(ref, "p", "5")), _finite(_sub(cur, "p", "5")),
+                  _finite(_sub(ref, "p", "95")), _finite(_sub(cur, "p", "95")))
+        if None not in p_vals:
+            comps["envelope"] = 1.0 - min(
+                1.0, (abs(p_vals[0] - p_vals[1]) + abs(p_vals[2] - p_vals[3])) / 0.5)
 
-    lr, lc = _lab(ref.get("lab_mean")), _lab(cur.get("lab_mean"))
-    d_col = math.sqrt(0.4 * (lr[0] - lc[0]) ** 2 + (lr[1] - lc[1]) ** 2 + (lr[2] - lc[2]) ** 2)
-    s_col = 1.0 - min(1.0, d_col / 30.0)
+    hist_ref, hist_cur = _seq(ref.get("lum_hist")), _seq(cur.get("lum_hist"))
+    if hist_ref and hist_cur:
+        comps["histogram"] = 1.0 - min(1.0, hist_emd(hist_ref, hist_cur) * 4.0)
 
-    comps = {"key": s_key, "envelope": s_env, "histogram": s_hist, "color": s_col}
-    # hue carries information only when BOTH sides are chromatic — two achromatic images
-    # (empty hue vectors) score cosine 1.0 for "no hue information", inflating exactly
-    # the degenerate pairs; skip the component and renormalize, mirroring direction
+    lr, lc = ref.get("lab_mean"), cur.get("lab_mean")
+    if (isinstance(lr, (list, tuple)) and len(lr) == 3
+            and isinstance(lc, (list, tuple)) and len(lc) == 3):
+        lab_vals = [_finite(x) for x in (*lr, *lc)]
+        if None not in lab_vals:
+            d_col = math.sqrt(0.4 * (lab_vals[0] - lab_vals[3]) ** 2
+                              + (lab_vals[1] - lab_vals[4]) ** 2
+                              + (lab_vals[2] - lab_vals[5]) ** 2)
+            comps["color"] = 1.0 - min(1.0, d_col / 30.0)
+
+    # hue joins when EITHER side is chromatic: a grey render of a colorful reference is
+    # real signal (cosine 0 — penalized toward color); two achromatic images carry no
+    # hue information and would inflate exactly the degenerate pairs — skipped
     hue_ref, hue_cur = _seq(ref.get("hue_hist")), _seq(cur.get("hue_hist"))
-    if any(abs(v) > 1e-6 for v in hue_ref) and any(abs(v) > 1e-6 for v in hue_cur):
+    if ((hue_ref or hue_cur) and (any(abs(v) > 1e-9 for v in hue_ref)
+                                  or any(abs(v) > 1e-9 for v in hue_cur))):
         comps["hue"] = max(0.0, cosine(hue_ref, hue_cur))
     # prefer the finer 5×5 grid when both sides carry it (better azimuth acuity);
     # 3×3 remains for stats produced by older engine versions
@@ -121,7 +151,10 @@ def score(ref: Dict, cur: Dict, weights: Dict[str, float] = None) -> Verdict:
         g_ref, g_cur = _seq(ref.get("grid")), _seq(cur.get("grid"))
     if g_ref and g_cur and len(g_ref) == len(g_cur) and any(abs(v) > 1e-6 for v in g_ref):
         comps["direction"] = max(0.0, (cosine(g_ref, g_cur) + 1.0) / 2.0)
-    # only weigh what was measurable — old stats without a grid renormalize cleanly
+    # only weigh what was measurable — old stats without a grid renormalize cleanly;
+    # NOTHING measurable = unmeasurable comparison, scored 0 (never a false perfect)
+    if not comps:
+        return Verdict(score=0.0, components={})
     total_w = sum(w[k] for k in comps) or 1.0
     total = sum(w[k] * comps[k] for k in comps) / total_w
     return Verdict(score=round(100.0 * total, 2), components=comps)

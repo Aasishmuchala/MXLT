@@ -198,9 +198,9 @@ def test_polish_turns_a_zeroed_dome_back_up(monkeypatch):
     hooks = Hooks(apply=apply, render=lambda t: "/tmp/p.png",
                   stats=lambda p: {"x": 1}, llm_deltas=lambda c: "", log=lambda m: None)
     st = start_state(dome=0.0)
-    out, sc, probes, _ = run_polish(st, 50.0, {"any": "ref"}, hooks,
-                                    MatchConfig(polish_rounds=2, polish_stop_at=200.0,
-                                                polish_max_probes=60))
+    out, sc, probes, _, _ = run_polish(st, 50.0, {"any": "ref"}, hooks,
+                                       MatchConfig(polish_rounds=2, polish_stop_at=200.0,
+                                                   polish_max_probes=60))
     assert out.get("dome.intensity") > 0.0
     assert sc > 50.0
 
@@ -223,7 +223,7 @@ def test_polish_climb_honors_cancel_mid_climb(monkeypatch):
     hooks = Hooks(apply=apply, render=render, stats=lambda p: {"x": 1},
                   llm_deltas=lambda c: "", log=lambda m: None,
                   should_cancel=lambda: renders["n"] >= 3)
-    out, sc, probes, converged = run_polish(
+    out, sc, probes, converged, _ = run_polish(
         start_state(), 60.0, {"r": 1}, hooks,
         MatchConfig(polish_rounds=8, polish_stop_at=1e9, polish_max_probes=500))
     assert renders["n"] <= 4                               # cancel cut the climb at once
@@ -266,7 +266,7 @@ def test_polish_result_is_not_applied_twice(monkeypatch):
     def fake_polish(state, score, ref, hooks, cfg, locks):
         hooks.apply(landed)                                # polish's contract: land it
         marks.append(len(world.applied))
-        return landed, score + 1.0, 3, False
+        return landed, score + 1.0, 3, False, False
 
     monkeypatch.setattr(director, "run_polish", fake_polish)
     res = run_match(start_state(), REF, {}, world.hooks(),

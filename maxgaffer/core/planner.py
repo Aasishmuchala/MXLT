@@ -160,7 +160,10 @@ def validate_plan(reply_text: str, cat: Dict[str, Set[str]],
                 ok = True
                 for k, (lo, hi) in PLACEMENT_LIMITS.items():
                     try:
-                        place[k] = min(hi, max(lo, float(placement.get(k))))
+                        pv = float(placement.get(k))
+                        if not math.isfinite(pv):
+                            raise ValueError
+                        place[k] = min(hi, max(lo, pv))
                     except (TypeError, ValueError):
                         rejected.append(f"create_light {name}: bad placement.{k}")
                         ok = False

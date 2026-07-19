@@ -58,8 +58,9 @@ def apply_draft() -> List[str]:
 
     Two passes, strictly ordered: collect every original → write the crash-safe file →
     only THEN mutate the renderer. A crash before the write leaves the scene untouched;
-    a crash after it leaves a complete recovery file. If the file can't be written,
-    nothing has been touched and draft mode aborts."""
+    a crash after it leaves a complete recovery file (the match's ``finally`` or the
+    next launch's recovery restores it). If the file can't be written, nothing has been
+    touched and draft mode aborts."""
     lines: List[str] = []
     if pending_snapshot():
         lines += restore_draft()
@@ -89,14 +90,19 @@ def apply_draft() -> List[str]:
         with open(SNAPSHOT_PATH, "w", encoding="utf-8") as f:
             json.dump(originals, f, indent=1)
     except OSError:
+        # no safety net → refuse BEFORE touching anything (nothing was mutated yet)
         return lines + ["draft: could not write the safety snapshot — draft mode ABORTED, "
                         "settings untouched"]
     # pass 2 — apply, per-prop fault-isolated; only log a change that actually happened
     for name, draft_value in planned:
-        applied = set_prop(r, (name,), draft_value)
+        try:
+            applied = set_prop(r, (name,), draft_value)
+        except Exception:  # noqa: BLE001
+            applied = None
         if applied:
             lines.append(f"draft: {name} {originals[name]:g} → {draft_value:g}")
         else:
+            # leave the snapshot: it still covers every prop that DID change
             lines.append(f"draft: {name} would not take the draft value — left at "
                          f"{originals[name]:g}")
     return lines

@@ -24,6 +24,12 @@ log = logging.getLogger(__name__)
 FORMAT_VERSION = 1
 
 
+def _str_list(value) -> List:
+    """Only real JSON arrays pass — a hand-edited ``"locks": "sun.intensity"`` string
+    would otherwise load as a set of single characters."""
+    return list(value) if isinstance(value, (list, tuple, set)) else []
+
+
 def sidecar_path(scene_path: str) -> Optional[str]:
     """foo.max → foo.maxgaffer.json (None for an unsaved scene)."""
     if not scene_path:
@@ -63,15 +69,22 @@ class CameraEntry:
     def from_dict(cls, d: Dict) -> "CameraEntry":
         state = d.get("state")
         pre = d.get("pre_match")
+        score_raw = d.get("score")
+        try:
+            score = float(score_raw) if isinstance(score_raw, (int, float)) else None
+            if score is not None and not math.isfinite(score):
+                score = None
+        except (TypeError, ValueError):
+            score = None
         return cls(
             reference=str(d.get("reference") or ""),
             state=LightingState.from_dict(state) if isinstance(state, dict) else None,
-            score=d.get("score") if isinstance(d.get("score"), (int, float)) else None,
+            score=score,
             matched_at=str(d.get("matched_at") or ""),
-            locks=set(x for x in (d.get("locks") or []) if isinstance(x, str)),
+            locks=set(x for x in _str_list(d.get("locks")) if isinstance(x, str)),
             semantics=d.get("semantics") if isinstance(d.get("semantics"), dict) else {},
             pre_match=LightingState.from_dict(pre) if isinstance(pre, dict) else None,
-            notes=[str(x) for x in (d.get("notes") or []) if isinstance(x, str)],
+            notes=[str(x) for x in _str_list(d.get("notes")) if isinstance(x, str)],
             seed_hdri=str(d.get("seed_hdri") or ""),
             pre_seed=d.get("pre_seed") if isinstance(d.get("pre_seed"), dict) else {},
         )
@@ -203,7 +216,9 @@ class Session:
             os.replace(tmp, self.path)
             self._protect_existing = False   # a successful explicit save re-arms saving
             return True
-        except OSError as e:
+        except (OSError, TypeError, ValueError) as e:
+            # a failed atomic write must not strand the .tmp (json.dump raises TypeError
+            # mid-stream on a non-serializable settings value, OSError on full disks)
             log.warning("MaxGaffer: session save failed for %s: %s", self.path, e)
             try:
                 os.unlink(tmp)
@@ -253,7 +268,12 @@ def preset_loads(text: str) -> Optional[LightingState]:
     if not isinstance(d, dict) or "maxgaffer_preset" not in d:
         return None
     state = d.get("state")
-    return LightingState.from_dict(state) if isinstance(state, dict) else None
+    if not isinstance(state, dict):
+        return None
+    try:
+        return LightingState.from_dict(state)
+    except (TypeError, ValueError):
+        return None
 
 
 def _iso_now() -> str:
