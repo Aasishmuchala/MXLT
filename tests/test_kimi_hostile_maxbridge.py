@@ -829,6 +829,7 @@ def _write_config(tmp_path, monkeypatch, raw):
     p = tmp_path / "config.json"
     p.write_bytes(raw)
     monkeypatch.setattr(cfgmod, "CONFIG_PATH", str(p))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))   # keep the MaxDirector key borrow off the real box
     return str(p)
 
 
