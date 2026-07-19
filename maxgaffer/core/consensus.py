@@ -50,7 +50,11 @@ def consolidate_analyses(samples: List[Dict]) -> Dict:
         elif key in NUMERIC_KEYS:
             out[key] = round(_median([float(v) for v in values]), 2)
         elif key in BOOL_KEYS:
-            out[key] = sum(bool(v) for v in values) * 2 > len(values)
+            true_votes = sum(bool(v) for v in values)
+            if true_votes * 2 == len(values):
+                out[key] = bool(best.get(key))   # tie → the most-confident sample,
+            else:                                # exactly like the enum path below
+                out[key] = true_votes * 2 > len(values)
         elif key == "key_notes":
             out[key] = best.get(key, "")
         else:                                   # enums: majority, confidence-broken ties

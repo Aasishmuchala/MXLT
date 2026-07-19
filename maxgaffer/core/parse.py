@@ -7,6 +7,7 @@ then degrade gracefully instead of applying garbage to a client scene.
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Sequence
 
 from .omega import parse_json_from_text
@@ -23,9 +24,12 @@ class ParseError(ValueError):
 
 def _num(d: Dict, key: str, lo: float, hi: float, default: float) -> float:
     try:
-        return min(hi, max(lo, float(d.get(key))))
+        v = float(d.get(key))
     except (TypeError, ValueError):
         return default
+    # JSON accepts bare NaN/Infinity tokens — they must land on the DEFAULT, not on a
+    # bound (min/max ordering silently coerces NaN to lo)
+    return min(hi, max(lo, v)) if math.isfinite(v) else default
 
 
 def _enum(d: Dict, key: str, allowed: Sequence[str], default: str) -> str:
@@ -70,6 +74,9 @@ def validate_deltas(reply_text: str, max_changes: int = 4) -> Dict:
     changes: Dict[str, float] = {}
     reasons: Dict[str, str] = {}
     raw = obj.get("changes")
+    if isinstance(raw, dict):
+        # a common deviation from the prompted schema — accept it rather than drop silently
+        raw = [{"param": k, "value": v} for k, v in raw.items()]
     if isinstance(raw, list):
         for item in raw[:max_changes]:
             if not isinstance(item, dict):
@@ -79,6 +86,8 @@ def validate_deltas(reply_text: str, max_changes: int = 4) -> Dict:
                 value = float(item.get("value"))
             except (TypeError, ValueError):
                 continue
+            if not math.isfinite(value):
+                continue          # NaN/∞ proposals are refused, never step-coerced
             if isinstance(param, str) and param:
                 changes[param] = value
                 reasons[param] = str(item.get("why") or "")[:120]

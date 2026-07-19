@@ -37,6 +37,24 @@ def _rt():
     return pymxs.runtime
 
 
+LIVE_LINK_PORTS = (20701, 20703)   # 20701 stock · 20703 on V-Ray 7.3 DR2
+
+
+def link_running(ports: Tuple[int, ...] = LIVE_LINK_PORTS) -> Optional[int]:
+    """The port a live link is streaming on, or None. A listener there means Vantage is
+    attached — the only non-destructive way to tell (the V-Ray action is a toggle, so
+    asking by executing it would FLIP the state). Pure stdlib socket, safe anywhere."""
+    import socket
+
+    for port in ports:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                return port
+        except OSError:
+            continue
+    return None
+
+
 def start_live_link() -> Tuple[bool, str]:
     """Execute V-Ray's 'Initiate a Live-Link to Chaos Vantage' action (a TOGGLE — it also
     stops an active link). → (executed?, how/diagnostic). Degrades off-Max."""
@@ -156,31 +174,44 @@ def render_stills(
     width: int,
     height: int,
     on_progress: Optional[Callable[[str, str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, str]:
     """LEGACY/Developer-Edition ONLY: sequential vantage_console CLI batch. Stock Vantage
-    2.0+ removed these flags — use the V-Ray backend or the in-app batch queue instead."""
+    2.0+ removed these flags — use the V-Ray backend or the in-app batch queue instead.
+
+    Every job is fault-isolated: a malformed job dict or a failed render records an error
+    for that camera and the batch CONTINUES — one bad shot must not cost the rest of the
+    night. ``should_cancel`` is checked between jobs; when it fires, every remaining job
+    is recorded as "cancelled" and the batch stops."""
+    def _cam(job, idx) -> str:
+        if isinstance(job, dict) and job.get("camera"):
+            return str(job["camera"])
+        return f"job{idx}"
+
     results: Dict[str, str] = {}
     if not os.path.exists(console_exe):
-        return {j["camera"]: f"vantage_console not found: {console_exe}" for j in jobs}
-    for job in jobs:
-        cam = job["camera"]
+        return {_cam(j, i): f"vantage_console not found: {console_exe}"
+                for i, j in enumerate(jobs)}
+    for i, job in enumerate(jobs):
+        cam = _cam(job, i)
+        if should_cancel is not None and should_cancel():
+            for k, rest in enumerate(jobs[i:], start=i):
+                results[_cam(rest, k)] = "cancelled"
+                if on_progress:
+                    on_progress(_cam(rest, k), "cancelled")
+            break
         if on_progress:
             on_progress(cam, "rendering (vantage)")
-        cmd = vantage_command(console_exe, job["scene_file"], job["output"], width, height)
         try:
+            cmd = vantage_command(console_exe, job["scene_file"], job["output"],
+                                  width, height)
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * 60)
             if proc.returncode == 0 and _output_written(job["output"]):
                 results[cam] = "ok"
-                if on_progress:
-                    on_progress(cam, "done")
             else:
                 results[cam] = f"vantage exit {proc.returncode}"
-                if on_progress:
-                    on_progress(cam, results[cam])
-                break
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 one bad job must not kill the batch
             results[cam] = f"error: {e}"
-            if on_progress:
-                on_progress(cam, results[cam])
-            break
+        if on_progress:
+            on_progress(cam, "done" if results[cam] == "ok" else results[cam])
     return results

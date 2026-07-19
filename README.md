@@ -125,9 +125,11 @@ Tick **deep match → 99** for hero shots. The precise promise, measured live:
   engine lands **≥99**: annealed steps and tightening solver deadbands finish what
   exploration started, then an LLM-free **adaptive coordinate line search** (climb while a
   rendered nudge measurably improves the critic, accelerate on streaks, halve on failure,
-  EV/WB are axes too so geometry can never fake exposure) squeezes to the optimum.
-  Live benchmark, asserted: **99.14 from the basin, deterministic legs only**; full live
-  pipeline **14.3 → 98.25 with a 4° sun-direction error**.
+  EV/WB are axes too so geometry can never fake exposure — and when single axes stall, the
+  coupled pairs are probed **diagonally** so a tonal↔geometry compensation ridge can't
+  trap the search) squeezes to the optimum.
+  Live benchmark, asserted: **99.01 from the basin, deterministic legs only**; full live
+  pipeline **18.7 → 99.3** (2026-07-18, post round-3 stress audit).
 * when the reference is a **different scene**, no lighting can produce its histogram —
   the engine converges to the scene's own optimum and the report SAYS SO: *"ceiling
   proven — the gap left is content, not lighting."* Two consecutive diminishing-return
@@ -293,7 +295,7 @@ MaxDirector's SPEC deferred to its P2.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install pytest pillow
-.venv/bin/python -m pytest tests/ -q          # ~70 tests, all pure core
+.venv/bin/python -m pytest tests/ -q          # 300+ tests, all pure core
 ```
 
 The suite catches the classics: EV/WB sign conventions, the 180°-wrap ambiguity, LLM junk

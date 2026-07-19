@@ -57,8 +57,10 @@ def render_frame(camera, out_path: str, width: int, height: int) -> Optional[str
         if bm is None:
             return None
         bm.filename = out_path
-        rt.save(bm)
-        rt.close(bm)
+        try:
+            rt.save(bm)
+        finally:
+            rt.close(bm)   # a failed save must not leak the bitmap
         return out_path if os.path.exists(out_path) else None
     except Exception:
         return None

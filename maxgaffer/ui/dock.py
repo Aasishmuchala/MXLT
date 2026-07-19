@@ -90,6 +90,47 @@ def _cap(text: str) -> QtWidgets.QLabel:
     return lbl
 
 
+# ---------------------------------------------------------------- crash forensics + safe decode
+_LOG_MIRROR = os.path.join(os.path.dirname(cfgmod.CONFIG_PATH), "last_session.log")
+
+
+def _reset_log_mirror() -> None:
+    """Truncate the crash-forensics log at dock open. A native Max crash bypasses every
+    Python try/except — but every log line is mirrored+flushed here, so after a crash the
+    LAST line of %LOCALAPPDATA%/MaxGaffer/last_session.log names the step that died."""
+    try:
+        with open(_LOG_MIRROR, "w", encoding="utf-8") as f:
+            f.write("MaxGaffer session log (crash forensics — last line = last step)\n")
+    except OSError:
+        pass
+
+
+def _mirror_log(msg: str) -> None:
+    try:
+        with open(_LOG_MIRROR, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except OSError:
+        pass
+
+
+def _bounded_pixmap(path: str, target: QtCore.QSize) -> QtGui.QPixmap:
+    """Decode an image for a thumbnail WITHOUT the full-resolution transient — a
+    QPixmap(path) on a 50-100 MP reference spikes 0.5-1+ GB, which is an OOM-crash risk
+    at match end on a box already loaded with V-Ray + Vantage. QImageReader scales JPEGs
+    DURING decode (never materializes full res); anything still huge is rejected."""
+    reader = QtGui.QImageReader(path)
+    size = reader.size()
+    if size.isValid():
+        # >120 MP even defeats a scaled decode's scratch buffers on some formats — skip
+        if size.width() * size.height() > 120_000_000:
+            return QtGui.QPixmap()
+        reader.setScaledSize(size.scaled(target, QtCore.Qt.KeepAspectRatio))
+    img = reader.read()
+    if img.isNull():
+        return QtGui.QPixmap()
+    return QtGui.QPixmap.fromImage(img)
+
+
 class _Worker(QtCore.QThread):
     done = QtCore.Signal(object)
     failed = QtCore.Signal(str)
@@ -124,6 +165,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         self._cancel = False
         self._busy = False
         self._sliders: Dict[str, QtWidgets.QDoubleSpinBox] = {}
+        _reset_log_mirror()   # crash forensics: last_session.log starts fresh per dock
         self._build()
         self.refresh_cameras()
         self._recover_draft_snapshot()
@@ -418,6 +460,7 @@ class MaxGafferDock(QtWidgets.QWidget):
 
     # ================================================================= helpers
     def _log(self, msg: str):
+        _mirror_log(msg)
         if msg.startswith("THUMB::"):
             url = QtCore.QUrl.fromLocalFile(msg[len("THUMB::"):]).toString()
             self.log.append(f'<img src="{url}" width="240">')
@@ -498,6 +541,9 @@ class MaxGafferDock(QtWidgets.QWidget):
 
     # ================================================================= reference
     def _pick_reference(self):
+        if self._busy:
+            self._log("busy — reference swap ignored until the current run finishes")
+            return
         cam = self._current_camera()
         if not cam:
             self._log("select a camera first")
@@ -517,11 +563,9 @@ class MaxGafferDock(QtWidgets.QWidget):
         e = self.ctrl.session.cameras.get(cam)
         ref = e.reference if e else ""
         if ref and os.path.exists(ref):
-            pix = QtGui.QPixmap(ref)
+            pix = _bounded_pixmap(ref, self.ref_thumb.size())
             if not pix.isNull():
-                self.ref_thumb.setPixmap(pix.scaled(
-                    self.ref_thumb.size(), QtCore.Qt.KeepAspectRatio,
-                    QtCore.Qt.SmoothTransformation))
+                self.ref_thumb.setPixmap(pix)
                 info = os.path.basename(ref)
                 if e and e.semantics:
                     s = e.semantics
@@ -671,6 +715,9 @@ class MaxGafferDock(QtWidgets.QWidget):
             self._log("board closed — current light kept (it was re-applied already)")
 
     def _save_preset(self):
+        if self._busy:
+            self._log("busy — preset save ignored until the current run finishes")
+            return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save lighting preset", "", "MaxGaffer preset (*.json)")
         if not path:
@@ -736,10 +783,13 @@ class MaxGafferDock(QtWidgets.QWidget):
         try:
             if mode != 2:
                 try:
-                    ops, lines, meta, _raw = self.ctrl.make_plan(cam, log=self._log)
+                    plan = self.ctrl.make_plan(cam, log=self._log)
                 except (OmegaError, RuntimeError) as err:
                     self._log(f"⚠ plan skipped ({err}) — continuing with the match loop")
-                    ops, lines, meta = [], [], {}
+                    plan = None
+                # None = junk plan reply twice (controller already logged it) —
+                # the match proceeds plan-less
+                ops, lines, meta = plan[:3] if plan is not None else ([], [], {})
                 if not ops:
                     self._log("plan: no operations proposed — continuing to the match loop")
                 elif self.act_autoexec.isChecked() or PlanPreviewDialog(
@@ -766,6 +816,7 @@ class MaxGafferDock(QtWidgets.QWidget):
             headline = f"{cam} — {result.stop_reason}, score {score}"
             self._fill_changes(plan_report, self.ctrl.state_change_rows(cam), headline)
             if self.act_popup.isChecked():
+                self._log("· showing the change report…")   # crash breadcrumb
                 ChangeReportDialog(plan_report, self.ctrl.state_change_rows(cam),
                                    headline, self).exec()
         except (OmegaError, RuntimeError) as err:
@@ -780,6 +831,7 @@ class MaxGafferDock(QtWidgets.QWidget):
             self.btn_cancel.setEnabled(False)
             self.refresh_cameras()
             self._show_reference(cam)
+            self._log("· match UI settled")   # crash breadcrumb: last healthy step
     def _start_match_all(self):
         if self._busy:
             return
@@ -826,11 +878,9 @@ class MaxGafferDock(QtWidgets.QWidget):
 
     def _set_match_thumb(self, path):
         if path and os.path.exists(path):
-            pix = QtGui.QPixmap(path)
+            pix = _bounded_pixmap(path, self.match_thumb.size())
             if not pix.isNull():
-                self.match_thumb.setPixmap(pix.scaled(
-                    self.match_thumb.size(), QtCore.Qt.KeepAspectRatio,
-                    QtCore.Qt.SmoothTransformation))
+                self.match_thumb.setPixmap(pix)
                 return
         self.match_thumb.setPixmap(QtGui.QPixmap())
         self.match_thumb.setText("no match yet")
@@ -855,7 +905,8 @@ class MaxGafferDock(QtWidgets.QWidget):
         self._log(f"— refine: {cam} — “{note}”")
         try:
             result = self.ctrl.refine(cam, note, log=self._log,
-                                      should_cancel=lambda: self._cancel)
+                                      should_cancel=lambda: self._cancel,
+                                      locks=self._locks())
             score = f"{result.best_score:.1f}" if result.best_score is not None else "n/a"
             ceiling = ""
             if (result.best_score or 0) < 99:
@@ -884,6 +935,9 @@ class MaxGafferDock(QtWidgets.QWidget):
             self.refresh_cameras()
             self._show_reference(cam)
     def _open_run_dir(self):
+        if self._busy:
+            self._log("busy — run folder opens when the current run finishes")
+            return
         d = self.ctrl._run_dir or cfgmod.sessions_dir()
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(d))
 
@@ -917,6 +971,9 @@ class MaxGafferDock(QtWidgets.QWidget):
 
     # ================================================================= vantage
     def _start_live_link(self):
+        if self._busy:
+            self._log("busy — live-link toggle ignored until the current run finishes")
+            return
         ok, how = self.ctrl.start_live_link()
         self.lbl_link.setText(("link: started — " if ok else "link: ") + how)
         self._log(("vantage live link: " if ok else "⚠ vantage live link: ") + how)
@@ -940,6 +997,8 @@ class MaxGafferDock(QtWidgets.QWidget):
         if not out_dir:
             return
         self._busy = True
+        self._cancel = False
+        self.btn_cancel.setEnabled(True)
         try:
             if self.cfg.final_render_backend == "vantage_cli":
                 # Developer-Edition CLI only — exports main-thread, renders on a worker
@@ -953,16 +1012,19 @@ class MaxGafferDock(QtWidgets.QWidget):
                 relay.progress.connect(self._on_vantage_progress)
                 results = self._run_blocking_io(
                     lambda: self.ctrl.run_vantage_jobs(
-                        jobs, on_progress=lambda c, s: relay.progress.emit(c, s)))
+                        jobs, on_progress=lambda c, s: relay.progress.emit(c, s),
+                        should_cancel=lambda: self._cancel))
             else:
                 results = self.ctrl.render_finals_vray(
-                    cams, out_dir, on_progress=lambda c, s: self._log(f"final {c}: {s}"))
+                    cams, out_dir, on_progress=lambda c, s: self._log(f"final {c}: {s}"),
+                    should_cancel=lambda: self._cancel)
             for cam, status in results.items():
                 self._log(f"{'✓' if status == 'ok' else '✗'} {cam}: {status}")
         except Exception as e:  # noqa: BLE001
             self._log(f"✗ final renders: {e}")
         finally:
             self._busy = False
+            self.btn_cancel.setEnabled(False)
 
     def _export_for_vantage(self):
         if self._busy:
@@ -988,6 +1050,9 @@ class MaxGafferDock(QtWidgets.QWidget):
 
     # ================================================================= settings
     def _open_settings(self):
+        if self._busy:
+            self._log("busy — settings ignored until the current run finishes")
+            return
         dlg = SettingsDialog(self.cfg, self)
         if dlg.exec():
             self.cfg.save()
@@ -1019,7 +1084,7 @@ class ScenarioBoardDialog(QtWidgets.QDialog):
             btn.setToolTip(c.get("why", ""))
             render = c.get("render")
             if render and os.path.exists(render):
-                pix = QtGui.QPixmap(render)
+                pix = _bounded_pixmap(render, QtCore.QSize(240, 135))
                 if not pix.isNull():
                     btn.setIcon(QtGui.QIcon(pix))
                     btn.setIconSize(QtCore.QSize(240, 135))

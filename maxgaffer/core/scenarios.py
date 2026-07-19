@@ -97,12 +97,15 @@ def build_scenarios(
     dropped — the board shows CHOICES, not duplicates."""
     if not current.values and not current.groups:
         return []          # no writable rig → every "candidate" would be a no-op card
+    max_count = max(0, int(max_count))
     base = dict(DEFAULT_SEMANTICS)
     have_ref = bool(semantics)
     if have_ref:
         base.update({k: v for k, v in semantics.items() if v is not None})
     out: List[Dict] = []
     for key, label, why, overrides in VARIANTS:
+        if len(out) >= max_count:
+            break
         if key == "as_analyzed" and not have_ref:
             continue
         if key == "practicals_dusk" and not current.groups:
@@ -116,6 +119,4 @@ def build_scenarios(
             continue
         out.append({"key": key, "label": label, "why": why, "state": state,
                     "semantics": sem})
-        if len(out) >= max_count:
-            break
     return out

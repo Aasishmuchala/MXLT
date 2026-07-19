@@ -8,8 +8,8 @@ iterate with the real solver, critic, guards and live DELTAS calls.
 
     python scripts/sim_match.py [oc_key]      (falls back to scripted-LLM if offline)
 
-PASS criteria (deterministic legs, asserted):  EV within 0.75 stop of target · WB within
-800 K · critic score improves ≥ 15 points. LLM legs (azimuth direction, altitude) are
+PASS criteria (deterministic legs, asserted):  EV within 0.5 stop of target · WB within
+700 K · critic score improves ≥ 15 points. LLM legs (azimuth direction, altitude) are
 reported, not asserted — taste is bounded, not deterministic.
 """
 
@@ -145,6 +145,10 @@ def phase_a_solver_only(world, ref_path, ref_stats) -> bool:
     )
     res = run_match(state_of(a_start), ref_stats, {}, hooks,
                     MatchConfig(max_iterations=6, target_score=99.0))
+    if res.best_score is None:
+        # cancelled/failed before any successful render — a clean FAIL, not a TypeError
+        print("A: no score produced (render or stats failed before iteration 0) — FAIL ✗")
+        return False
     ev_f = res.best_state.get("exposure.ev")
     wb_f = res.best_state.get("exposure.wb_kelvin")
     first = next((r.score for r in res.iterations if r.score is not None), 0.0)

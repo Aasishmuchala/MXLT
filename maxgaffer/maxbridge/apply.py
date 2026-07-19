@@ -80,11 +80,20 @@ def read_state(rig: Dict[str, Any], baselines: Dict[str, float],
     for group, lights in (rig.get("groups") or {}).items():
         factors: List[float] = []
         for lt in lights:
-            base = baselines.get(_light_name(lt), 1.0) or 1.0
+            name = _light_name(lt)
+            try:
+                base = float(baselines[name]) if name in baselines else 1.0
+            except (TypeError, ValueError):
+                base = 1.0
+            if name in baselines and base == 0:
+                # authored-off light: writes pin it at 0 × factor = 0, so it carries no
+                # dimmer signal — read it as 0, not against a phantom 1.0 baseline
+                factors.append(0.0)
+                continue
             v = sc.get_prop(lt, sc.LIGHT_MULT, base)
             try:
-                factors.append(float(v) / base)
-            except (TypeError, ValueError, ZeroDivisionError):
+                factors.append(float(v) / base)   # base is never 0 here (handled above)
+            except (TypeError, ValueError):
                 factors.append(1.0)
         if factors:
             st.groups[group] = sum(factors) / len(factors)
@@ -112,10 +121,13 @@ def apply_state(rig: Dict[str, Any], baselines: Dict[str, float], state: Lightin
     ctx = pymxs.undo(True, "MaxGaffer lighting") if undo else pymxs.undo(False)
     with ctx:
         _apply_inner(rig, baselines, state, camera, warnings)
-    try:
-        _rt().redrawViews()
-    except Exception:
-        pass
+    if undo:
+        # probe/loop applies (undo=False) fire 130+ times per deep match — redrawing the
+        # viewport for each is a redraw storm; manual applies stay live
+        try:
+            _rt().redrawViews()
+        except Exception:
+            pass
     return warnings
 
 

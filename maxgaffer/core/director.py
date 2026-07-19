@@ -91,6 +91,15 @@ POLISH_PARAMS = (
     ("dome.rotation_deg", 12.0, False, 1.5),
 )
 
+# the compensation couples — probed diagonally when single-axis search stalls (ridge
+# escape): exposure↔WB fake each other, and both fake low-sun warmth/direction
+_POLISH_PAIRS = (
+    ("exposure.ev", "exposure.wb_kelvin"),
+    ("exposure.wb_kelvin", "sun.altitude_deg"),
+    ("exposure.ev", "sun.altitude_deg"),
+    ("sun.azimuth_deg", "sun.altitude_deg"),
+)
+
 
 @dataclass
 class Hooks:
@@ -400,9 +409,13 @@ def run_match(
     # ---- always land on the best known state
     if best_score is not None:
         hooks.apply(best_state)
-    else:
+    elif any(r.render_path for r in records):
+        # unscored LLM-visual mode (metrics off): land on the latest applied state
         best_state = state
         hooks.apply(best_state)
+    # else: cancelled/failed before the FIRST successful render — leave the scene exactly
+    # as the run found it (matches are explorations, never commitments) and return
+    # best_score=None so the controller keeps the camera's previously accepted state
     result = MatchResult(
         best_state=best_state,
         best_score=best_score,
@@ -440,7 +453,7 @@ def run_polish(
     hooks: Hooks,
     cfg: MatchConfig,
     locks: Optional[Set[str]] = None,
-) -> Tuple[LightingState, float, int, bool]:
+) -> Tuple[LightingState, float, int, bool, bool]:
     """LLM-free ADAPTIVE coordinate line search. Per parameter: nudge, keep climbing in a
     direction while each rendered probe measurably improves the score; when neither
     direction improves, that parameter's step halves next round.
@@ -516,10 +529,78 @@ def run_polish(
                     dead[key] = (step, best_score)
             low_gain_rounds = (low_gain_rounds + 1
                                if best_score - round_start < cfg.polish_round_eps else 0)
-            if low_gain_rounds >= 2:
-                hooks.apply(best)
-                return best, best_score, probes, True, False   # plateau — NOT proven
             if not improved_any:
+                # COMPENSATION-RIDGE escape: tonal and geometry axes can ratchet each
+                # other AWAY from the target (altitude↑ fakes warmth, WB↑ cancels it —
+                # the v0.9.5+ stats made this a live trap: polish stalled at 97.8 on the
+                # ridge while the 99 summit sat one diagonal away). Single-axis moves
+                # can't cross a rotated valley floor, so before halving, probe the
+                # coupled pairs diagonally with the CURRENT steps (Powell-style) — one
+                # bounded pass per stall, still under the probe budget.
+                escaped = False
+                is_log = {k: l for k, _s, l, _f in POLISH_PARAMS}
+
+                def _diag_probe(ka: str, kb: str, sa: float, sb: float,
+                                mult: float) -> Optional[float]:
+                    cand = best.copy()
+                    va, vb = cand.get(ka), cand.get(kb)
+                    da, db = sa * steps[ka] * mult, sb * steps[kb] * mult
+                    cand.set(ka, va * (2.0 ** da) if is_log[ka] else va + da)
+                    cand.set(kb, vb * (2.0 ** db) if is_log[kb] else vb + db)
+                    if abs(cand.get(ka) - va) < 1e-6 and abs(cand.get(kb) - vb) < 1e-6:
+                        return None             # both clamped — no move at all
+                    sc = measure(cand, f"polish{rnd}_diag")
+                    if sc is not None and sc > best_score + cfg.polish_min_gain:
+                        return sc
+                    return None
+
+                for ka, kb in _POLISH_PAIRS:
+                    if escaped or hooks.should_cancel() \
+                            or probes >= cfg.polish_max_probes:
+                        break
+                    if ka in locks or kb in locks or ka not in best.values \
+                            or kb not in best.values:
+                        continue
+                    for sa in (1.0, -1.0):
+                        if escaped:
+                            break
+                        for sb in (1.0, -1.0):
+                            sc = _diag_probe(ka, kb, sa, sb, 1.0)
+                            if sc is None:
+                                continue
+                            hooks.log(f"polish: {ka}&{kb} diagonal · "
+                                      f"{best_score:.2f}→{sc:.2f} ✓ (ridge escape)")
+                            va, vb = best.get(ka), best.get(kb)
+                            cand = best.copy()
+                            da, db = sa * steps[ka], sb * steps[kb]
+                            cand.set(ka, va * (2.0 ** da) if is_log[ka] else va + da)
+                            cand.set(kb, vb * (2.0 ** db) if is_log[kb] else vb + db)
+                            best, best_score = cand, sc
+                            improved_any = escaped = True
+                            # ride the valley: accelerate along the winning diagonal
+                            # exactly like the single-axis climb does (stride ×1.6)
+                            mult = 1.6
+                            while best_score < cfg.polish_stop_at \
+                                    and probes < cfg.polish_max_probes:
+                                sc2 = _diag_probe(ka, kb, sa, sb, mult)
+                                if sc2 is None:
+                                    break
+                                hooks.log(f"polish: {ka}&{kb} diagonal ×{mult:.1f} · "
+                                          f"{best_score:.2f}→{sc2:.2f} ✓")
+                                va, vb = best.get(ka), best.get(kb)
+                                cand = best.copy()
+                                da, db = sa * steps[ka] * mult, sb * steps[kb] * mult
+                                cand.set(ka, va * (2.0 ** da) if is_log[ka] else va + da)
+                                cand.set(kb, vb * (2.0 ** db) if is_log[kb] else vb + db)
+                                best, best_score = cand, sc2
+                                mult *= 1.6
+                            break
+                if escaped:
+                    low_gain_rounds = 0
+                    continue
+                if low_gain_rounds >= 2:
+                    hooks.apply(best)          # two diminishing rounds AND the diagonal
+                    return best, best_score, probes, True, False   # escape failed — plateau
                 all_floored = all(steps[k] <= floor + 1e-9
                                   for k, _s, _l, floor in POLISH_PARAMS)
                 if all_floored:
@@ -527,6 +608,9 @@ def run_polish(
                     return best, best_score, probes, True, True   # proven local optimum
                 for k, _s, _l, floor in POLISH_PARAMS:
                     steps[k] = max(floor, steps[k] / 2.0)
+            elif low_gain_rounds >= 2:
+                hooks.apply(best)
+                return best, best_score, probes, True, False   # plateau — NOT proven
         hooks.apply(best)
         return best, best_score, probes, False, False
     except Exception:

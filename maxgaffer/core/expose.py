@@ -68,7 +68,10 @@ def expose_pixels(
     base_wb: float,
 ) -> List[Tuple[int, int, int]]:
     """Apply EV (linear multiply) + WB (chromatic gain) in linear light. Pure."""
-    scale = 2.0 ** (base_ev - ev)          # V-Ray: higher EV = darker
+    if not all(math.isfinite(v) for v in (ev, base_ev, wb_kelvin, base_wb)):
+        return list(pixels)      # junk exposure in = identity out, never a crash
+    d_ev = max(-30.0, min(30.0, base_ev - ev))      # 2**x overflows beyond ±1024
+    scale = 2.0 ** d_ev          # V-Ray: higher EV = darker
     gr, gg, gb = wb_gain(wb_kelvin, base_wb)
     gr *= scale
     gg *= scale
@@ -100,6 +103,7 @@ def expose_image_file(src: str, dst: str, ev: float, base_ev: float,
         from PIL import Image  # type: ignore
     except Exception:
         return None
+    tmp = dst + ".tmp"
     try:
         with Image.open(src) as im:
             im = im.convert("RGB")
@@ -107,9 +111,14 @@ def expose_image_file(src: str, dst: str, ev: float, base_ev: float,
                                     wb_kelvin, base_wb)
             out = Image.new("RGB", im.size)
             out.putdata(exposed)
-            tmp = dst + ".tmp"
-            out.save(tmp, format="PNG")
+            # honor the destination's own format — a .jpg path must not get PNG bytes
+            fmt = "JPEG" if dst.lower().endswith((".jpg", ".jpeg")) else "PNG"
+            out.save(tmp, format=fmt)
         os.replace(tmp, dst)      # atomic even when src == dst (in-place expose)
         return dst
     except Exception:
+        try:
+            os.remove(tmp)        # never strand the partial write
+        except OSError:
+            pass
         return None

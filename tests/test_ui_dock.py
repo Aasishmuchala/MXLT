@@ -92,8 +92,9 @@ class FakeController:
         return MatchResult(best_state=demo_state(), best_score=98.2,
                            best_render=self.best_render, stop_reason="target_reached")
 
-    def refine(self, camera_name, note, log, should_cancel=lambda: False):
+    def refine(self, camera_name, note, log, should_cancel=lambda: False, locks=None):
         self.calls.append(("refine", camera_name, note))
+        self.refine_locks = locks                  # the Locks menu's live selection
         log("refined")
         return MatchResult(best_state=demo_state(), best_score=98.9,
                            best_render=self.best_render, stop_reason="target_reached")
@@ -135,11 +136,13 @@ class FakeController:
     def prepare_vantage_jobs(self, cams, out_dir, on_progress, use_saved_states=True):
         return [{"camera": c, "scene_file": "x.vrscene", "output": "o.png"} for c in cams]
 
-    def run_vantage_jobs(self, jobs, on_progress):
+    def run_vantage_jobs(self, jobs, on_progress, should_cancel=None):
+        self.vantage_cancel = should_cancel
         return {j["camera"]: "ok" for j in jobs}
 
-    def render_finals_vray(self, cams, out_dir, on_progress):
+    def render_finals_vray(self, cams, out_dir, on_progress, should_cancel=None):
         self.calls.append(("finals", tuple(cams)))
+        self.finals_cancel = should_cancel
         return {c: "ok" for c in cams}
 
     def export_and_open_vantage(self, cams, on_progress):

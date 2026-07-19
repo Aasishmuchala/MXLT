@@ -18,7 +18,7 @@ import json
 import os
 import subprocess
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from ..core import (consensus, critic, domeseed, expose, feedback, metrics, omega,
                     planner, prompts, rules, scenedigest, scenarios as scen)
@@ -150,9 +150,11 @@ class Controller:
         try:
             repo = self.cfg.repo_path or os.path.dirname(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            proc = subprocess.run(
+            # through the io runner like the gateway calls — a wedged sidecar must
+            # never freeze Max's main thread (and Cancel) for the full timeout
+            proc = self.io(lambda: subprocess.run(
                 [py, "-m", "maxgaffer.sidecar.metrics_cli", path],
-                capture_output=True, text=True, timeout=60, cwd=repo)
+                capture_output=True, text=True, timeout=60, cwd=repo))
             data = json.loads(proc.stdout or "null")
             if isinstance(data, list) and data and isinstance(data[0].get("stats"), dict):
                 return data[0]["stats"]
@@ -216,9 +218,10 @@ class Controller:
             try:
                 repo = self.cfg.repo_path or os.path.dirname(
                     os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-                proc = subprocess.run(
+                # io runner, same as _sidecar_stats — sidecar waits never block the UI
+                proc = self.io(lambda: subprocess.run(
                     [py, "-m", "maxgaffer.sidecar.metrics_cli", path, "--b64"],
-                    capture_output=True, text=True, timeout=60, cwd=repo)
+                    capture_output=True, text=True, timeout=60, cwd=repo))
                 data = json.loads(proc.stdout or "null")
                 if isinstance(data, list) and data and data[0].get("b64"):
                     return omega.image_block(data[0]["b64"],
@@ -245,6 +248,9 @@ class Controller:
             raise RuntimeError("no reference image bound to this camera")
         if e.semantics:
             return e.semantics
+        # a fresh analysis supersedes any previous read — a stale contested-consensus
+        # flag must never attach its warning to a run it doesn't describe
+        self._last_analyze_agreement = None
         block = self._image_block(e.reference)
         if block is None:
             raise RuntimeError(f"could not read reference image: {e.reference}")
@@ -331,7 +337,9 @@ class Controller:
     # ------------------------------------------------------------------ scene-wide plan
     def make_plan(self, camera_name: str, log: Callable[[str], None]):
         """READ (full digest) → UNDERSTAND (LLM sees ref + every current setting) →
-        PLAN (validated, digest-grounded ops). Returns (ops, lines, meta, raw_digest)."""
+        PLAN (validated, digest-grounded ops). Returns (ops, lines, meta, raw_digest),
+        or None when the model replied junk twice — a PLAN failure degrades to
+        "no plan" so the match proceeds plan-less (unlike ANALYZE, which fails loud)."""
         e = self.session.entry(camera_name)
         if not e.reference:
             raise RuntimeError("bind a reference image to this camera first")
@@ -362,9 +370,14 @@ class Controller:
                 {"role": "assistant", "content": reply[:1500]},
                 {"role": "user", "content": "That was not valid JSON. Reply with ONLY the "
                                             "JSON object, nothing else."}]
-            ops, rejected, meta = planner.validate_plan(self.io(lambda: omega.call(
-                self.cfg.api_key, planner.PLAN_SYSTEM, retry,
-                model=self.cfg.model, max_tokens=4096)), cat)
+            try:
+                ops, rejected, meta = planner.validate_plan(self.io(lambda: omega.call(
+                    self.cfg.api_key, planner.PLAN_SYSTEM, retry,
+                    model=self.cfg.model, max_tokens=4096)), cat)
+            except ParseError:
+                log("⚠ plan reply was invalid JSON twice — plan skipped, continuing "
+                    "with the match loop")
+                return None
         if meta.get("read"):
             log("scene read: " + meta["read"])
         for r in rejected:
@@ -525,6 +538,20 @@ class Controller:
         if cam is None:
             raise RuntimeError(f"camera '{camera_name}' not found in the scene")
         sc.set_active_camera(camera_name)
+        # checklist #14 is a CRASH vector, not a perf note: V-Ray GPU loop renders while
+        # a Vantage live link streams the same scene can VRAM-starve the one card and
+        # take Max down. Detect the combination and say so BEFORE the first render.
+        try:
+            from . import vantage as _vt
+
+            port = _vt.link_running()
+            rcls = str(sc._rt().classOf(sc._rt().renderers.current)).lower()
+            if port is not None and "gpu" in rcls:
+                log(f"⚠ Vantage live link is UP (port {port}) and the renderer is "
+                    "V-Ray GPU — one GPU doing both can crash Max (checklist #14). "
+                    "Close the link for the match or switch V-Ray to CPU.")
+        except Exception:
+            pass
         if self.cfg.auto_exposure_control:
             from .exposure import ExposureHost, ensure_exposure_control
 
@@ -594,79 +621,79 @@ class Controller:
                 log(line)
             draft_applied = df.pending_snapshot()
 
-        # exposure-host reality check (2 tiny probes, once per session): flips
-        # software_exposure ON automatically when the renderer provably doesn't bake
-        # EV into the saved buffer — nobody should need to know the config flag exists
-        self._verify_exposure_host(cam, run_dir, log)
-
-        # software exposure: apply the just-applied state's EV/WB to each loop frame
-        # before it's scored, anchored at the camera's pre_match snapshot (the same
-        # anchor probes/board/finals use, so all exposed pixels stay consistent)
-        self._sw_state = start
-        self._sw_warned = False
-        if getattr(self.cfg, "software_exposure", False) \
-                and "exposure.ev" in start.values:
-            log("software exposure ON — EV/WB applied to loop frames before scoring "
-                "(renderer-independent; V-Ray GPU's exposure is display-stage only)")
-
-        def render_hook(tag: str):
-            path = self._render_exposed(
-                cam, os.path.join(run_dir, f"{tag}.png"),
-                self.cfg.loop_width, self.cfg.loop_height,
-                state=getattr(self, "_sw_state", None) or start, entry=e, log=log)
-            if path:
-                log(f"THUMB::{path}")   # UI renders these markers as inline thumbnails
-            return path
-
-        def apply_hook(st):
-            self._sw_state = st            # the frame render_hook is about to expose
-            self._apply_logged(rig, st, cam, log)
-
-        hooks = Hooks(
-            apply=apply_hook,
-            render=render_hook,
-            stats=self.stats_for,
-            llm_deltas=self._llm_deltas_hook(ref_block),
-            log=log,
-            should_cancel=should_cancel,
-        )
-
-        agreement = getattr(self, "_last_analyze_agreement", None)
-        if agreement is not None and agreement < 1.0:
-            log(f"⚠ analyze samples disagreed (agreement {agreement:.0%}) — consensus "
-                "used; consider a cleaner reference if the match fights you")
-            self._last_analyze_agreement = None
-
-        if do_sweep and start_override is None and rig.get("sun") is not None \
-                and "sun.azimuth_deg" not in locks:
-            log(f"sun sweep: {self.cfg.sweep_count} directions…")
-            az, alt_hint, _why = run_sun_sweep(
-                start, rules.sweep_azimuths(self.cfg.sweep_count), hooks,
-                llm_pick=lambda paths, azs: self._sweep_call(ref_block, paths, azs),
-                ref_stats=ref_stats)
-            if az is not None:
-                start.set("sun.azimuth_deg", az)
-                # the hint was judged against real renders of THIS scene — trust it over
-                # the ANALYZE band when the altitude isn't locked
-                if alt_hint != "na" and "sun.altitude_deg" not in locks \
-                        and "sun.altitude_deg" in start.values:
-                    start.set("sun.altitude_deg", rules.ALTITUDE_DEG.get(
-                        alt_hint, start.get("sun.altitude_deg")))
-                    log(f"sweep: altitude refined to "
-                        f"{start.get('sun.altitude_deg'):.0f}° ('{alt_hint}')")
-
-        cfg = MatchConfig(
-            max_iterations=(max(int(self.cfg.max_iterations), 10) if deep
-                            else int(self.cfg.max_iterations)),
-            target_score=99.0 if deep else float(self.cfg.target_score),
-            analytic=ref_stats is not None,
-            weights=self.cfg.critic_weights or None,
-            polish=deep,
-        )
-        if deep:
-            log(f"DEEP MATCH: target 99 · up to {cfg.max_iterations} iterations · "
-                "coordinate-descent polish to the scene's ceiling afterwards")
         try:
+            # everything from here to the restore lives inside the safety net — a raise
+            # in the exposure check or the sweep must not leave draft sampler settings
+            # standing in the artist's render setup
+            self._verify_exposure_host(cam, run_dir, log)
+
+            # software exposure: apply the just-applied state's EV/WB to each loop frame
+            # before it's scored, anchored at the camera's pre_match snapshot (the same
+            # anchor probes/board/finals use, so all exposed pixels stay consistent)
+            self._sw_state = start
+            self._sw_warned = False
+            if getattr(self.cfg, "software_exposure", False) \
+                    and "exposure.ev" in start.values:
+                log("software exposure ON — EV/WB applied to loop frames before scoring "
+                    "(renderer-independent; V-Ray GPU's exposure is display-stage only)")
+
+            def render_hook(tag: str):
+                path = self._render_exposed(
+                    cam, os.path.join(run_dir, f"{tag}.png"),
+                    self.cfg.loop_width, self.cfg.loop_height,
+                    state=getattr(self, "_sw_state", None) or start, entry=e, log=log)
+                if path:
+                    log(f"THUMB::{path}")   # UI renders these markers as inline thumbnails
+                return path
+
+            def apply_hook(st):
+                self._sw_state = st        # the frame render_hook is about to expose
+                self._apply_logged(rig, st, cam, log)
+
+            hooks = Hooks(
+                apply=apply_hook,
+                render=render_hook,
+                stats=self.stats_for,
+                llm_deltas=self._llm_deltas_hook(ref_block),
+                log=log,
+                should_cancel=should_cancel,
+            )
+
+            agreement = getattr(self, "_last_analyze_agreement", None)
+            if agreement is not None and agreement < 1.0:
+                log(f"⚠ analyze samples disagreed (agreement {agreement:.0%}) — consensus "
+                    "used; consider a cleaner reference if the match fights you")
+                self._last_analyze_agreement = None
+
+            if do_sweep and start_override is None and rig.get("sun") is not None \
+                    and "sun.azimuth_deg" not in locks:
+                log(f"sun sweep: {self.cfg.sweep_count} directions…")
+                az, alt_hint, _why = run_sun_sweep(
+                    start, rules.sweep_azimuths(self.cfg.sweep_count), hooks,
+                    llm_pick=lambda paths, azs: self._sweep_call(ref_block, paths, azs),
+                    ref_stats=ref_stats)
+                if az is not None:
+                    start.set("sun.azimuth_deg", az)
+                    # the hint was judged against real renders of THIS scene — trust it over
+                    # the ANALYZE band when the altitude isn't locked
+                    if alt_hint != "na" and "sun.altitude_deg" not in locks \
+                            and "sun.altitude_deg" in start.values:
+                        start.set("sun.altitude_deg", rules.ALTITUDE_DEG.get(
+                            alt_hint, start.get("sun.altitude_deg")))
+                        log(f"sweep: altitude refined to "
+                            f"{start.get('sun.altitude_deg'):.0f}° ('{alt_hint}')")
+
+            cfg = MatchConfig(
+                max_iterations=(max(int(self.cfg.max_iterations), 10) if deep
+                                else int(self.cfg.max_iterations)),
+                target_score=99.0 if deep else float(self.cfg.target_score),
+                analytic=ref_stats is not None,
+                weights=self.cfg.critic_weights or None,
+                polish=deep,
+            )
+            if deep:
+                log(f"DEEP MATCH: target 99 · up to {cfg.max_iterations} iterations · "
+                    "coordinate-descent polish to the scene's ceiling afterwards")
             result = run_match(start, ref_stats, semantics, hooks, cfg, locks,
                                rig_notes="; ".join(rig.get("notes", [])),
                                director_note=director_note)
@@ -675,7 +702,18 @@ class Controller:
                 for line in df.restore_draft():
                     log(line)
         e.locks = locks
-        self.session.record_match(camera_name, result.best_state, result.best_score)
+        if result.best_score is None and result.stop_reason in ("cancelled",
+                                                                "render_failed"):
+            # nothing was ever measured — recording would overwrite the camera's
+            # accepted state+score with an unmeasured first guess. Put the scene back
+            # to its previous light instead (the director skipped its final apply too).
+            prev = e.state if e.state is not None else e.pre_match
+            if prev is not None:
+                self._apply_logged(rig, prev, cam, log)
+            log(f"match {result.stop_reason} before any successful render — "
+                "no measurement, kept previous lighting")
+        else:
+            self.session.record_match(camera_name, result.best_state, result.best_score)
         self.save_session()
         try:   # the calibration trail: every run leaves a machine-readable record
             with open(os.path.join(run_dir, "run.json"), "w", encoding="utf-8") as f:
@@ -738,15 +776,19 @@ class Controller:
         note: str,
         log: Callable[[str], None],
         should_cancel: Callable[[], bool] = lambda: False,
+        locks: Optional[Set[str]] = None,
     ) -> MatchResult:
         """The conversation turn: a director's note → instant deterministic nudges →
         3-lens ENSEMBLE (competing corrections, each branch rendered and scored) → the
-        winner continues into a deep match with the note pinned into every prompt."""
+        winner continues into a deep match with the note pinned into every prompt.
+        ``locks`` is the UI's CURRENT lock selection (run_match's convention); None
+        falls back to the camera's persisted locks."""
         e = self.session.entry(camera_name)
         if not e.reference:
             raise RuntimeError("bind a reference image to this camera first")
         e.notes = (getattr(e, "notes", []) + [note])[-6:]
         combined = " · ".join(e.notes[-3:])
+        locks = set(locks if locks is not None else e.locks)
         rig = self.rig(refresh=True)
         cam = sc.get_camera(camera_name)
         if cam is None:
@@ -766,7 +808,7 @@ class Controller:
         base = (e.state.copy() if e.state is not None
                 else ap.read_state(rig, self._baselines, cam))
         deltas = feedback.nudges_from_note(note, base.keys(), list(base.groups))
-        state0, applied = feedback.apply_note_deltas(base, deltas)
+        state0, applied = feedback.apply_note_deltas(base, deltas, locks)
         for k, v in applied.items():
             log(f"note → {k} = {v:.2f} (instant)")
 
@@ -813,7 +855,7 @@ class Controller:
             if render0_block is not None:
                 content.append(render0_block)
             content.append(omega.text_block(prompts.deltas_user_text(
-                state_table(state0, e.locks), semantics, [], {}, 0, 1,
+                state_table(state0, locks), semantics, [], {}, 0, 1,
                 "; ".join(rig.get("notes", [])), "", combined)))
             try:
                 reply = self.io(lambda: omega.call(
@@ -825,7 +867,7 @@ class Controller:
             except Exception as err:  # noqa: BLE001 a dead lens must not kill the round
                 log(f"lens {lens_name}: unusable ({err})")
                 continue
-            cand, accepted, _rej = apply_changes(state0, proposal["changes"], e.locks,
+            cand, accepted, _rej = apply_changes(state0, proposal["changes"], locks,
                                                  limit=True, known=rig_keys(state0))
             if not accepted:
                 log(f"lens {lens_name}: no valid changes")
@@ -840,7 +882,7 @@ class Controller:
         winner = (max(scored, key=lambda b: b[2]) if scored else branches[0])
         log(f"ensemble winner: {winner[0]}"
             + (f" at {winner[2]:.1f}" if winner[2] is not None else ""))
-        return self.run_match(camera_name, log, should_cancel, locks=set(e.locks),
+        return self.run_match(camera_name, log, should_cancel, locks=locks,
                               do_sweep=False, deep=True, start_override=winner[1],
                               director_note=combined)
 
@@ -915,28 +957,31 @@ class Controller:
             log("⚠ reference stats unavailable — board renders without scores")
         run_dir = self._new_run_dir(camera_name)
         results: List[Dict] = []
-        for cand in board:
-            if should_cancel():
-                log("scenario board cancelled")
-                break
-            self._apply_logged(rig, cand["state"], cam, log)
-            path = self._render_exposed(
-                cam, os.path.join(run_dir, f"scen_{cand['key']}.png"),
-                self.cfg.loop_width, self.cfg.loop_height,
-                state=cand["state"], entry=e, log=log)
-            score = None
-            if path:
-                log(f"THUMB::{path}")
-                if ref is not None:
-                    cur = self.stats_for(path)
-                    if cur is not None:
-                        score = critic.score(ref, cur,
-                                             self.cfg.critic_weights or None).score
-            log(f"scenario {cand['label']}: "
-                + (f"{score:.1f}" if score is not None else "unscored")
-                + f" — {cand['why']}")
-            results.append({**cand, "render": path, "score": score})
-        self._apply_logged(rig, current, cam, log)   # leave the scene as it was found
+        try:
+            for cand in board:
+                if should_cancel():
+                    log("scenario board cancelled")
+                    break
+                self._apply_logged(rig, cand["state"], cam, log)
+                path = self._render_exposed(
+                    cam, os.path.join(run_dir, f"scen_{cand['key']}.png"),
+                    self.cfg.loop_width, self.cfg.loop_height,
+                    state=cand["state"], entry=e, log=log)
+                score = None
+                if path:
+                    log(f"THUMB::{path}")
+                    if ref is not None:
+                        cur = self.stats_for(path)
+                        if cur is not None:
+                            score = critic.score(ref, cur,
+                                                 self.cfg.critic_weights or None).score
+                log(f"scenario {cand['label']}: "
+                    + (f"{score:.1f}" if score is not None else "unscored")
+                    + f" — {cand['why']}")
+                results.append({**cand, "render": path, "score": score})
+        finally:
+            # a raise mid-board must not strand the scene in a candidate's lighting
+            self._apply_logged(rig, current, cam, log)   # leave the scene as it was found
         return results
 
     def adopt_scenario(self, camera_name: str, state: LightingState,
@@ -1101,10 +1146,16 @@ class Controller:
 
     # ------------------------------------------------------------------ restore
     def restore_pre_match(self, camera_name: str) -> bool:
+        """Undo an exploration: re-apply the pre-match light and/or un-seed the dome.
+        The two halves are independent — Seed-then-Restore on a fresh camera has a
+        pre_seed but no pre_match, and must still work."""
         e = self.session.cameras.get(camera_name)
-        if not (e and e.pre_match is not None):
+        if e is None:
             return False
-        self.apply_state(e.pre_match, camera_name)
+        restored = False
+        if e.pre_match is not None:
+            self.apply_state(e.pre_match, camera_name)
+            restored = True
         if e.pre_seed:                         # a seed replaced the dome texture — undo it
             dome = self.rig().get("dome")
             if dome is not None:
@@ -1121,7 +1172,8 @@ class Controller:
             e.pre_seed = {}
             e.seed_hdri = ""
             self.save_session()
-        return True
+            restored = True
+        return restored
 
     # ------------------------------------------------------------------ vantage
     def start_live_link(self) -> Tuple[bool, str]:
@@ -1161,7 +1213,9 @@ class Controller:
         return jobs
 
     def run_vantage_jobs(self, jobs: List[Dict],
-                         on_progress: Callable[[str, str], None]) -> Dict[str, str]:
+                         on_progress: Callable[[str, str], None],
+                         should_cancel: Optional[Callable[[], bool]] = None
+                         ) -> Dict[str, str]:
         """LEGACY (Developer-Edition CLI only) — pure subprocess, worker-thread safe."""
         if getattr(self.cfg, "no_renders", False):
             for job in jobs:
@@ -1169,42 +1223,56 @@ class Controller:
                             "skipped — no-render mode is ON (Settings)")
             return {job.get("camera", ""): "skipped (no-render mode)" for job in jobs}
         return vt.render_stills(jobs, self.cfg.vantage_console,
-                                self.cfg.final_width, self.cfg.final_height, on_progress)
+                                self.cfg.final_width, self.cfg.final_height, on_progress,
+                                should_cancel=should_cancel)
 
     def render_finals_vray(
         self,
         camera_names: List[str],
         out_dir: str,
         on_progress: Callable[[str, str], None],
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, str]:
         """DEFAULT final-render backend (stock Vantage 3.x has no headless CLI): per
         camera, apply its saved state and production-render through V-Ray at final res.
-        MAIN THREAD — renders block Max by nature; progress narrates between shots."""
+        MAIN THREAD — renders block Max by nature; progress narrates between shots.
+        ``should_cancel`` is checked between cameras (remaining ones record
+        "cancelled"), and one camera's failure never aborts the batch."""
         if getattr(self.cfg, "no_renders", False):
             for name in camera_names:
                 on_progress(name, "skipped — no-render mode is ON (Settings)")
             return {name: "skipped (no-render mode)" for name in camera_names}
         results: Dict[str, str] = {}
         os.makedirs(out_dir, exist_ok=True)
-        for name in camera_names:
-            on_progress(name, "applying state")
-            e = self.session.cameras.get(name)
-            if e and e.state is not None:
-                self.apply_state(e.state, name)
-            self._rebind_seed(name)            # finals render under their own seed too
-            cam = sc.get_camera(name)
-            if cam is None:
-                results[name] = "camera not found"
-                on_progress(name, results[name])
-                continue
-            on_progress(name, f"rendering {self.cfg.final_width}×{self.cfg.final_height} (V-Ray)")
-            # finals go through the SAME exposed path as the loop, anchored at this
-            # camera's pre_match — the delivered PNG carries the exposure the accepted
-            # match iteration showed, even on display-stage-exposure renderers
-            out = self._render_exposed(cam, os.path.join(out_dir, f"{_safe(name)}.png"),
-                                       self.cfg.final_width, self.cfg.final_height,
-                                       state=(e.state if e else None), entry=e)
-            results[name] = "ok" if out else "render failed"
+        for i, name in enumerate(camera_names):
+            if should_cancel is not None and should_cancel():
+                for rest in camera_names[i:]:
+                    results[rest] = "cancelled"
+                    on_progress(rest, "cancelled")
+                break
+            try:
+                on_progress(name, "applying state")
+                e = self.session.cameras.get(name)
+                if e and e.state is not None:
+                    self.apply_state(e.state, name)
+                self._rebind_seed(name)            # finals render under their own seed too
+                cam = sc.get_camera(name)
+                if cam is None:
+                    results[name] = "camera not found"
+                    on_progress(name, results[name])
+                    continue
+                on_progress(name, f"rendering {self.cfg.final_width}×"
+                                  f"{self.cfg.final_height} (V-Ray)")
+                # finals go through the SAME exposed path as the loop, anchored at this
+                # camera's pre_match — the delivered PNG carries the exposure the accepted
+                # match iteration showed, even on display-stage-exposure renderers
+                out = self._render_exposed(
+                    cam, os.path.join(out_dir, f"{_safe(name)}.png"),
+                    self.cfg.final_width, self.cfg.final_height,
+                    state=(e.state if e else None), entry=e)
+                results[name] = "ok" if out else "render failed"
+            except Exception as err:  # noqa: BLE001 one bad camera must not kill the night
+                results[name] = f"error: {err}"
             on_progress(name, results[name])
         return results
 
@@ -1228,6 +1296,10 @@ class Controller:
         stem = _safe(os.path.splitext(os.path.basename(sc.scene_path() or "unsaved"))[0])
         d = os.path.join(cfgmod.sessions_dir(), stem, sub)
         os.makedirs(d, exist_ok=True)
+        if sub == "refs":
+            # the transcode cache is FILES (ref_*.png / llm_*.png), not run dirs —
+            # prune it under the same keep policy or it grows without bound
+            prune_old_files(d, keep=int(self.cfg.keep_runs))
         return d
 
     def _new_run_dir(self, camera_name: str) -> str:
@@ -1270,9 +1342,42 @@ def prune_old_runs(parent_dir: str, keep: int) -> int:
     return removed
 
 
+def prune_old_files(dir_path: str, keep: int) -> int:
+    """Delete the oldest FILES (by mtime) beyond ``keep`` — for file-based caches like
+    the refs transcode dir, where pruning by subdirectory can't apply. keep <= 0
+    disables pruning. Returns how many were removed."""
+    if keep <= 0:
+        return 0
+    try:
+        files = [os.path.join(dir_path, f) for f in os.listdir(dir_path)]
+        files = [f for f in files if os.path.isfile(f)]
+        files.sort(key=lambda f: os.path.getmtime(f))
+    except OSError:
+        return 0
+    removed = 0
+    for f in files[:-keep]:
+        try:
+            os.remove(f)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def _safe(name: str) -> str:
-    return "".join(c if c.isalnum() or c in "-_." else "_" for c in name) or "unnamed"
+    cleaned = "".join(c if c.isalnum() or c in "-_." else "_" for c in name) or "unnamed"
+    if cleaned != name:
+        # sanitization rewrote the name — "Cam/A" and "Cam\A" both became "Cam_A"
+        # (colliding run dirs/files); a short stable hash of the RAW name disambiguates
+        import hashlib
+
+        cleaned += "_" + hashlib.md5(name.encode("utf-8", "replace")).hexdigest()[:6]
+    return cleaned
 
 
 def _stamp() -> str:
-    return time.strftime("%Y%m%d-%H%M%S")
+    """Run-dir timestamp: sorts chronologically and has SUB-SECOND resolution — two runs
+    on the same camera inside one second used to share a dir and overwrite run.json."""
+    now = time.time()
+    return time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) + \
+        f"-{int(now * 1000) % 1000:03d}"

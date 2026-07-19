@@ -18,6 +18,7 @@ Pure python; unit-tested off-Max.
 from __future__ import annotations
 
 import json
+import math
 from typing import Dict, List, Sequence, Set, Tuple
 
 from .omega import parse_json_from_text
@@ -82,12 +83,15 @@ def plan_user_text(digest_text: str, semantics: Dict, camera_name: str) -> str:
 
 
 def _valid_value(v) -> bool:
-    if isinstance(v, bool) or isinstance(v, (int, float)):
+    if isinstance(v, bool):
         return True
+    if isinstance(v, (int, float)):
+        # NaN/∞ must never ride a validated plan into a live V-Ray property
+        return math.isfinite(v)
     if isinstance(v, str):
         return len(v) < 500
     if (isinstance(v, (list, tuple)) and len(v) == 3
-            and all(isinstance(x, (int, float)) for x in v)):
+            and all(isinstance(x, (int, float)) and math.isfinite(x) for x in v)):
         return True
     return False
 
@@ -157,7 +161,10 @@ def validate_plan(reply_text: str, cat: Dict[str, Set[str]],
                 ok = True
                 for k, (lo, hi) in PLACEMENT_LIMITS.items():
                     try:
-                        place[k] = min(hi, max(lo, float(placement.get(k))))
+                        pv = float(placement.get(k))
+                        if not math.isfinite(pv):
+                            raise ValueError
+                        place[k] = min(hi, max(lo, pv))
                     except (TypeError, ValueError):
                         rejected.append(f"create_light {name}: bad placement.{k}")
                         ok = False

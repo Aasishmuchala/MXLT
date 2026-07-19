@@ -57,15 +57,20 @@ def nudges_from_note(note: str, current_keys: List[str],
             scale = 2.0 if _INTENSIFIERS.search(lead + m.group(0)) else 1.0
             if key == _GROUP_WILDCARD:
                 for g in group_names:
+                    if g.startswith("MG_"):
+                        continue   # MG_* are our own plan-created match instruments,
+                                   # not scene practicals (same exemption as rules.py)
                     deltas[f"group.{g}"] = deltas.get(f"group.{g}", 0.0) + delta * scale
             elif key in current_keys:
                 deltas[key] = deltas.get(key, 0.0) + delta * scale
     return deltas
 
 
-def apply_note_deltas(state, deltas: Dict[str, float]):
+def apply_note_deltas(state, deltas: Dict[str, float], locks=None):
     """Deltas → target values on a copy of ``state`` (log-space where the key demands),
-    then through the genome gate so bounds still rule. → (new_state, changes_dict)."""
+    then through the genome gate so bounds still rule. → (new_state, changes_dict).
+    A note is a request, a lock is a veto — locks are honored here exactly like in the
+    LLM and polish paths ("never touched — not by the solver, not by the model")."""
     from .genome import apply_changes
 
     changes: Dict[str, float] = {}
@@ -77,7 +82,7 @@ def apply_note_deltas(state, deltas: Dict[str, float]):
             changes[key] = max(0.0, cur * (2.0 ** delta))
         else:
             changes[key] = cur + delta
-    new, accepted, _rej = apply_changes(state, changes, limit=False)
+    new, accepted, _rej = apply_changes(state, changes, locks=locks, limit=False)
     return new, accepted
 
 

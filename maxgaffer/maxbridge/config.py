@@ -12,10 +12,17 @@ from dataclasses import asdict, dataclass, field
 from typing import Dict
 
 
-def _appdata_dir(name: str) -> str:
+def _appdata_dir(name: str, create: bool = False) -> str:
+    """%LOCALAPPDATA%/<name> (or ~/<name>). Creation is LAZY (save/access time) and
+    best-effort — makedirs at import time meant ``import config`` died on an
+    unwritable base before a single feature could load."""
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     d = os.path.join(base, name)
-    os.makedirs(d, exist_ok=True)
+    if create:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
     return d
 
 
@@ -65,6 +72,10 @@ class Config:
     repo_path: str = ""                      # clone folder, written by install.bat
 
     def save(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        except OSError:
+            pass
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(asdict(self), f, indent=1)
 
@@ -94,6 +105,9 @@ def _borrow_maxdirector_key() -> str:
 
 
 def sessions_dir() -> str:
-    d = os.path.join(_appdata_dir("MaxGaffer"), "sessions")
-    os.makedirs(d, exist_ok=True)
+    d = os.path.join(_appdata_dir("MaxGaffer", create=True), "sessions")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
     return d

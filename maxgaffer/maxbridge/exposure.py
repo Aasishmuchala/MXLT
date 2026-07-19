@@ -127,7 +127,13 @@ class ExposureHost:
             # native Physical in Target mode: exposure_value IS the EV (verified)
             gain_type = get_prop(self.cam, CAM_EV_TYPE)
             ev_direct = get_prop(self.cam, CAM_EV)
-            if ev_direct is not None and (gain_type is None or int(gain_type) == 1):
+            try:
+                target_mode = gain_type is None or int(gain_type) == 1
+            except (TypeError, ValueError):
+                # a non-int enum (broken plugin prop) must not kill read_state —
+                # treat as not-Target and fall through to the exposure triangle
+                target_mode = False
+            if ev_direct is not None and target_mode:
                 try:
                     return float(ev_direct)
                 except (TypeError, ValueError):

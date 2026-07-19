@@ -11,6 +11,7 @@ computes it from the camera transform; here it's just arithmetic.
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Set, Tuple
 
 from .genome import GROUP_PREFIX, LightingState
@@ -41,6 +42,16 @@ TURBIDITY = {"none": 2.5, "light_haze": 4.5, "heavy_haze": 7.0, "fog": 8.5}
 SUN_SIZE = {"hard": 1.0, "mixed": 3.0, "soft": 8.0}
 
 
+def _fnum(value, default: float) -> float:
+    """float() + finiteness — cached semantics may come from a hand-edited sidecar,
+    so a junk value falls back to the default instead of crashing the match at start."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
+
+
 def initial_state(
     semantics: Dict,
     current: LightingState,
@@ -57,6 +68,7 @@ def initial_state(
     locks = locks or set()
     st = current.copy()
     why: List[str] = []
+    camera_yaw_deg = _fnum(camera_yaw_deg, 0.0)   # a degenerate camera transform ≠ crash
 
     def put(key: str, value: float, note: str) -> None:
         has = (key in st.values) or (
@@ -79,7 +91,7 @@ def initial_state(
         if band == "na":
             alt = TIME_FALLBACK_ALTITUDE.get(time_of_day, 35.0)
         put("sun.altitude_deg", alt, f"altitude band '{band}' / {time_of_day}")
-        bearing = float(semantics.get("sun_bearing_deg", 0.0))
+        bearing = _fnum(semantics.get("sun_bearing_deg"), 0.0)
         put("sun.azimuth_deg", camera_yaw_deg + bearing,
             f"camera yaw {camera_yaw_deg:.0f}° + bearing {bearing:+.0f}° from reference shadows")
         put("sun.size", SUN_SIZE.get(semantics.get("light_quality", "mixed"), 3.0),
@@ -104,7 +116,7 @@ def initial_state(
                 "sky is the key light — dome carries the frame")
 
     # ---- white balance first guess (analytic solver refines every iteration)
-    put("exposure.wb_kelvin", float(semantics.get("wb_kelvin_estimate", 6500.0)),
+    put("exposure.wb_kelvin", _fnum(semantics.get("wb_kelvin_estimate"), 6500.0),
         "reference white-balance feel")
 
     # ---- practicals: on → they contribute (and at night they carry the frame);

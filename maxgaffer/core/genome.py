@@ -73,6 +73,8 @@ def spec_for(key: str) -> Optional[ParamSpec]:
 
 
 def _wrap_deg(v: float) -> float:
+    if not math.isfinite(v):
+        return 0.0          # inf/NaN can never be a heading — deterministic fallback
     v = math.fmod(v, 360.0)
     return v + 360.0 if v < 0 else v
 
@@ -84,6 +86,8 @@ def clamp(key: str, value: float) -> float:
     v = float(value)
     if spec.wrap:
         return _wrap_deg(v)
+    if math.isnan(v):
+        return spec.lo
     return min(spec.hi, max(spec.lo, v))
 
 
@@ -99,6 +103,12 @@ def limit_step(key: str, current: float, proposed: float, scale: float = 1.0) ->
         raise KeyError(f"unknown lighting parameter: {key}")
     step = spec.step * max(0.05, float(scale))
     cur, prop = float(current), float(proposed)
+    if not math.isfinite(prop):
+        # a NaN/∞ proposal must never become a move — min/max ordering would otherwise
+        # silently coerce it into a FULL step in one direction (found by stress fuzzing)
+        return clamp(key, cur)
+    if not math.isfinite(cur):
+        cur = spec.lo
     if spec.wrap:
         delta = (prop - cur + 180.0) % 360.0 - 180.0
         if delta == -180.0:   # antipode is ambiguous — deterministically go clockwise
@@ -146,12 +156,24 @@ class LightingState:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "LightingState":
+        """Sidecar/preset load — hand-edited files are INVITED (the sidecar is documented
+        as human-readable), so junk values are skipped, never raised."""
         st = cls()
-        for k, v in (d.get("values") or {}).items():
+        if not isinstance(d, dict):
+            return st
+        values = d.get("values")
+        groups = d.get("groups")
+        for k, v in (values.items() if isinstance(values, dict) else ()):
             if spec_for(k) is not None:
-                st.values[k] = clamp(k, v)
-        for g, v in (d.get("groups") or {}).items():
-            st.groups[str(g)] = clamp(GROUP_PREFIX + str(g), v)
+                try:
+                    st.values[k] = clamp(k, v)
+                except (TypeError, ValueError):
+                    continue
+        for g, v in (groups.items() if isinstance(groups, dict) else ()):
+            try:
+                st.groups[str(g)] = clamp(GROUP_PREFIX + str(g), v)
+            except (TypeError, ValueError):
+                continue
         return st
 
     # -------------------------------------------------------------- diff
@@ -204,6 +226,9 @@ def apply_changes(
             value = float(raw)
         except (TypeError, ValueError):
             rejected.append(f"{key}: non-numeric value {raw!r}")
+            continue
+        if not math.isfinite(value):
+            rejected.append(f"{key}: non-finite value {raw!r}")
             continue
         if limit:
             value = limit_step(key, new.get(key, spec.lo), value, step_scale)

@@ -16,6 +16,7 @@ Values are LINEAR radiance floats, rows top-first, ``rows[y][x] = (r, g, b)``.
 from __future__ import annotations
 
 import math
+import os
 from typing import List, Optional, Sequence, Tuple
 
 _HEADER_MAGIC = (b"#?RADIANCE", b"#?RGBE")
@@ -33,6 +34,8 @@ def float_to_rgbe(r: float, g: float, b: float) -> Tuple[int, int, int, int]:
     if m < 1e-9:
         return 0, 0, 0, 0
     _mant, exp = math.frexp(m)              # m = mant * 2**exp, mant in [0.5, 1)
+    if exp > 127:
+        exp = 127                           # beyond RGBE's range — saturate, don't crash
     scale = math.ldexp(1.0, 8 - exp)        # component * scale lands in [0, 256)
     return (
         min(255, max(0, int(r * scale))),
@@ -106,7 +109,11 @@ def write_hdr(path: str, rows: Sequence[Sequence[Tuple[float, float, float]]]) -
                 else:
                     f.write(bytes(b for p in px for b in p))
         return True
-    except OSError:
+    except (OSError, TypeError, ValueError):
+        try:
+            os.remove(path)               # never leave a truncated .hdr behind
+        except OSError:
+            pass
         return False
 
 
@@ -184,13 +191,17 @@ def read_hdr(path: str) -> Optional[List[List[Tuple[float, float, float]]]]:
         return None
     width, height, pos = head
     rows: List[List[Tuple[float, float, float]]] = []
+    in_band = _MIN_RLE_WIDTH <= width <= _MAX_RLE_WIDTH
     for _y in range(height):
         is_rle = (
-            _MIN_RLE_WIDTH <= width <= _MAX_RLE_WIDTH
+            in_band
             and pos + 4 <= len(data)
             and data[pos] == 2 and data[pos + 1] == 2
             and ((data[pos + 2] << 8) | data[pos + 3]) == width
         )
+        if in_band and not is_rle:
+            return None     # in-band scanlines are new-style RLE by spec — anything else
+                            # here is old-style RLE, which flat-decodes into garbage
         if is_rle:
             decoded = _decode_rle_scanline(data, pos + 4, width)
             if decoded is None:

@@ -151,6 +151,8 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
     hi_sum = [0.0, 0.0, 0.0]
     hi_n = 0
     hi_clipped = 0
+    incl_sum = [0.0, 0.0, 0.0]   # INCLUSIVE mean (clipped pixels counted) — the symmetric
+    incl_n = 0                   # same-scene signal; see lab_mean_hi_full below
     for r, g, b in pixels:
         if (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0 >= hi_thresh:
             # per-channel-saturated pixels read as NEUTRAL in LAB (a*=b*=0) — the
@@ -158,23 +160,21 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
             # highlight-quartile b* toward 0 (software-exposed 8-bit frames clip
             # exactly this way, over-driving the WB solve). Excluded unless the whole
             # quartile is clipped, in which case the old behavior is the only signal.
+            L, a, bb = _rgb_to_lab(r, g, b)
+            incl_sum[0] += L
+            incl_sum[1] += a
+            incl_sum[2] += bb
+            incl_n += 1
             if max(r, g, b) >= 254:
                 hi_clipped += 1
                 continue
-            L, a, bb = _rgb_to_lab(r, g, b)
             hi_sum[0] += L
             hi_sum[1] += a
             hi_sum[2] += bb
             hi_n += 1
-    hi_clip_frac = hi_clipped / max(1, hi_clipped + hi_n)
+    hi_clip_frac = hi_clipped / max(1, incl_n)
     if hi_n == 0 and hi_clipped:      # fully blown quartile — fall back, don't zero out
-        for r, g, b in pixels:
-            if (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0 >= hi_thresh:
-                L, a, bb = _rgb_to_lab(r, g, b)
-                hi_sum[0] += L
-                hi_sum[1] += a
-                hi_sum[2] += bb
-                hi_n += 1
+        hi_sum, hi_n = incl_sum, incl_n
 
     def pct(p: float) -> float:
         return lums[min(n - 1, int(p / 100.0 * n))]
@@ -198,6 +198,11 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
         "grid": [round(g, 5) for g in grid],   # mean-centered 3×3 luminance pattern
         "grid5": [round(g, 5) for g in grid5],  # 5×5 — finer directional acuity
         "lab_mean_hi": ([s / hi_n for s in hi_sum] if hi_n else lab_mean),
+        # INCLUSIVE highlight mean (clipped pixels counted, neutral-drag and all) — the
+        # solver switches to it when BOTH images clip heavily: same-scene matches need
+        # symmetric highlight populations or the WB anchor drifts cool (v0.9.7 regression:
+        # per-image exclusion mismatched the populations and stalled deep match at 97.8)
+        "lab_mean_hi_full": ([s / incl_n for s in incl_sum] if incl_n else lab_mean),
         "hi_clip_frac": hi_clip_frac,
         # geometric mean of LINEAR luminance, 60% center-weighted (blend in log space)
         "log_key": math.exp(0.6 * key_center + 0.4 * key_full),

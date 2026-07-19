@@ -2,7 +2,8 @@
 
 Off-Max it checks: core imports, the full test-suite floor (stdlib PNG stats), Pillow,
 gateway reachability. Inside Max's listener it additionally checks pymxs, V-Ray, the
-vrscene exporter, vantage_console.exe, and classifies the open scene's rig.
+vrscene exporter, vantage_console.exe (only for the vantage_cli finals backend), and
+classifies the open scene's rig.
 """
 
 from __future__ import annotations
@@ -99,7 +100,13 @@ def main():
         def _vantage():
             from maxgaffer.maxbridge import config as cfgmod
 
-            p = cfgmod.load().vantage_console
+            cfg = cfgmod.load()
+            # stock Vantage 3.x HAS no render CLI (Chaos-confirmed) — the console is
+            # only required when the artist explicitly chose the vantage_cli backend
+            if cfg.final_render_backend != "vantage_cli":
+                return ("not required — finals backend is "
+                        f"'{cfg.final_render_backend}' (stock Vantage has no render CLI)")
+            p = cfg.vantage_console
             if not os.path.exists(p):
                 raise RuntimeError(f"not found: {p}")
             return p

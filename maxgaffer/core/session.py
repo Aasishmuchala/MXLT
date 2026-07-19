@@ -11,6 +11,7 @@ Timestamps are injected so tests stay deterministic.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set
@@ -18,6 +19,12 @@ from typing import Callable, Dict, List, Optional, Set
 from .genome import LightingState
 
 FORMAT_VERSION = 1
+
+
+def _str_list(value) -> List:
+    """Only real JSON arrays pass — a hand-edited ``"locks": "sun.intensity"`` string
+    would otherwise load as a set of single characters."""
+    return list(value) if isinstance(value, (list, tuple, set)) else []
 
 
 def sidecar_path(scene_path: str) -> Optional[str]:
@@ -59,15 +66,22 @@ class CameraEntry:
     def from_dict(cls, d: Dict) -> "CameraEntry":
         state = d.get("state")
         pre = d.get("pre_match")
+        score_raw = d.get("score")
+        try:
+            score = float(score_raw) if isinstance(score_raw, (int, float)) else None
+            if score is not None and not math.isfinite(score):
+                score = None
+        except (TypeError, ValueError):
+            score = None
         return cls(
             reference=str(d.get("reference") or ""),
             state=LightingState.from_dict(state) if isinstance(state, dict) else None,
-            score=d.get("score") if isinstance(d.get("score"), (int, float)) else None,
+            score=score,
             matched_at=str(d.get("matched_at") or ""),
-            locks=set(x for x in (d.get("locks") or []) if isinstance(x, str)),
+            locks=set(x for x in _str_list(d.get("locks")) if isinstance(x, str)),
             semantics=d.get("semantics") if isinstance(d.get("semantics"), dict) else {},
             pre_match=LightingState.from_dict(pre) if isinstance(pre, dict) else None,
-            notes=[str(x) for x in (d.get("notes") or []) if isinstance(x, str)],
+            notes=[str(x) for x in _str_list(d.get("notes")) if isinstance(x, str)],
             seed_hdri=str(d.get("seed_hdri") or ""),
             pre_seed=d.get("pre_seed") if isinstance(d.get("pre_seed"), dict) else {},
         )
@@ -114,9 +128,15 @@ class Session:
                 d = json.load(f)
         except (OSError, ValueError):
             return s
-        for name, entry in (d.get("cameras") or {}).items():
+        if not isinstance(d, dict):
+            return s      # valid JSON but not a session (hand-edit) — start clean
+        cameras = d.get("cameras")
+        for name, entry in (cameras.items() if isinstance(cameras, dict) else ()):
             if isinstance(entry, dict):
-                s.cameras[str(name)] = CameraEntry.from_dict(entry)
+                try:
+                    s.cameras[str(name)] = CameraEntry.from_dict(entry)
+                except (TypeError, ValueError, AttributeError):
+                    continue          # one junk entry must not kill the whole session
         if isinstance(d.get("settings"), dict):
             s.settings.update(d["settings"])
         if isinstance(d.get("baselines"), dict):
@@ -132,13 +152,19 @@ class Session:
             "settings": self.settings,
             "baselines": self.baselines,
         }
+        tmp = self.path + ".tmp"
         try:
-            tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=1)
             os.replace(tmp, self.path)
             return True
-        except OSError:
+        except (OSError, TypeError, ValueError):
+            # a failed atomic write must not strand the .tmp (json.dump raises TypeError
+            # mid-stream on a non-serializable settings value, OSError on full disks)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
             return False
 
     # ------------------------------------------------------------------ camera API
@@ -183,7 +209,12 @@ def preset_loads(text: str) -> Optional[LightingState]:
     if not isinstance(d, dict) or "maxgaffer_preset" not in d:
         return None
     state = d.get("state")
-    return LightingState.from_dict(state) if isinstance(state, dict) else None
+    if not isinstance(state, dict):
+        return None
+    try:
+        return LightingState.from_dict(state)
+    except (TypeError, ValueError):
+        return None
 
 
 def _iso_now() -> str:

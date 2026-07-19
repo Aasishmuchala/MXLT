@@ -32,7 +32,11 @@ class OmegaError(RuntimeError):
 
 
 def extract_text(payload: dict) -> str:
-    blocks = payload.get("content") or []
+    if not isinstance(payload, dict):
+        return ""     # a 200 carrying `null`/[] degrades into the retry path, not a crash
+    blocks = payload.get("content")
+    if not isinstance(blocks, list):
+        return ""
     return "\n".join(
         b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"
     ).strip()

@@ -137,63 +137,76 @@ def execute_plan(ops: List[Dict], camera=None) -> Dict[str, Any]:
                         "why": op.get("why", "")})
                 elif op["op"] == "create_light":
                     maker, presets = LIGHT_MAKERS[op["light_type"]]
+                    # validate BEFORE creating anything — a malformed op must not leak
+                    # an untracked orphan light into the scene
+                    name = op["name"]
+                    placement = op["placement"]
                     try:
                         node = getattr(rt, maker)()
                     except Exception as e:  # noqa: BLE001
                         report["warnings"].append(
                             f"create {op['light_type']}: class unavailable ({e})")
                         continue
-                    node.name = op["name"]
-                    for k, v in presets.items():
-                        sc.set_prop(node, (k,), v)
-                    if basis is not None or "at_node" in op["placement"]:
+                    try:
+                        node.name = name
+                        for k, v in presets.items():
+                            sc.set_prop(node, (k,), v)
+                        if basis is not None or "at_node" in placement:
+                            try:
+                                node.pos = _place_from(basis or {"pos": [0, 0, 0],
+                                                                 "yaw_deg": 0.0,
+                                                                 "look": [0, 200, 0]},
+                                                       placement)
+                            except Exception:
+                                report["warnings"].append(f"{name}: placement failed")
+                        if op["light_type"] == "VRaySun" and basis is not None:
+                            # a targetless scripted VRaySun aims straight down — give it a
+                            # target at the camera's subject so its direction is meaningful
+                            try:
+                                tgt = rt.Targetobject()
+                                lx, ly, lz = basis["look"]
+                                tgt.pos = rt.Point3(lx, ly, lz)
+                                tgt.name = name + "_target"
+                                node.target = tgt
+                            except Exception:
+                                report["warnings"].append(
+                                    f"{name}: could not create a sun target")
+                        if op.get("aim_at_camera_target") and basis is not None:
+                            try:
+                                lx, ly, lz = basis["look"]
+                                p = node.pos
+                                d = rt.Point3(lx - float(p.x), ly - float(p.y),
+                                              lz - float(p.z))
+                                node.dir = d
+                            except Exception:
+                                report["warnings"].append(f"{name}: aim failed")
+                        for prop, value in (op.get("props") or {}).items():
+                            try:
+                                setattr(node, prop, _coerce(getattr(node, prop, None), value))
+                            except Exception:
+                                report["warnings"].append(
+                                    f"{name}.{prop}: not settable on {op['light_type']}")
+                        layer = _ensure_mg_layer()
+                        if layer is not None:
+                            try:
+                                layer.addNode(node)
+                            except Exception:
+                                pass
+                        where = (placement.get("at_node")
+                                 or f"{placement.get('bearing_deg', 0):+.0f}° / "
+                                    f"{placement.get('distance', 0):.0f}u / "
+                                    f"h{placement.get('height', 0):+.0f}")
+                        report["created"].append({"name": name,
+                                                  "type": op["light_type"], "at": where,
+                                                  "why": op.get("why", "")})
+                    except Exception:
+                        # post-creation failure: don't strand the half-built node —
+                        # it would be invisible to the report and off the MG_lights layer
                         try:
-                            node.pos = _place_from(basis or {"pos": [0, 0, 0],
-                                                             "yaw_deg": 0.0,
-                                                             "look": [0, 200, 0]},
-                                                   op["placement"])
-                        except Exception:
-                            report["warnings"].append(f"{op['name']}: placement failed")
-                    if op["light_type"] == "VRaySun" and basis is not None:
-                        # a targetless scripted VRaySun aims straight down — give it a
-                        # target at the camera's subject so its direction is meaningful
-                        try:
-                            tgt = rt.Targetobject()
-                            lx, ly, lz = basis["look"]
-                            tgt.pos = rt.Point3(lx, ly, lz)
-                            tgt.name = op["name"] + "_target"
-                            node.target = tgt
-                        except Exception:
-                            report["warnings"].append(
-                                f"{op['name']}: could not create a sun target")
-                    if op.get("aim_at_camera_target") and basis is not None:
-                        try:
-                            lx, ly, lz = basis["look"]
-                            p = node.pos
-                            d = rt.Point3(lx - float(p.x), ly - float(p.y),
-                                          lz - float(p.z))
-                            node.dir = d
-                        except Exception:
-                            report["warnings"].append(f"{op['name']}: aim failed")
-                    for prop, value in (op.get("props") or {}).items():
-                        try:
-                            setattr(node, prop, _coerce(getattr(node, prop, None), value))
-                        except Exception:
-                            report["warnings"].append(
-                                f"{op['name']}.{prop}: not settable on {op['light_type']}")
-                    layer = _ensure_mg_layer()
-                    if layer is not None:
-                        try:
-                            layer.addNode(node)
+                            rt.delete(node)
                         except Exception:
                             pass
-                    where = (op["placement"].get("at_node")
-                             or f"{op['placement'].get('bearing_deg', 0):+.0f}° / "
-                                f"{op['placement'].get('distance', 0):.0f}u / "
-                                f"h{op['placement'].get('height', 0):+.0f}")
-                    report["created"].append({"name": op["name"],
-                                              "type": op["light_type"], "at": where,
-                                              "why": op.get("why", "")})
+                        raise
             except Exception as e:  # noqa: BLE001 one op must never kill the plan
                 report["warnings"].append(f"op failed: {e}")
     try:

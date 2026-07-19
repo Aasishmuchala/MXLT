@@ -57,7 +57,17 @@ def score(ref: Dict, cur: Dict, weights: Dict[str, float] = None) -> Verdict:
 
     w = dict(DEFAULT_WEIGHTS)
     if weights:
-        w.update({k: float(v) for k, v in weights.items() if k in w})
+        # config.json is user-editable — a NaN/negative/garbage weight must not poison
+        # the score (NaN total makes every accept/revert comparison False — silently)
+        for k, v in weights.items():
+            if k not in w:
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(fv) and fv >= 0.0:
+                w[k] = fv
 
     # every component joins ONLY when its source data is present on both sides —
     # absent data must never default to a perfect sub-score (a present-but-empty
