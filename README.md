@@ -13,8 +13,9 @@ one button (V-Ray finals in Max — stock Vantage 3.x has no headless CLI — pl
 per-camera vrscene exports for Vantage's in-app Batch Render queue).
 
 Target: **3ds Max 2026 (Py 3.11, PySide6) + V-Ray 7 + Chaos Vantage 3.x.** Internal Sthyra
-pipeline tool, sibling of MaxDirector (same Omega gateway, same hexagon architecture, same
-key — borrowed automatically if MaxDirector is installed).
+pipeline tool, sibling of MaxDirector. Omega is the default semantic provider and its key
+is borrowed automatically; Anthropic, OpenAI, compatible/local endpoints, and offline
+mode are also supported.
 
 ![MaxGaffer dock](docs/ui/dock.png)
 
@@ -29,9 +30,9 @@ the [scenario board](docs/ui/board.png), [change report](docs/ui/report.png),
 | Exposure (EV) + white balance | **histogram solver** (deterministic; WB reads the HIGHLIGHT quartile — the illuminant, not the furniture) | measurable — never let an LLM eyeball photometry |
 | Reference semantics | **3-sample ANALYZE consensus** (majority/median/circular-mean) | a single sample coin-flips; three don't |
 | Sun azimuth (coarse) | **sweep grid + LLM multiple-choice, cross-checked by the direction metric** | two independent judges on the weakest call |
-| Sun geometry refine, sky character, HDRI rotation, light-group balance, mood | **Opus 4.8 vision** via Omega, ≤4 bounded changes/iteration | semantic judgment, hard-railed by the genome |
-| Accept / revert / stop | **tonal critic** (deterministic 0-100) | keep-best + slump-revert make exploration safe |
-| Taste, final say | **you** | locks, live sliders, undo — one undo record per apply |
+| Sun geometry refine, sky character, HDRI rotation, light-group balance, mood | **Provider-neutral vision model**, ≤4 bounded changes/iteration | semantic judgment, hard-railed by the genome |
+| Accept / revert / stop | **tonal critic + honest scorecard** (deterministic 0-100) | keep-best + slump-revert make exploration safe; component coverage exposes uncertainty |
+| Taste, final say | **you** | preference profiles, Accept/Needs Work feedback, locks, live sliders, undo |
 
 Every LLM proposal is validated against the **genome** (`core/genome.py`): unknown params
 dropped, locked params refused, bounds clamped, per-iteration step limits enforced. The
@@ -46,7 +47,7 @@ error)** vs the pre-v0.6 baseline of 85.1 best / 56.6 stalled (dated 2026-07-16 
 
 ```
 maxgaffer/core/       PURE python, ZERO pymxs/Qt (test-enforced) — genome, solver, critic,
-                      director loop, rules, session, prompts, Omega client, stdlib PNG stats
+                      director loop, rules, session, prompts, provider adapters, stdlib PNG stats
 maxgaffer/maxbridge/  the ONLY pymxs importer — scene/rig introspection, apply, exposure
                       hosts, loop renders, Vantage (live link + vrscene + vantage_console)
 maxgaffer/ui/         PySide6 dock (camera board · reference · match loop · rig sliders · Vantage)
@@ -54,7 +55,7 @@ maxgaffer/sidecar/    optional Pillow stats CLI for a system python
 tests/                pytest — runs on any OS, no Max needed
 ```
 
-Dependency floor is **stdlib-only**: the Omega client is urllib, loop-render stats decode
+Dependency floor is **stdlib-only**: semantic HTTP adapters use urllib, loop-render stats decode
 through a built-in PNG reader. Pillow (optional, installer tries) upgrades JPEG reference
 ingestion and slims LLM payloads; without it, references transcode through Max's own bitmap
 I/O. There is no torch, no OpenCV, no required pip package.
@@ -65,7 +66,7 @@ I/O. There is no torch, no OpenCV, no required pip package.
 2. Restart Max → Customize → Customize User Interface → category **MaxGaffer** → drag the
    action to a toolbar.
 3. Click it. If MaxDirector is installed, the oc_ key is borrowed automatically; otherwise
-   Settings → paste key → **Test gateway**.
+   Settings → choose a semantic provider, paste its key/URL, then test it.
 4. (Recommended) Start the Vantage live link once from the V-Ray menu if the in-plugin
    button reports it couldn't find the action.
 
@@ -78,7 +79,7 @@ Two answers to the parametric loop's honest ceiling — the UNREACHABLE referenc
 
 **Seed dome** (RIG row) synthesizes an equirect **HDR panorama from the reference
 itself** — its colors become the ambient light from every direction (mirror-folded around
-the camera's view, sky/ground extended, structure blurred away), and a high-energy sun
+the camera's view with sky/ground extension), and a high-energy sun
 disc is injected at the solved sun position (altitude-matched blackbody tint; overcast
 references get a lifted sky and no disc). The pano is written as a real Radiance `.hdr`
 (pure-stdlib RGBE writer — no Pillow, no numpy), bound to the dome via the existing
@@ -87,11 +88,12 @@ live genome param). The previous dome texture/rotation is snapshotted once — *
 puts it back. This is the deterministic, local, reproducible version of Chaos's AI Mood
 Match (V-Ray 7 U3, SketchUp/Rhino-only) — and for a generative pano, `build_seed`'s
 `pano_path` ingests any external equirect (DiffusionLight-class estimators) through the
-identical orient/inject pipeline. Seeds are per camera and follow the shot: switching
+identical orient/inject pipeline. Seeds are sharp by default for useful reflections;
+`seed_blur_passes=1..2` is an explicit diffuse-light option for multi-dome rigs. Seeds are
+per camera and follow the shot: switching
 cameras, batch finals and vrscene exports re-bind each camera's own seed. Honest limit:
-the pano is deliberately blurred illumination, so where the dome is VISIBLE in glossy
-reflections or through glazing it reads as soft color, not a crisp sky — keep the dome
-camera-invisible on shots where that matters.
+a single reference cannot reveal the unseen 360° world, so mirror-folded directions remain
+an estimate, not a captured location.
 
 **BOARD** (action bar) is Light Gen with numbers: up to six candidate rigs — as-analyzed,
 golden low, overcast soft, backlit rim, cool north, practicals at dusk — each built by the
@@ -118,9 +120,9 @@ left"* — or tap a chip. Three things happen:
    automatically.
 The UI shows reference vs latest match side by side; the log is the conversation record.
 
-## Deep match — the 99 mode (v0.7)
+## Hero match — bounded 99 mode (v0.11)
 
-Tick **deep match → 99** for hero shots. The precise promise, measured live:
+Choose **Hero → 99** for hero shots. The precise promise, measured live:
 * when the reference is **reachable** (same scene / relight / compatible space), the
   engine lands **≥99**: annealed steps and tightening solver deadbands finish what
   exploration started, then an LLM-free **adaptive coordinate line search** (climb while a
@@ -134,7 +136,9 @@ Tick **deep match → 99** for hero shots. The precise promise, measured live:
   the engine converges to the scene's own optimum and the report SAYS SO: *"ceiling
   proven — the gap left is content, not lighting."* Two consecutive diminishing-return
   rounds (< 0.2 score) or full step-floor exhaustion is the convergence proof.
-Cost: up to ~10 loop iterations + ≤120 polish probes at loop resolution — hero-shot money.
+Cost is explicit and bounded: normally 8 loop iterations + ≤6 low-res sweep renders +
+≤48 polish probes (62 worst case). Fast is 320×180 / 3 iterations / 4 sweep directions;
+Standard preserves the configured loop settings.
 
 ## Agent mode — scene-wide plans (v0.5)
 
@@ -264,25 +268,27 @@ structurally refused, not just prompted).
 * **Contaminated iterations** — when the solver had to move EV ≥ 1.5 stops, the render the
   model just critiqued was badly mis-exposed, so its intensity/group proposals are dropped
   for that iteration (geometry proposals survive). Logged when it happens.
-* **Loop cost is render cost** — iteration renders use your current V-Ray sampler at
-  `loop_width` (480 px default). On a heavy interior that's minutes per iteration ×
-  (8 sweep + N iterations). MaxGaffer deliberately never touches sampler settings (contract:
-  render setups are the artist's); use a draft preset for matching sessions if needed.
+* **Loop cost is render cost** — Fast/Standard/Hero show a hard render budget before the
+  first probe. Direction sweeps are downsampled; scored loop frames keep one resolution so
+  the metric remains comparable. Optional draft sampler mode is restored crash-safely.
 * **Matches are explorations** — the pre-match light is snapshotted automatically per camera;
   **Restore pre-match light** puts it back exactly. Baselines for practical groups are
   adopted once (by light name, persisted) and never re-captured, so MaxGaffer dimming a
   group to 0 can never poison its authored value.
 
-Known limits (deliberate): one sun + one dome (extras are ignored with a note), no
-volumetrics/aerial-perspective matching, no per-light solo — groups are layer-based dimmer
-boards. Since v0.3: photometric/standard lights join the groups, EXR/HDR/TIFF references
-ingest via Max's own bitmap I/O, overcast can dim instead of disable the sun
-(`overcast_sun_mode`), and **Match ALL (refs)** queues every referenced camera unattended.
+Current boundaries: stock Vantage 3.x still requires its in-app Batch Render queue;
+MaxGaffer exports the ordered vrscenes, queue manifest and instructions, launches Vantage,
+and copies the list, but does not pretend the removed headless API exists. Up to four
+role-sorted suns and four domes are matchable; native V-Ray Environment Fog/Aerial
+Perspective is matched when present. Animation interpolation/baking is available through
+the API (there is not yet a timeline editor in the dock). Large content/albedo/material
+differences remain unsolvable by lighting alone and are called out by the scorecard.
 
 ## API (MaxDirector integration / any pipeline tool)
 
 ```python
-from maxgaffer.api import match_camera, match_all_cameras, render_cameras
+from maxgaffer.api import (match_camera, match_all_cameras, render_cameras,
+                           bake_lighting_animation)
 result = match_camera("PhysCam_Hero", r"D:/refs/dusk.jpg", log=print)   # → score/state/renders
 match_all_cameras(log=print)                                            # overnight queue
 render_cameras(["PhysCam_Hero"], r"D:/out", print)     # finals (V-Ray backend by default)

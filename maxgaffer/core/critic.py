@@ -33,6 +33,71 @@ DEFAULT_WEIGHTS: Dict[str, float] = {
     "direction": 0.15,   # 3×3 luminance-grid cosine — WHERE the light lives
 }
 
+PREFERENCE_PROFILES: Dict[str, Dict[str, float]] = {
+    "balanced": dict(DEFAULT_WEIGHTS),
+    "direction": {"key": 0.14, "envelope": 0.14, "histogram": 0.13,
+                  "color": 0.16, "hue": 0.10, "direction": 0.33},
+    "color_mood": {"key": 0.13, "envelope": 0.10, "histogram": 0.11,
+                   "color": 0.34, "hue": 0.22, "direction": 0.10},
+    "tonal": {"key": 0.29, "envelope": 0.24, "histogram": 0.24,
+              "color": 0.10, "hue": 0.05, "direction": 0.08},
+}
+
+
+def weights_for(preference: str = "balanced", overrides: Dict[str, float] = None) -> Dict[str, float]:
+    """Artist-facing taste profile plus optional expert per-component overrides."""
+    weights = dict(PREFERENCE_PROFILES.get(str(preference or "balanced"), DEFAULT_WEIGHTS))
+    for key, value in (overrides or {}).items():
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if key in weights and math.isfinite(value) and value >= 0:
+            weights[key] = value
+    return weights
+
+
+def scorecard(score_value: float, components: Dict[str, float], *,
+              ceiling_proven: bool = False, ceiling_converged: bool = False) -> Dict:
+    """Honest human-readable interpretation of the proxy score and its likely gap."""
+    clean = {key: max(0.0, min(1.0, _num(value)))
+             for key, value in (components or {}).items() if key in DEFAULT_WEIGHTS}
+    measured_weight = sum(DEFAULT_WEIGHTS[key] for key in clean)
+    total_weight = sum(DEFAULT_WEIGHTS.values()) or 1.0
+    coverage = measured_weight / total_weight
+    ordered = sorted(clean.items(), key=lambda item: item[1])
+    weakest = [key for key, value in ordered if value < 0.72][:3]
+    strengths = [key for key, value in reversed(ordered) if value >= 0.85][:3]
+    likely = []
+    if clean.get("direction", 1.0) < 0.65:
+        likely.append("light direction/shadow placement")
+    if min(clean.get("color", 1.0), clean.get("hue", 1.0)) < 0.65:
+        likely.append("white balance or source color")
+    if clean.get("key", 1.0) < 0.65:
+        likely.append("exposure/key level")
+    tonal_shape = min(clean.get("envelope", 1.0), clean.get("histogram", 1.0))
+    light_axes = min(clean.get("key", 1.0), clean.get("color", 1.0),
+                     clean.get("direction", 1.0))
+    content_gap = bool((ceiling_proven and (score_value or 0) < 95.0)
+                       or (light_axes >= 0.78 and tonal_shape < 0.62))
+    if content_gap:
+        likely.append("scene content/albedo/material distribution—not lighting alone")
+    confidence = "high" if coverage >= 0.90 else "medium" if coverage >= 0.65 else "low"
+    return {
+        "score": score_value,
+        "components": clean,
+        "coverage": round(coverage, 3),
+        "confidence": confidence,
+        "strengths": strengths,
+        "weakest": weakest,
+        "likely_gap": likely,
+        "content_gap": content_gap,
+        "ceiling": "proven" if ceiling_proven else
+                   "plateau" if ceiling_converged else "not_tested",
+        "disclaimer": ("This measures tonal, color, and direction statistics; it is not "
+                       "a guarantee of artistic or semantic visual equivalence."),
+    }
+
 
 @dataclass
 class Verdict:

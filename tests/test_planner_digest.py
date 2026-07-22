@@ -103,6 +103,22 @@ def test_create_light_validation_and_placement_clamp():
     assert any("no placement" in r or "needs placement" in r for r in rejected)
 
 
+def test_create_light_physical_placement_is_canonical_and_clamped():
+    ops, rejected, _ = validate_plan(plan_reply([
+        {"op": "create_light", "light_type": "VRayLight_plane", "name": "metric",
+         "placement": {"bearing_deg": 25, "distance_m": 2.5, "height_m": 1.2},
+         "why": "portable placement"},
+        {"op": "create_light", "light_type": "VRayLight_sphere", "name": "mixed",
+         "placement": {"bearing_deg": 0, "distance_m": 2, "height": 50},
+         "why": "mixed schemas must not pass"},
+    ]), CAT)
+    assert len(ops) == 1
+    assert ops[0]["placement"] == {"bearing_deg": 25.0, "distance_m": 2.5,
+                                    "height_m": 1.2}
+    assert "2.50m" in describe_plan(ops)[0]
+    assert any("height_m" in note for note in rejected)
+
+
 def test_plan_caps_at_max_ops_and_requires_json():
     many = [{"op": "set", "target": "exposure", "prop": "ev", "value": i, "why": "x"}
             for i in range(20)]

@@ -45,6 +45,8 @@ CONFIG_PATH = os.path.join(_appdata_dir("MaxGaffer"), "config.json")
 class Config:
     api_key: str = ""                        # oc_ gateway key
     model: str = "claude-opus-4-8"           # vision-capable — the loop shows it images
+    semantic_provider: str = "omega"          # omega | anthropic | openai | openai_compatible | offline
+    semantic_base_url: str = ""               # required only for compatible/local endpoints
     vantage_exe: str = r"C:\Program Files\Chaos\Vantage\vantage.exe"
     # Vantage 3.x REMOVED stock command-line rendering (Chaos support-confirmed; it now
     # needs the Developer Edition). Default backend renders finals through V-Ray in Max —
@@ -61,6 +63,7 @@ class Config:
     target_score: float = 82.0
     analyze_samples: int = 3                 # ANALYZE self-consistency (1 = single-shot)
     sweep_count: int = 8
+    seed_blur_passes: int = 0                # 0 sharp reflections; 1-2 diffuse-light blur
     keep_runs: int = 10                      # run folders kept per camera (0 = keep all)
     draft_sampler: bool = False              # opt-in: draft render settings during matches
     # apply-only mode: MaxGaffer never fires a render. MATCH = analyze → first guess →
@@ -81,6 +84,7 @@ class Config:
     # remains available for dome-only rigs.
     overcast_sun_mode: str = "dim"
     critic_weights: Dict[str, float] = field(default_factory=dict)   # override critic defaults
+    artist_preference: str = "balanced"       # balanced | direction | color_mood | tonal
     repo_path: str = ""                      # clone folder, written by install.bat
 
     def save(self) -> None:
@@ -132,7 +136,7 @@ def load() -> Config:
                         _warn(f"'{k}' is {type(v).__name__}, expected "
                               f"{type(getattr(defaults, k)).__name__} — keeping default "
                               f"{getattr(defaults, k)!r}")
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         pass
     if not cfg.api_key:
         cfg.api_key = _borrow_maxdirector_key()
@@ -147,7 +151,7 @@ def _borrow_maxdirector_key() -> str:
         if isinstance(d, dict):
             return str(d.get("api_key") or "")
         _warn("MaxDirector config.json is not an object — no key borrowed")
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         pass
     return ""
 

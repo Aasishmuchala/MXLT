@@ -106,8 +106,8 @@ class TestSessionHardening:
 
     def test_load_junk_state_values(self, tmp_path):
         p = tmp_path / "s.json"
-        json.dump({"cameras": {"c": {"state": {"values": {"sun.intensity": "abc"}}}}},
-                  p.open("w"))
+        with p.open("w") as f:
+            json.dump({"cameras": {"c": {"state": {"values": {"sun.intensity": "abc"}}}}}, f)
         s = session.Session.load(str(p))
         assert s.cameras["c"].state is not None  # entry survives, junk value skipped
 
@@ -121,8 +121,8 @@ class TestSessionHardening:
 
     def test_string_locks_and_notes_do_not_become_char_sets(self, tmp_path):
         p = tmp_path / "s.json"
-        json.dump({"cameras": {"c": {"locks": "sun.intensity", "notes": "too bright"}}},
-                  p.open("w"))
+        with p.open("w") as f:
+            json.dump({"cameras": {"c": {"locks": "sun.intensity", "notes": "too bright"}}}, f)
         e = session.Session.load(str(p)).cameras["c"]
         assert e.locks == set() and e.notes == []
 

@@ -126,6 +126,27 @@ def test_create_light_happy_path_still_reports(rt):
     assert report["warnings"] == []
 
 
+def test_physical_light_placement_uses_max_unit_decoder(rt):
+    from maxgaffer.maxbridge import execute as ex
+
+    rt.units = _Node(decodeValue=lambda token: float(token[:-1]) * 1000.0)
+    basis = {"pos": [10.0, 20.0, 30.0], "yaw_deg": 0.0,
+             "look": [10.0, 120.0, 30.0]}
+    p = ex._place_from(basis, {"bearing_deg": 0, "distance_m": 2.5,
+                               "height_m": 1.2})
+    assert (p.x, p.y, p.z) == pytest.approx((10.0, 2520.0, 1230.0))
+
+
+def test_legacy_light_placement_remains_raw_scene_units(rt):
+    from maxgaffer.maxbridge import execute as ex
+
+    rt.units = _Node(decodeValue=lambda token: float(token[:-1]) * 1000.0)
+    basis = {"pos": [0.0, 0.0, 0.0], "yaw_deg": 0.0,
+             "look": [0.0, 1.0, 0.0]}
+    p = ex._place_from(basis, {"bearing_deg": 0, "distance": 250, "height": 120})
+    assert (p.x, p.y, p.z) == pytest.approx((0.0, 250.0, 120.0))
+
+
 # --------------------------------------------------------------------- draft.py
 @pytest.fixture
 def draft_env(rt, tmp_path, monkeypatch):
@@ -282,6 +303,17 @@ def test_render_frame_closes_bitmap_when_save_raises(rt, tmp_path):
     assert (rt.renderWidth, rt.renderHeight) == (640, 360)    # size still restored
 
 
+def test_failed_transcode_cannot_return_a_stale_previous_image(rt, tmp_path):
+    from maxgaffer.maxbridge import render as rd
+
+    dst = tmp_path / "reference.png"
+    dst.write_bytes(b"old image")
+    rt.openBitMap = lambda path: None
+
+    assert rd.transcode_to_png("missing.exr", str(dst)) is None
+    assert not dst.exists()
+
+
 # --------------------------------------------------------------------- vantage.py
 def test_render_stills_continues_after_a_failed_job(tmp_path, monkeypatch):
     from maxgaffer.maxbridge import vantage as vt
@@ -296,7 +328,8 @@ def test_render_stills_continues_after_a_failed_job(tmp_path, monkeypatch):
             raise RuntimeError("console wedged")
         for a in cmd:
             if a.startswith("-outputFile="):
-                open(a.split("=", 1)[1], "wb").write(b"png")
+                with open(a.split("=", 1)[1], "wb") as output_file:
+                    output_file.write(b"png")
         return "done", 0
 
     monkeypatch.setattr(vt, "_run_console", fake_console)
@@ -333,7 +366,8 @@ def test_render_stills_cancel_marks_remaining_jobs(tmp_path, monkeypatch):
         done.append(cmd)
         for a in cmd:
             if a.startswith("-outputFile="):
-                open(a.split("=", 1)[1], "wb").write(b"png")
+                with open(a.split("=", 1)[1], "wb") as output_file:
+                    output_file.write(b"png")
         return "done", 0
 
     monkeypatch.setattr(vt, "_run_console", fake_console)

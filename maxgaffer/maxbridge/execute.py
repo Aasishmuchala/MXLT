@@ -4,7 +4,7 @@ One undo record for the whole plan. Every op is fault-isolated: a failed set rec
 warning and the plan continues. Created lights are always MG_-prefixed and placed on the
 "MG_lights" layer, so a whole session's additions can be selected, dimmed, or deleted as
 one board. Placement is resolved HERE from real camera geometry — the model only ever
-supplied bearing/distance/height or a node name.
+supplied bearing plus physical distance/height (or legacy raw-unit values), or a node name.
 """
 
 from __future__ import annotations
@@ -95,19 +95,33 @@ LIGHT_MAKERS = {
 }
 
 
+def _world_units(metres: float) -> float:
+    """Convert physical metres through Max's current system-unit settings."""
+    return sc.world_units(metres)
+
+
 def _place_from(basis: Dict[str, Any], placement: Dict[str, Any]):
     rt = _rt()
     if "at_node" in placement:
         node = rt.getNodeByName(placement["at_node"], exact=True)
         if node is not None:
             p = node.pos
-            return rt.Point3(float(p.x), float(p.y), float(p.z) + 50.0)
-        return rt.Point3(0.0, 0.0, 100.0)
+            return rt.Point3(float(p.x), float(p.y), float(p.z) + _world_units(0.5))
+        return rt.Point3(0.0, 0.0, _world_units(1.0))
     yaw = math.radians(basis["yaw_deg"] + float(placement.get("bearing_deg", 0.0)))
-    dist = float(placement.get("distance", 200.0))
+    if "distance_m" in placement:
+        dist = _world_units(float(placement.get("distance_m", 2.0)))
+    elif "distance" in placement:
+        dist = float(placement["distance"])
+    else:
+        dist = _world_units(2.0)
+    if "height_m" in placement:
+        height = _world_units(float(placement.get("height_m", 0.0)))
+    else:
+        height = float(placement.get("height", 0.0))
     cx, cy, cz = basis["pos"]
     return rt.Point3(cx + math.sin(yaw) * dist, cy + math.cos(yaw) * dist,
-                     cz + float(placement.get("height", 0.0)))
+                     cz + height)
 
 
 def _ensure_mg_layer():
@@ -220,10 +234,16 @@ def execute_plan(ops: List[Dict], camera=None) -> Dict[str, Any]:
                                     layer.addNode(n)
                                 except Exception:
                                     pass
-                        where = (placement.get("at_node")
-                                 or f"{placement.get('bearing_deg', 0):+.0f}° / "
-                                    f"{placement.get('distance', 0):.0f}u / "
-                                    f"h{placement.get('height', 0):+.0f}")
+                        where = placement.get("at_node")
+                        if not where:
+                            if "distance_m" in placement:
+                                where = (f"{placement.get('bearing_deg', 0):+.0f}° / "
+                                         f"{placement.get('distance_m', 0):.2f}m / "
+                                         f"h{placement.get('height_m', 0):+.2f}m")
+                            else:
+                                where = (f"{placement.get('bearing_deg', 0):+.0f}° / "
+                                         f"{placement.get('distance', 0):.0f}u / "
+                                         f"h{placement.get('height', 0):+.0f}u")
                         report["created"].append({"name": name,
                                                   "type": op["light_type"], "at": where,
                                                   "why": op.get("why", "")})

@@ -269,8 +269,9 @@ def test_render_exposed_applies_state_exposure(tmp_path, monkeypatch):
         pre_match = pre
 
     out = c._render_exposed(object(), raw, 32, 32, state=st, entry=E())
-    im = Image.open(out).convert("RGB")
-    mean = sum(p[0] for p in im.getdata()) / (32 * 32)
+    with Image.open(out) as opened:
+        im = opened.convert("RGB")
+    mean = sum(im.getpixel((x, y))[0] for y in range(32) for x in range(32)) / (32 * 32)
     assert mean < 120                                    # visibly darkened vs 180
 
 
@@ -284,7 +285,8 @@ def test_render_exposed_identity_without_flag(tmp_path, monkeypatch):
     monkeypatch.setattr(ctl.rd, "render_frame", fake_render)
     out = c._render_exposed(object(), str(tmp_path / "o.png"), 8, 8,
                             state=None, entry=None)
-    im = Image.open(out).convert("RGB")
+    with Image.open(out) as opened:
+        im = opened.convert("RGB")
     assert im.getpixel((0, 0)) == (100, 100, 100)
 
 

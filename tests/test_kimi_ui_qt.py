@@ -57,7 +57,7 @@ class FakeController:
     def read_state(self, camera_name=""):
         return demo_state()
 
-    def select_camera(self, name, apply_saved=True):
+    def select_camera(self, name, apply_saved=True, camera_id=""):
         self.calls.append(("select_camera", name))
         return []
 

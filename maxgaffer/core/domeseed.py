@@ -331,6 +331,7 @@ def build_seed(
     sun_size_deg: float = 4.0,
     ambient_key: float = 0.35,
     parametric_sun_active: bool = False,
+    blur_passes: int = 0,
 ) -> Optional[Dict]:
     """Reference (or external pano) → seeded .hdr on disk. → meta dict, None when the
     source can't be read. Raises SeedError when the source read FINE but the seed can't
@@ -372,7 +373,12 @@ def build_seed(
             rows = ingest_pano(pixels, w, h, cam_yaw_deg, out_w, out_h)
         else:
             rows = synthesize_pano(pixels, w, h, cam_yaw_deg, out_w, out_h, fov_deg)
-    rows = blur_pano(rows)
+    # Old releases always blurred the pano. That is useful for diffuse-only illumination
+    # but visibly destroys product/architectural reflections. Sharp is now the default;
+    # artists can opt into lighting-only blur when a separate reflection dome is present.
+    blur_passes = max(0, min(4, int(blur_passes)))
+    if blur_passes:
+        rows = blur_pano(rows, passes=blur_passes)
     rows, scale = normalize_key(rows, ambient_key)
 
     sky = sem.get("sky", "clear")
@@ -417,6 +423,8 @@ def build_seed(
         "cam_yaw_deg": cam_yaw_deg,
         "fov_deg": snap_fov(fov_deg),
         "normalize_scale": round(scale, 5),
+        "blur_passes": blur_passes,
+        "reflection_quality": "sharp" if blur_passes == 0 else "lighting_blur",
         "sun": sun_meta,
         "disc_policy": disc_policy,
         "overcast_lift": (sky == "overcast"),

@@ -70,8 +70,14 @@ def _find_exposure_control():
     Class names carry underscores on real boxes (the renderer is
     V_Ray_GPU_7__update_2_hotfix_2) — normalize before matching."""
     ec = _scene_exposure_control()
-    if ec is not None and "vray" in str(_rt().classOf(ec)).lower().replace("_", ""):
-        return ec
+    if ec is not None:
+        try:
+            if "vray" in str(_rt().classOf(ec)).lower().replace("_", ""):
+                return ec
+        except Exception:
+            # Deleted/hostile controls can remain referenced by the scene slot.  Treat
+            # them as unusable instead of breaking every state read/apply.
+            return None
     return None
 
 
@@ -207,25 +213,31 @@ class ExposureHost:
         return None
 
     def write_ev(self, ev: float) -> bool:
+        try:
+            ev = float(ev)
+            if not math.isfinite(ev):
+                return False
+        except (TypeError, ValueError):
+            return False
         if self.kind == "exposure_control":
             # .ev only registers in "from EV" mode (106) — enforce like the camera
             # path enforces gain type below (measured on-box 2026-07-16: default
             # mode 107 silently ignores .ev writes)
             if get_prop(self.ec, EC_MODE) is not None:
                 set_prop(self.ec, EC_MODE, 106)
-            return set_prop(self.ec, EC_EV, float(ev)) is not None
+            return set_prop(self.ec, EC_EV, ev) is not None
         if self.kind == "physical_cam":
             # preferred: native Target-EV mode — exact, no side effects on DOF/motion
             if get_prop(self.cam, CAM_EV) is not None:
                 if get_prop(self.cam, CAM_EV_TYPE) is not None:
                     set_prop(self.cam, CAM_EV_TYPE, 1)   # 1 = Target (verified enum)
-                return set_prop(self.cam, CAM_EV, float(ev)) is not None
+                return set_prop(self.cam, CAM_EV, ev) is not None
             current = self.read_ev()   # legacy fallback: move ISO only
             if current is None:
                 return False
             try:
                 iso = float(get_prop(self.cam, CAM_ISO, 100.0))
-                new_iso = min(51200.0, max(6.0, iso * (2.0 ** (current - float(ev)))))
+                new_iso = min(51200.0, max(6.0, iso * (2.0 ** (current - ev))))
                 return set_prop(self.cam, CAM_ISO, new_iso) is not None
             except Exception:
                 return False
@@ -246,13 +258,19 @@ class ExposureHost:
         return None
 
     def write_wb_kelvin(self, kelvin: float) -> bool:
+        try:
+            kelvin = float(kelvin)
+            if not math.isfinite(kelvin):
+                return False
+        except (TypeError, ValueError):
+            return False
         host = self.ec if self.kind == "exposure_control" else self.cam
         if host is None:
             return False
         kelvin_props = EC_WB_KELVIN if self.kind == "exposure_control" else CAM_WB_KELVIN
         mode_props = EC_WB_MODE if self.kind == "exposure_control" else CAM_WB_TYPE
         if get_prop(host, kelvin_props) is not None:
-            ok = set_prop(host, kelvin_props, float(kelvin)) is not None
+            ok = set_prop(host, kelvin_props, kelvin) is not None
             if ok:
                 _set_wb_mode(host, mode_props, WB_TYPE_TEMPERATURE)
             return ok

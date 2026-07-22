@@ -61,10 +61,10 @@ CONSOLE_STUB = (
     "import os, sys, time\n"
     "mode, out = sys.argv[1], sys.argv[2]\n"
     "if mode == 'ok':\n"
-    "    open(out, 'wb').write(b'png')\n"
+    "    with open(out, 'wb') as output_file: output_file.write(b'png')\n"
     "elif mode == 'suffix':\n"
     "    stem, ext = os.path.splitext(out)\n"
-    "    open(stem + '.0000' + ext, 'wb').write(b'png')\n"
+    "    with open(stem + '.0000' + ext, 'wb') as output_file: output_file.write(b'png')\n"
     "elif mode == 'sleep':\n"
     "    time.sleep(30)\n"
     "elif mode == 'fail':\n"
@@ -459,3 +459,22 @@ def test_export_vrscene_restores_previous_camera(monkeypatch, tmp_path):
     out = str(tmp_path / "shot.vrscene")
     assert vt.export_vrscene(out, "CamA") == out
     assert calls == ["prevCam"]                        # restored after the export
+
+
+def test_stock_vantage_queue_manifest_is_ordered_and_honest(tmp_path):
+    export_dir = str(tmp_path / "vantage")
+    jobs = [
+        {"camera": "CamB", "scene_file": str(tmp_path / "B.vrscene"),
+         "output": str(tmp_path / "B.png")},
+        {"camera": "CamA", "scene_file": str(tmp_path / "A.vrscene"),
+         "output": str(tmp_path / "A.png")},
+    ]
+    path = vt.write_queue_manifest(export_dir, jobs, 1920, 1080)
+    assert path is not None
+    import json
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    assert data["requires_in_app_queue"] is True
+    assert [j["camera"] for j in data["jobs"]] == ["CamB", "CamA"]
+    assert data["resolution"] == {"width": 1920, "height": 1080}
+    assert (tmp_path / "vantage" / "VANTAGE_BATCH_INSTRUCTIONS.txt").exists()

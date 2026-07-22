@@ -53,6 +53,30 @@ def test_pick_reference_blocked_while_busy(dock, monkeypatch):
     assert "busy" in dock.log.toPlainText()
 
 
+def test_reference_picker_exposes_max_native_formats_and_rejects_missing(dock,
+                                                                          monkeypatch):
+    seen = {}
+
+    def choose(*args, **kwargs):
+        seen["filter"] = args[3]
+        return ("Z:/missing/reference.exr", "")
+
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", staticmethod(choose))
+    before = dock.ctrl.session.cameras["CamA"].reference
+    dock._pick_reference()
+    assert "*.exr" in seen["filter"] and "*.tiff" in seen["filter"]
+    assert dock.ctrl.session.cameras["CamA"].reference == before
+    assert "not found" in dock.log.toPlainText()
+
+
+def test_missing_bound_reference_is_reported_as_missing_not_unbound(dock, tmp_path):
+    missing = tmp_path / "moved.jpg"
+    dock.ctrl.session.cameras["CamA"].reference = str(missing)
+    dock._show_reference("CamA")
+    assert dock.ref_thumb.text() == "reference missing"
+    assert "moved or was deleted" in dock.lbl_ref_info.text()
+
+
 def test_open_settings_blocked_while_busy(dock, monkeypatch):
     from maxgaffer.ui import dock as dockmod
 

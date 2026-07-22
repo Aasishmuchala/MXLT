@@ -98,6 +98,10 @@ def transcode_to_png(src_path: str, dst_png: str, max_dim: int = 1024) -> Option
     src = None
     dst = None
     try:
+        # A failed/silent Max save must never make an older file look like a successful
+        # decode of the newly selected reference.
+        if os.path.exists(dst_png):
+            os.remove(dst_png)
         src = rt.openBitMap(src_path)
         if src is None:
             return None

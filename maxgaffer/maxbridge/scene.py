@@ -63,6 +63,32 @@ LIGHT_MULT = ("multiplier", "intensity")
 DOME_TEX_ROT = ("horizontalRotation", "horizontal_rotation", "hRot", "tex_hrotation")
 DOME_TEX_FILE = ("HDRIMapName", "fileName", "filename", "bitmap_filename")
 DOME_TEX_ON = ("texmap_on", "useTexmap", "use_texture")
+FOG_ON = ("enabled", "on", "active")
+FOG_DISTANCE = ("fog_distance", "fogDistance", "distance")
+FOG_HEIGHT = ("fog_height", "fogHeight", "height")
+
+
+def world_units(metres: float) -> float:
+    """Physical metres → current 3ds Max system units."""
+    rt = _rt()
+    token = f"{float(metres):.12g}m"
+    try:
+        return float(rt.units.decodeValue(token))
+    except Exception:
+        try:
+            escaped = token.replace('"', '')
+            return float(rt.execute(f'units.decodeValue "{escaped}"'))
+        except Exception:
+            return float(metres) * 100.0
+
+
+def metres_from_world_units(value: float) -> float:
+    """Current system units → physical metres, using the same Max-native conversion."""
+    try:
+        one_metre = world_units(1.0)
+        return float(value) / one_metre if abs(one_metre) > 1e-12 else float(value) / 100.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 # ------------------------------------------------------------------ cameras
@@ -78,6 +104,18 @@ def _node_name(obj) -> str:
         return str(obj.name)
     except Exception:
         return "<unreadable>"
+
+
+def camera_identity(cam) -> str:
+    """Persistent anim handle for a camera, serialized as text; empty when unavailable."""
+    try:
+        handle = _rt().getHandleByAnim(cam)
+        return str(int(handle)) if handle is not None else ""
+    except Exception:
+        try:
+            return str(int(cam.handle))
+        except Exception:
+            return ""
 
 
 def camera_yaw_deg(cam) -> float:
@@ -110,7 +148,7 @@ def list_cameras() -> List[Dict[str, Any]]:
             if "target" in cname.lower() and "camera" not in cname.lower():
                 continue                       # Targetobject helpers
             try:
-                out.append({"name": str(o.name), "class": cname,
+                out.append({"name": str(o.name), "id": camera_identity(o), "class": cname,
                             "yaw_deg": camera_yaw_deg(o)})
             except Exception:
                 continue
@@ -131,7 +169,7 @@ def list_cameras() -> List[Dict[str, Any]]:
     return out
 
 
-def get_camera(name: str):
+def get_camera(name: str, camera_id: str = ""):
     """Resolve a camera by name. With duplicate names, getNodeByName's pick is
     unspecified — walk the same collection list_cameras() shows and take the FIRST match,
     so the node acted on is always the first one the board lists."""
@@ -145,7 +183,9 @@ def get_camera(name: str):
             if "target" in cname.lower() and "camera" not in cname.lower():
                 continue
             try:
-                if str(o.name) == name:
+                if camera_id and camera_identity(o) == str(camera_id):
+                    return o
+                if not camera_id and str(o.name) == name:
                     return o
             except Exception:
                 continue
@@ -157,8 +197,8 @@ def get_camera(name: str):
         return None
 
 
-def set_active_camera(name: str) -> bool:
-    cam = get_camera(name)
+def set_active_camera(name: str, camera_id: str = "") -> bool:
+    cam = get_camera(name, camera_id)
     if cam is None:
         return False
     try:
@@ -168,6 +208,24 @@ def set_active_camera(name: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def active_camera_name() -> str:
+    """Name of the viewport camera, or ``""`` for perspective/stale viewports."""
+    try:
+        cam = _rt().viewport.getCamera()
+        if cam is None:
+            return ""
+        return str(cam.name)
+    except Exception:
+        return ""
+
+
+def active_camera_identity() -> str:
+    try:
+        return camera_identity(_rt().viewport.getCamera())
+    except Exception:
+        return ""
 
 
 def scene_path() -> str:
@@ -222,16 +280,51 @@ def _dome_type_value(light) -> Optional[int]:
         return None
 
 
+def _role_rank(node, kind: str) -> Tuple[int, str]:
+    """Stable artist-friendly ordering from common light-role naming conventions."""
+    name = _node_name(node).lower()
+    if any(word in name for word in ("primary", "main", "hero", "key", "lighting", "gi")):
+        rank = 0
+    elif any(word in name for word in ("background", "backplate", "visible", "_bg", "bg_")):
+        rank = 4
+    elif any(word in name for word in ("fill", "ambient", "secondary")):
+        rank = 2
+    elif any(word in name for word in ("rim", "back", "reflection", "refl", "spec")):
+        rank = 3
+    else:
+        rank = 1
+    return rank, name
+
+
+def _atmospherics() -> List[Any]:
+    """Best-effort native atmospheric/render-effect enumeration across Max versions."""
+    rt = _rt()
+    out: List[Any] = []
+    for count_name, getter_name in (("numAtmospherics", "getAtmospheric"),
+                                    ("numEffects", "getEffect")):
+        try:
+            count_raw = getattr(rt, count_name)
+            count = int(count_raw() if callable(count_raw) else count_raw)
+            getter = getattr(rt, getter_name)
+            for i in range(1, count + 1):
+                obj = getter(i)
+                if obj is not None and obj not in out:
+                    out.append(obj)
+        except Exception:
+            continue
+    return out
+
+
 def classify_rig() -> Dict[str, Any]:
-    """→ {"sun": node|None, "dome": node|None, "sky_env": bool,
-          "groups": {name: [nodes]}, "notes": [str]}
+    """→ primary sun/dome plus ordered multi-light roles and atmosphere capability.
 
     Groups = every non-dome VRayLight (and VRayIES), keyed by the light's LAYER name —
     archviz scenes organize practicals by layer, which makes layers the natural dimmer
     boards. Lights on the default layer land in group "practicals".
     """
     rt = _rt()
-    rig: Dict[str, Any] = {"sun": None, "dome": None, "sky_env": False,
+    rig: Dict[str, Any] = {"sun": None, "dome": None, "suns": [], "domes": [],
+                           "atmosphere": None, "sky_env": False,
                            "groups": {}, "notes": []}
     try:
         lights = list(rt.lights)
@@ -242,8 +335,8 @@ def classify_rig() -> Dict[str, Any]:
         if cname == "targetobject":
             continue    # the lights collection yields light TARGETS too — same gotcha as cameras
         if cname == "vraysun":
-            if rig["sun"] is None:
-                rig["sun"] = lt
+            rig["suns"].append(lt)
+            if len(rig["suns"]) == 1:
                 try:
                     tgt = getattr(lt, "target", None)
                     # a deleted target reads back as a dead-node wrapper, not None
@@ -261,14 +354,10 @@ def classify_rig() -> Dict[str, Any]:
                             "assembly may fight MaxGaffer's sun moves")
                 except Exception:
                     pass
-            else:
-                rig["notes"].append(f"extra VRaySun '{_node_name(lt)}' ignored (first one wins)")
         elif cname == "vraylight":
             # dome detection: V-Ray light .type — dome is expected to be 1 (VERIFY ON BOX)
-            if _dome_type_value(lt) == 1 and rig["dome"] is None:
-                rig["dome"] = lt
-            elif _dome_type_value(lt) == 1:
-                rig["notes"].append(f"extra dome '{_node_name(lt)}' ignored")
+            if _dome_type_value(lt) == 1:
+                rig["domes"].append(lt)
             else:
                 _add_group_light(rig, lt)
         elif cname in ("vrayies", "vrayambientlight"):
@@ -279,6 +368,29 @@ def classify_rig() -> Dict[str, Any]:
             # photometric + standard lights join the dimmer boards too — LIGHT_MULT
             # candidates cover both conventions (.multiplier / .intensity)
             _add_group_light(rig, lt)
+    # A name such as Key/Lighting/Reflection/Background makes the role deterministic;
+    # otherwise original scene order is retained by Python's stable sort.
+    rig["suns"].sort(key=lambda node: _role_rank(node, "sun"))
+    rig["domes"].sort(key=lambda node: _role_rank(node, "dome"))
+    rig["sun"] = rig["suns"][0] if rig["suns"] else None
+    rig["dome"] = rig["domes"][0] if rig["domes"] else None
+    if len(rig["suns"]) > 1:
+        rig["notes"].append(f"multi-sun rig: {len(rig['suns'])} suns exposed as sun, "
+                            "sun2…sun4")
+    if len(rig["domes"]) > 1:
+        rig["notes"].append(f"multi-dome rig: {len(rig['domes'])} domes exposed as dome, "
+                            "dome2…dome4")
+    if len(rig["suns"]) > 4 or len(rig["domes"]) > 4:
+        rig["notes"].append("only the first four role-sorted suns/domes are matchable")
+
+    for effect in _atmospherics():
+        cname = _class_name(effect).lower()
+        if "environmentfog" in cname or "aerialperspective" in cname:
+            if rig["atmosphere"] is None:
+                rig["atmosphere"] = effect
+            else:
+                rig["notes"].append(f"extra atmosphere '{_node_name(effect)}' ignored")
+
     try:
         env = rt.environmentMap
         rig["sky_env"] = env is not None and "vraysky" in _class_name(env).lower()

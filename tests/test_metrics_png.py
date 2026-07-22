@@ -29,7 +29,9 @@ def test_png_min_matches_pillow_on_gradient(tmp_path):
     assert rows is not None
     flat = [c for row in rows for px in row for c in px]
     with PIL.open(path) as im:
-        ref = list(im.convert("RGB").getdata())
+        rgb = im.convert("RGB")
+        pixel_data = getattr(rgb, "get_flattened_data", rgb.getdata)
+        ref = list(pixel_data())
     ref_flat = [c for px in ref for c in px]
     # same pixels (no subsampling at this size) — exact match after unfiltering
     assert flat == ref_flat

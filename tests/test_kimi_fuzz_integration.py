@@ -21,26 +21,8 @@ Deterministic-seeded fuzzing (random.Random(7) et al.) of every hostile-input su
   4. Round-trips: LightingState.from_dict(to_dict) idempotent on random valid states;
      session save -> load preserves cameras/locks/baselines.
 
-REAL BUGS FOUND BY THIS FUZZING (left unfixed per mission; skipped repros at the bottom):
-
-  * BUG-A (RecursionError escapes every JSON entry point): a sidecar/config/preset/LLM
-    reply with JSON nesting deeper than the interpreter recursion limit makes
-    json.load(s) raise RecursionError, which is NOT an (OSError, ValueError):
-      - maxgaffer/core/session.py:135   Session.load      -> crashes, and because the
-        quarantine path is skipped _protect_existing stays False, so the NEXT auto-save
-        silently overwrites the hostile file (data-loss guard defeated).
-      - maxgaffer/core/session.py:250   preset_loads      -> crashes.
-      - maxgaffer/maxbridge/config.py:103 config.load     -> crashes plugin settings load.
-      - maxgaffer/core/omega.py:72      parse_json_from_text catches only JSONDecodeError,
-        so RecursionError escapes validate_analysis / validate_deltas / validate_plan
-        instead of the documented ParseError.
-    Minimal repro bytes: b'{"a":' * 5000 + b'1' + b'}' * 5000  (default recursion limit).
-
-  * BUG-B (quadratic hang in parse_json_from_text): maxgaffer/core/omega.py:50-78 rescans
-    from every '{' to end-of-text when no balanced close exists — O(n^2). Measured
-    locally: 1k braces 0.017s, 2k 0.072s, 4k 0.289s (4x size = 16x time); 100k braces
-    exceeds 60s; a 10MB all-braces reply would hang Max's main thread for hours.
-    Minimal repro: parse_json_from_text("{" * 20000)  (~7s; any budget < 5s fails).
+The fuzzing found recursion escape and quadratic brace-flood defects. Both are fixed and
+their original reproducers run below as normal, timed regression tests.
 
 Everything here is stdlib-only (runs under Max's Python 3.11, no Pillow/numpy) and every
 fuzz loop is bounded (<= 300 iterations, each sub-second by construction).
@@ -260,10 +242,12 @@ class TestSidecarFuzz:
         path = str(tmp_path / "clean.maxgaffer.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(_base_sidecar(rng), f)
-        before = open(path, "rb").read()
+        with open(path, "rb") as f:
+            before = f.read()
         s = Session.load(path, now_fn=_NOW)
         assert not s._protect_existing
-        assert open(path, "rb").read() == before
+        with open(path, "rb") as f:
+            assert f.read() == before
         assert _quarantine_backup(path) is None
 
 
@@ -727,37 +711,20 @@ class TestRoundTrip:
         assert s2.settings == s.settings
 
 
-# ------------------------------------------------------- REAL BUGS — skipped repros
-# Per the mission these are NOT fixed in source; the repros are captured here, skipped,
-# so the suite stays green while documenting the exact crash/hang. Remove the skip
-# marker to demonstrate.
+# ------------------------------------------------------- parser hardening regressions
 
 
-@pytest.mark.skip(
-    reason="REAL BUG-A: deeply nested JSON raises RecursionError that escapes "
-    "Session.load (session.py:135 — only OSError/ValueError caught), skipping the "
-    "corrupt-quarantine AND leaving _protect_existing False, so the next auto-save "
-    "silently overwrites the hostile file. Same escape: preset_loads "
-    "(session.py:250), config.load (maxbridge/config.py:103), parse_json_from_text "
-    "(omega.py:72, catches only JSONDecodeError) and therefore validate_analysis / "
-    "validate_deltas / validate_plan raise RecursionError instead of ParseError. "
-    "Repro bytes: b'{\"a\":' * 5000 + b'1' + b'}' * 5000.")
-def test_REALBUG_A_deep_nesting_recursionerror_escapes(tmp_path):
+def test_regression_deep_nesting_recursionerror_is_contained(tmp_path):
     payload = '{"a":' * 5000 + "1" + "}" * 5000
     path = str(tmp_path / "deep.maxgaffer.json")
     with open(path, "w", encoding="utf-8") as f:
         f.write(payload)
-    s = Session.load(path, now_fn=_NOW)      # RecursionError escapes here today
-    assert s._protect_existing               # ...so the corrupt file was quarantined
+    s = Session.load(path, now_fn=_NOW)
+    assert s._protect_existing               # corrupt input is quarantined, never overwritten
     assert _quarantine_backup(path) is not None
 
 
-@pytest.mark.skip(
-    reason="REAL BUG-B: parse_json_from_text (omega.py:50-78) is O(n^2) on replies "
-    "with many unbalanced '{' — it rescans to end-of-text from every '{'. Measured: "
-    "1k braces 0.017s / 4k 0.289s / 20k ~7s / 100k >60s; a 10MB all-braces reply "
-    "hangs Max's main thread for hours. Repro: parse_json_from_text('{' * 20000).")
-def test_REALBUG_B_brace_flood_quadratic_hang():
+def test_regression_brace_flood_is_linear_and_fast():
     t0 = time.perf_counter()
     parse_json_from_text("{" * 20000)
     assert time.perf_counter() - t0 < 2.0, "quadratic blowup in parse_json_from_text"

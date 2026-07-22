@@ -152,6 +152,8 @@ class MatchResult:
                                         # full round improved nothing — a proven local
                                         # optimum. converged without proven = plateau
                                         # (two low-gain rounds; finer steps untested)
+    best_components: Dict[str, float] = field(default_factory=dict)
+    scorecard: Dict = field(default_factory=dict)
 
     def to_summary(self) -> Dict:
         """JSON-safe run record — the controller writes it to the run dir as run.json.
@@ -165,6 +167,8 @@ class MatchResult:
             "polish_probes": self.polish_probes,
             "ceiling_converged": self.ceiling_converged,
             "ceiling_proven": self.ceiling_proven,
+            "best_components": self.best_components,
+            "scorecard": self.scorecard,
             "best_state": self.best_state.to_dict(),
             "iterations": [
                 {"index": r.index, "score": r.score, "render": r.render_path,
@@ -195,6 +199,7 @@ def run_match(
     best_state = state.copy()
     best_score: Optional[float] = None
     best_render: Optional[str] = None
+    best_components: Dict[str, float] = {}
     live: Optional[LightingState] = None   # what the scene is actually wearing right now
     records: List[IterationRecord] = []
     score_history: List[Tuple[int, float]] = []
@@ -261,6 +266,7 @@ def run_match(
                     else:
                         stall_count = 0
                     best_score, best_state, best_render = verdict.score, state.copy(), path
+                    best_components = dict(verdict.components)
                     slump_count = 0
                 else:
                     if verdict.score < (best_score or 0) - cfg.slump_tolerance:
@@ -468,6 +474,7 @@ def run_match(
         best_render=best_render,
         stop_reason=stop_reason,
         iterations=records,
+        best_components=best_components,
     )
 
     # ---- DEEP-MATCH finisher: squeeze to the scene's ceiling, then prove it
@@ -492,6 +499,8 @@ def run_match(
         result.ceiling_converged = converged
         result.ceiling_proven = proven
         result.best_state, result.best_score = p_state, p_score
+        if getattr(hooks, "_polish_best_components", None):
+            result.best_components = dict(hooks._polish_best_components)
         # NO trailing apply here — every run_polish return path already landed `best`;
         # re-applying the identical state is a no-op undo step (SPEC: one undo per apply)
         if converged and p_score < cfg.polish_stop_at:
@@ -523,6 +532,7 @@ def run_polish(
     locks = locks or set()
     best = state.copy()
     best_score = score_now
+    hooks._polish_best_components = {}
     probes = 0
     steps = {k: s for k, s, _log, _floor in POLISH_PARAMS}
     # fail-memo: (step, score) at last failure per param — while neither has changed,
@@ -543,7 +553,9 @@ def run_polish(
         if st is None:
             return None
         probes += 1
-        return critic.score(ref_stats, st, cfg.weights).score
+        verdict = critic.score(ref_stats, st, cfg.weights)
+        hooks._last_polish_components = dict(verdict.components)
+        return verdict.score
 
     try:
         low_gain_rounds = 0
@@ -582,6 +594,8 @@ def run_polish(
                             hooks.log(f"polish: {key} {v:.2f}→{cand.get(key):.2f} · "
                                       f"{best_score:.2f}→{sc:.2f} ✓")
                             best, best_score = cand, sc
+                            hooks._polish_best_components = dict(
+                                getattr(hooks, "_last_polish_components", {}))
                             improved_any = True
                             param_moved = True
                             stride *= 1.6          # keep riding the slope, faster
@@ -640,6 +654,8 @@ def run_polish(
                             cand.set(ka, va * (2.0 ** da) if is_log[ka] else va + da)
                             cand.set(kb, vb * (2.0 ** db) if is_log[kb] else vb + db)
                             best, best_score = cand, sc
+                            hooks._polish_best_components = dict(
+                                getattr(hooks, "_last_polish_components", {}))
                             improved_any = escaped = True
                             # ride the valley: accelerate along the winning diagonal
                             # exactly like the single-axis climb does (stride ×1.6)
@@ -657,6 +673,8 @@ def run_polish(
                                 cand.set(ka, va * (2.0 ** da) if is_log[ka] else va + da)
                                 cand.set(kb, vb * (2.0 ** db) if is_log[kb] else vb + db)
                                 best, best_score = cand, sc2
+                                hooks._polish_best_components = dict(
+                                    getattr(hooks, "_last_polish_components", {}))
                                 mult *= 1.6
                             break
                 if escaped:

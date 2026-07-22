@@ -14,6 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 
 QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+QtCore = pytest.importorskip("PySide6.QtCore")
 
 from maxgaffer.core.director import MatchResult  # noqa: E402
 from maxgaffer.core.genome import LightingState  # noqa: E402
@@ -55,7 +56,7 @@ class FakeController:
         self.calls.append(("apply_state", camera_name))
         return []
 
-    def select_camera(self, name, apply_saved=True):
+    def select_camera(self, name, apply_saved=True, camera_id=""):
         self.calls.append(("select_camera", name))
         return []
 
@@ -65,6 +66,10 @@ class FakeController:
     def state_change_rows(self, camera_name):
         return [{"target": camera_name, "prop": "sun.altitude_deg",
                  "before": 55.0, "after": 8.0, "why": ""}]
+
+    def record_artist_feedback(self, camera_name, accepted, rating=None, note=""):
+        self.calls.append(("artist_feedback", camera_name, accepted, rating, note))
+        return {"accepted": accepted}
 
     # engine --------------------------------------------------------
     def make_plan(self, camera_name, log):
@@ -83,9 +88,10 @@ class FakeController:
                 "created": [], "warnings": [], "effect": {"before": 40.0, "after": 80.0}}
 
     def run_match(self, camera_name, log, should_cancel=lambda: False, locks=None,
-                  do_sweep=False, deep=False, start_override=None, director_note=""):
+                  do_sweep=False, deep=False, quality_profile="standard",
+                  start_override=None, director_note=""):
         self.calls.append(("run_match", camera_name, frozenset(locks or set()),
-                           do_sweep, deep))
+                           do_sweep, deep, quality_profile))
         if self.raise_on_match:
             raise self.raise_on_match
         log("matched")
@@ -189,6 +195,65 @@ def test_camera_dropdown_switch(dock):
     assert dock._current_camera() == "CamB"
 
 
+def test_failed_camera_switch_reverts_to_previous_camera(dock, monkeypatch):
+    def gone(name, apply_saved=True, camera_id=""):
+        raise RuntimeError("camera was deleted")
+
+    monkeypatch.setattr(dock.ctrl, "select_camera", gone)
+    dock.cam_combo.setCurrentIndex(1)
+    assert dock._current_camera() == "CamA"
+    assert dock._active_camera == "CamA"
+    assert "camera was deleted" in dock.log.toPlainText()
+
+
+def test_refresh_prefers_active_viewport_camera_when_old_camera_disappears(dock,
+                                                                           monkeypatch):
+    monkeypatch.setattr(dock.ctrl, "cameras", lambda: [
+        {"name": "NewA", "reference": "", "score": None, "active": False},
+        {"name": "NewB", "reference": "", "score": None, "active": True},
+    ])
+    dock.refresh_cameras()
+    assert dock._current_camera() == "NewB"
+
+
+def test_duplicate_camera_names_are_disambiguated_by_identity(dock, monkeypatch):
+    monkeypatch.setattr(dock.ctrl, "cameras", lambda: [
+        {"name": "CamA", "id": "100001", "reference": "", "score": None,
+         "duplicate": True},
+        {"name": "CamA", "id": "100002", "reference": "", "score": None,
+         "duplicate": True},
+        {"name": "CamB", "reference": "", "score": None},
+    ])
+    dock.refresh_cameras()
+    assert dock.cam_combo.count() == 3
+    assert dock.cam_combo.itemText(0) != dock.cam_combo.itemText(1)
+    assert dock.cam_combo.itemData(0, QtCore.Qt.UserRole + 1) == "100001"
+
+
+def test_camera_switch_clears_other_cameras_match_preview(dock):
+    dock.match_thumb.setText("CamA render")
+    dock.cam_combo.setCurrentIndex(1)
+    assert dock.match_thumb.text() == "no match preview"
+
+
+def test_camera_poll_refreshes_open_dock_when_scene_camera_set_changes(dock, monkeypatch):
+    dock._camera_fingerprint = (("1", "CamA", "Physical"),)
+    monkeypatch.setattr(dock.ctrl, "camera_fingerprint",
+                        lambda: (("1", "CamA", "Physical"),
+                                 ("2", "CamB", "Physical")), raising=False)
+    called = []
+    monkeypatch.setattr(dock, "refresh_cameras", lambda: called.append(True))
+    dock._poll_cameras()
+    assert called == [True]
+
+
+def test_artist_accept_and_needs_work_are_recorded_separately(dock):
+    dock._artist_feedback(True)
+    dock._artist_feedback(False)
+    assert ("artist_feedback", "CamA", True, None, "") in dock.ctrl.calls
+    assert ("artist_feedback", "CamA", False, None, "") in dock.ctrl.calls
+
+
 def test_standard_match_runs_plan_then_loop_and_fills_changes(dock):
     dock.cmb_mode.setCurrentIndex(0)
     dock._start_match()
@@ -217,6 +282,13 @@ def test_deep_mode_reaches_engine(dock):
     dock._start_match()
     call = next(c for c in dock.ctrl.calls if c[0] == "run_match")
     assert call[4] is True                                   # deep=True
+
+
+def test_fast_mode_reaches_bounded_profile(dock):
+    dock.cmb_mode.setCurrentIndex(3)
+    dock._start_match()
+    call = next(c for c in dock.ctrl.calls if c[0] == "run_match")
+    assert call[4] is False and call[5] == "fast"
 
 
 def test_locks_and_options_reach_engine(dock):

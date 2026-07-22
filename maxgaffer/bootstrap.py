@@ -1,6 +1,6 @@
 """Launch entry point — the startup macro calls ``maxgaffer.bootstrap.launch()``.
 
-MaxGaffer's hard floor is stdlib-only (the Omega client is urllib, loop-render stats decode
+MaxGaffer's hard floor is stdlib-only (semantic provider clients use urllib, loop-render stats decode
 via the stdlib PNG reader), so unlike MaxDirector there are NO required pip packages.
 Pillow in Max's user-site is optional and self-detected: it upgrades reference ingestion
 (JPEG stats without transcode) and slims LLM payloads.

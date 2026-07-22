@@ -21,7 +21,7 @@ from .genome import LightingState
 
 log = logging.getLogger(__name__)
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 
 def _str_list(value) -> List:
@@ -38,9 +38,28 @@ def sidecar_path(scene_path: str) -> Optional[str]:
     return root + ".maxgaffer.json" if root else None
 
 
+def reference_signature(path: str) -> str:
+    """Stable identity for a reference, including in-place file replacements.
+
+    Artists commonly overwrite ``reference.jpg`` and bind the same path again.  Path-only
+    invalidation kept the old semantic analysis and score in that case.  Nanosecond mtime
+    plus size catches the replacement without reading or hashing a multi-gigabyte EXR.
+    """
+    normalized = os.path.normcase(os.path.abspath(path)) if path else ""
+    try:
+        st = os.stat(path)
+        return f"{normalized}|{st.st_size}|{st.st_mtime_ns}"
+    except OSError:
+        return f"{normalized}|missing"
+
+
 @dataclass
 class CameraEntry:
+    camera_id: str = ""                       # persistent Max anim handle when available
+    camera_name: str = ""                     # display label; may change without losing state
     reference: str = ""                       # reference image path ("" = none bound)
+    reference_relative: str = ""              # portable path relative to the scene folder
+    reference_signature: str = ""             # path + stat identity for in-place changes
     state: Optional[LightingState] = None     # last accepted rig for this camera
     score: Optional[float] = None
     matched_at: str = ""
@@ -50,10 +69,16 @@ class CameraEntry:
     notes: List[str] = field(default_factory=list)  # director's notes, newest last
     seed_hdri: str = ""                             # generated dome-seed .hdr ("" = none)
     pre_seed: Dict = field(default_factory=dict)    # dome texture/rotation before seeding
+    scorecard: Dict = field(default_factory=dict)   # component confidence + honest gap read
+    artist_feedback: List[Dict] = field(default_factory=list)
 
     def to_dict(self) -> Dict:
         return {
+            "camera_id": self.camera_id,
+            "camera_name": self.camera_name,
             "reference": self.reference,
+            "reference_relative": self.reference_relative,
+            "reference_signature": self.reference_signature,
             "state": self.state.to_dict() if self.state else None,
             "score": self.score,
             "matched_at": self.matched_at,
@@ -63,6 +88,8 @@ class CameraEntry:
             "notes": list(self.notes),
             "seed_hdri": self.seed_hdri,
             "pre_seed": dict(self.pre_seed),
+            "scorecard": dict(self.scorecard),
+            "artist_feedback": list(self.artist_feedback),
         }
 
     @classmethod
@@ -77,7 +104,11 @@ class CameraEntry:
         except (TypeError, ValueError):
             score = None
         return cls(
+            camera_id=str(d.get("camera_id") or ""),
+            camera_name=str(d.get("camera_name") or ""),
             reference=str(d.get("reference") or ""),
+            reference_relative=str(d.get("reference_relative") or ""),
+            reference_signature=str(d.get("reference_signature") or ""),
             state=LightingState.from_dict(state) if isinstance(state, dict) else None,
             score=score,
             matched_at=str(d.get("matched_at") or ""),
@@ -87,6 +118,9 @@ class CameraEntry:
             notes=[str(x) for x in _str_list(d.get("notes")) if isinstance(x, str)],
             seed_hdri=str(d.get("seed_hdri") or ""),
             pre_seed=d.get("pre_seed") if isinstance(d.get("pre_seed"), dict) else {},
+            scorecard=d.get("scorecard") if isinstance(d.get("scorecard"), dict) else {},
+            artist_feedback=[dict(x) for x in _str_list(d.get("artist_feedback"))
+                             if isinstance(x, dict)][-50:],
         )
 
 
@@ -146,7 +180,7 @@ class Session:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, RecursionError) as e:
             s._quarantine_corrupt(f"unreadable sidecar ({e})")
             return s
         if not isinstance(d, dict):
@@ -166,7 +200,16 @@ class Session:
                 if not isinstance(entry, dict):
                     continue
                 try:
-                    s.cameras[str(name)] = CameraEntry.from_dict(entry)
+                    loaded = CameraEntry.from_dict(entry)
+                    if not loaded.camera_name:
+                        loaded.camera_name = str(name)
+                    if loaded.reference_relative and path:
+                        candidate = os.path.normpath(os.path.join(
+                            os.path.dirname(path), loaded.reference_relative))
+                        # Prefer the project-relative copy after a project folder move.
+                        if os.path.isfile(candidate):
+                            loaded.reference = candidate
+                    s.cameras[str(name)] = loaded
                 except Exception as e:  # one corrupt camera must not kill the rest
                     log.warning("MaxGaffer: skipping corrupt camera entry %r in %s: %s",
                                 name, path, e)
@@ -227,27 +270,103 @@ class Session:
             return False
 
     # ------------------------------------------------------------------ camera API
-    def entry(self, camera: str) -> CameraEntry:
-        if camera not in self.cameras:
-            self.cameras[camera] = CameraEntry()
-        return self.cameras[camera]
+    def find(self, camera: str, camera_id: str = "") -> Optional[CameraEntry]:
+        """Find by persistent identity first, then by legacy/name key."""
+        if camera_id:
+            for entry in self.cameras.values():
+                if entry.camera_id == str(camera_id):
+                    if camera:
+                        entry.camera_name = camera
+                    return entry
+        direct = self.cameras.get(camera)
+        if direct is not None and (not camera_id or not direct.camera_id
+                                   or direct.camera_id == str(camera_id)):
+            return direct
+        for entry in self.cameras.values():
+            if entry.camera_name == camera and (not camera_id or not entry.camera_id
+                                                or entry.camera_id == str(camera_id)):
+                return entry
+        return None
 
-    def set_reference(self, camera: str, ref_path: str) -> None:
-        e = self.entry(camera)
-        if e.reference != ref_path:
+    def entry(self, camera: str, camera_id: str = "") -> CameraEntry:
+        found = self.find(camera, camera_id)
+        if found is not None:
+            if camera_id and not found.camera_id:
+                found.camera_id = str(camera_id)
+            if camera:
+                found.camera_name = camera
+            return found
+        key = camera
+        if key in self.cameras:
+            key = f"{camera}@@{camera_id or len(self.cameras) + 1}"
+        entry = CameraEntry(camera_id=str(camera_id or ""), camera_name=camera)
+        self.cameras[key] = entry
+        return entry
+
+    def set_reference(self, camera: str, ref_path: str, camera_id: str = "") -> None:
+        e = self.entry(camera, camera_id)
+        rel = ""
+        if ref_path and self.path:
+            try:
+                rel_candidate = os.path.relpath(ref_path, os.path.dirname(self.path))
+                if rel_candidate != os.pardir and not rel_candidate.startswith(os.pardir + os.sep):
+                    rel = rel_candidate
+            except (OSError, ValueError):
+                pass
+        signature = reference_signature(ref_path)
+        if e.reference != ref_path or e.reference_signature != signature:
             e.reference = ref_path
+            e.reference_relative = rel
+            e.reference_signature = signature
             e.semantics = {}          # a new reference invalidates the cached analysis
             e.score = None
 
     def record_match(self, camera: str, state: LightingState,
-                     score: Optional[float]) -> None:
-        e = self.entry(camera)
+                     score: Optional[float], camera_id: str = "") -> None:
+        e = self.entry(camera, camera_id)
         e.state = state.copy()
         e.score = score
         e.matched_at = self._now()
 
+    def record_artist_feedback(self, camera: str, accepted: bool,
+                               rating: Optional[int] = None, note: str = "",
+                               camera_id: str = "") -> Dict:
+        """Persist the human verdict that the numeric score can never infer."""
+        e = self.entry(camera, camera_id)
+        try:
+            stars = min(5, max(1, int(rating))) if rating is not None else None
+        except (TypeError, ValueError):
+            stars = None
+        item = {"at": self._now(), "accepted": bool(accepted),
+                "rating": stars, "note": str(note or "")[:500],
+                "score": e.score, "scorecard": dict(e.scorecard)}
+        e.artist_feedback = (e.artist_feedback + [item])[-50:]
+        return item
+
     def cameras_with_states(self) -> List[str]:
-        return [n for n, e in self.cameras.items() if e.state is not None]
+        return [(e.camera_name or n) for n, e in self.cameras.items() if e.state is not None]
+
+    def relink_references(self, roots: List[str]) -> Dict[str, str]:
+        """Relink missing references by their portable relative path or unique basename."""
+        changed: Dict[str, str] = {}
+        valid_roots = [os.path.abspath(r) for r in roots if r and os.path.isdir(r)]
+        for key, entry in self.cameras.items():
+            if not entry.reference or os.path.isfile(entry.reference):
+                continue
+            candidates: List[str] = []
+            for root in valid_roots:
+                if entry.reference_relative:
+                    candidates.append(os.path.join(root, entry.reference_relative))
+                basename = os.path.basename(entry.reference)
+                candidates.extend(os.path.join(dp, basename) for dp, _dirs, files in os.walk(root)
+                                  if basename in files)
+            hits = [os.path.normpath(p) for p in candidates if os.path.isfile(p)]
+            hits = list(dict.fromkeys(hits))
+            if len(hits) == 1:
+                entry.reference = hits[0]
+                entry.reference_signature = reference_signature(hits[0])
+                changed[entry.camera_name or key] = hits[0]
+        return changed
 
 
 PRESET_VERSION = 1
@@ -263,7 +382,7 @@ def preset_loads(text: str) -> Optional[LightingState]:
     """Parse a preset; None if it isn't one. Values re-clamped by the genome on load."""
     try:
         d = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(d, dict) or "maxgaffer_preset" not in d:
         return None

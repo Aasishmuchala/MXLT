@@ -20,12 +20,14 @@ import subprocess
 import time
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from ..core import (consensus, critic, domeseed, expose, feedback, metrics, omega,
-                    planner, prompts, rules, scenedigest, scenarios as scen)
+from ..core import (animation, consensus, critic, domeseed, expose, feedback, metrics, omega,
+                    planner, profiles, prompts, providers, rules, scenedigest,
+                    scenarios as scen)
 from ..core.director import Hooks, MatchConfig, MatchResult, run_match, run_sun_sweep
 from ..core.genome import LightingState
 from ..core.parse import ParseError, validate_analysis
-from ..core.session import Session, preset_dumps, preset_loads, sidecar_path
+from ..core.session import (Session, preset_dumps, preset_loads, reference_signature,
+                            sidecar_path)
 from . import apply as ap
 from . import config as cfgmod
 from . import digest as dg
@@ -57,6 +59,8 @@ class Controller:
         self._ref_cache: Dict[str, Dict] = {}     # ref path+mtime → stats
         self._run_dir: Optional[str] = None
         self._last_analyze_agreement: Optional[float] = None
+        self._selected_camera_name = ""
+        self._selected_camera_id = ""
         # pure-I/O runner — the UI swaps in a worker-thread pump so gateway waits never
         # freeze Max; pymxs is NEVER called through this (network/subprocess only)
         self.io: Callable = lambda fn: fn()
@@ -109,26 +113,79 @@ class Controller:
 
     def cameras(self) -> List[Dict]:
         cams = sc.list_cameras()
+        active = sc.active_camera_name()
+        active_id = sc.active_camera_identity()
         for c in cams:
-            e = self.session.cameras.get(c["name"])
+            e = self.session.find(c["name"], c.get("id", ""))
+            if e is not None:
+                if c.get("id") and not e.camera_id:
+                    e.camera_id = str(c["id"])
+                e.camera_name = c["name"]
             c["reference"] = e.reference if e else ""
             c["score"] = e.score if e else None
             c["has_state"] = bool(e and e.state)
+            c["active"] = (bool(active_id) and c.get("id") == active_id) or (
+                not active_id and c["name"] == active)
         return cams
 
+    def _camera_id(self, camera_name: str) -> str:
+        if camera_name == self._selected_camera_name and self._selected_camera_id:
+            return self._selected_camera_id
+        matches = [c.get("id", "") for c in sc.list_cameras() if c.get("name") == camera_name]
+        return str(matches[0]) if len(matches) == 1 else ""
+
+    def camera_entry(self, camera_name: str, create: bool = False):
+        camera_id = self._camera_id(camera_name)
+        return (self.session.entry(camera_name, camera_id) if create
+                else self.session.find(camera_name, camera_id))
+
+    def camera_node(self, camera_name: str):
+        camera_id = self._camera_id(camera_name)
+        return (sc.get_camera(camera_name, camera_id) if camera_id
+                else sc.get_camera(camera_name))
+
+    def _set_active_camera(self, camera_name: str) -> bool:
+        camera_id = self._camera_id(camera_name)
+        return (sc.set_active_camera(camera_name, camera_id) if camera_id
+                else sc.set_active_camera(camera_name))
+
+    def bind_reference(self, camera_name: str, path: str) -> None:
+        self.session.set_reference(camera_name, path, self._camera_id(camera_name))
+
+    def _record_match(self, camera_name: str, state: LightingState,
+                      score: Optional[float]) -> None:
+        self.session.record_match(camera_name, state, score, self._camera_id(camera_name))
+
+    def camera_fingerprint(self) -> Tuple:
+        return tuple((c.get("id", ""), c.get("name", ""), c.get("class", ""))
+                     for c in sc.list_cameras())
+
+    def relink_missing_references(self, roots: List[str]) -> Dict[str, str]:
+        changed = self.session.relink_references(roots)
+        if changed:
+            self.save_session()
+        return changed
+
     def read_state(self, camera_name: str = "") -> LightingState:
-        cam = sc.get_camera(camera_name) if camera_name else None
+        cam = self.camera_node(camera_name) if camera_name else None
         return ap.read_state(self.rig(), self._baselines, cam)
 
     def apply_state(self, state: LightingState, camera_name: str = "") -> List[str]:
-        cam = sc.get_camera(camera_name) if camera_name else None
+        cam = self.camera_node(camera_name) if camera_name else None
         return ap.apply_state(self.rig(), self._baselines, state, cam)
 
-    def select_camera(self, camera_name: str, apply_saved: bool = True) -> List[str]:
-        sc.set_active_camera(camera_name)
+    def select_camera(self, camera_name: str, apply_saved: bool = True,
+                      camera_id: str = "") -> List[str]:
+        camera_id = str(camera_id or self._camera_id(camera_name))
+        activated = (sc.set_active_camera(camera_name, camera_id) if camera_id
+                     else sc.set_active_camera(camera_name))
+        if activated is False:
+            raise RuntimeError(f"camera '{camera_name}' is no longer available")
+        self._selected_camera_name = camera_name
+        self._selected_camera_id = camera_id
         warnings: List[str] = []
         if apply_saved and self.session.settings.get("apply_on_select", True):
-            e = self.session.cameras.get(camera_name)
+            e = self.camera_entry(camera_name)
             if e and e.state is not None:
                 warnings = self.apply_state(e.state, camera_name)
             self._rebind_seed(camera_name)     # the dome is scene-global; seeds are not
@@ -139,7 +196,7 @@ class Controller:
         light is applied for viewing or rendering, its own seed must come back, or shot A
         silently renders under shot B's sky. Never touches rotation: the applied state
         owns dome.rotation_deg (only the initial seed bind zeroes it)."""
-        e = self.session.cameras.get(camera_name)
+        e = self.camera_entry(camera_name)
         if not (e and e.seed_hdri) or not os.path.exists(e.seed_hdri):
             return
         dome = self.rig().get("dome")
@@ -176,9 +233,8 @@ class Controller:
         return None
 
     def ref_stats(self, ref_path: str) -> Optional[Dict]:
-        try:
-            key = f"{ref_path}:{os.path.getmtime(ref_path)}"
-        except OSError:
+        key = reference_signature(ref_path)
+        if key.endswith("|missing"):
             return None
         if key in self._ref_cache:
             return self._ref_cache[key]
@@ -198,20 +254,34 @@ class Controller:
         return s
 
     def _transcode_ref(self, ref_path: str) -> Optional[str]:
+        token = _reference_token(ref_path)
         png = os.path.join(self._ensure_run_dir("refs"),
-                           "ref_" + _safe(os.path.basename(ref_path)) + ".png")
+                           "ref_" + _safe(os.path.basename(ref_path)) +
+                           f"_{token}.png")
         out = rd.transcode_to_png(ref_path, png)
         if out:
             prune_old_files(os.path.dirname(png), keep=int(self.cfg.keep_runs))
         return out
 
     # ------------------------------------------------------------------ LLM plumbing
+    def _semantic_call(self, system: str, messages: list, max_tokens: int) -> str:
+        return providers.call(
+            self.cfg.semantic_provider, self.cfg.api_key, system, messages,
+            model=self.cfg.model, max_tokens=max_tokens,
+            base_url=self.cfg.semantic_base_url,
+        )
+
+    def _critic_weights(self) -> Dict[str, float]:
+        return critic.weights_for(self.cfg.artist_preference, self.cfg.critic_weights)
+
     def _image_block(self, path: str) -> Optional[dict]:
         """Payload-slim image block: Pillow in-process → sidecar --b64 → raw file (small
         renders) → Max transcode to PNG. EXR/HDR/TIFF skip straight to Max transcode."""
         if _needs_max_ingest(path):
+            token = _reference_token(path)
             png = os.path.join(self._ensure_run_dir("refs"),
-                               "llm_" + _safe(os.path.basename(path)) + ".png")
+                               "llm_" + _safe(os.path.basename(path)) +
+                               f"_{token}.png")
             if rd.transcode_to_png(path, png, max_dim=768):
                 prune_old_files(os.path.dirname(png), keep=int(self.cfg.keep_runs))
                 return omega.image_block_from_file(png)
@@ -253,7 +323,8 @@ class Controller:
         except OSError:
             return None
         png = os.path.join(self._ensure_run_dir("refs"),
-                           "llm_" + os.path.basename(path) + ".png")
+                           "llm_" + _safe(os.path.basename(path)) + "_" +
+                           _reference_token(path) + ".png")
         if rd.transcode_to_png(path, png, max_dim=768):
             prune_old_files(os.path.dirname(png), keep=int(self.cfg.keep_runs))
             return omega.image_block_from_file(png)
@@ -261,9 +332,20 @@ class Controller:
 
     def analyze_reference(self, camera_name: str) -> Dict:
         """ANALYZE call (cached in the session until the reference changes)."""
-        e = self.session.entry(camera_name)
+        e = self.camera_entry(camera_name, create=True)
         if not e.reference:
             raise RuntimeError("no reference image bound to this camera")
+        current_signature = reference_signature(e.reference)
+        if e.reference_signature != current_signature:
+            if not e.reference_signature and e.semantics:
+                # Backward-compatible adoption for v1 sidecars written before signatures
+                # existed.  An explicit Load/swap still invalidates via set_reference().
+                e.reference_signature = current_signature
+            else:
+                # Same path, new pixels: never reuse the previous image's analysis/score.
+                e.reference_signature = current_signature
+                e.semantics = {}
+                e.score = None
         if e.semantics:
             # cached read — clear any stale contest flag so a LATER camera's run never
             # logs this camera's (or an older run's) disagreement
@@ -273,6 +355,7 @@ class Controller:
         # flag must never attach its warning to a run it doesn't describe
         self._last_analyze_agreement = None
         ref_path = e.reference   # pinned: the gateway waits below are click-windows
+        ref_signature = e.reference_signature
         block = self._image_block(ref_path)
         if block is None:
             raise RuntimeError(f"could not read reference image: {ref_path}")
@@ -285,9 +368,8 @@ class Controller:
         n = max(1, int(self.cfg.analyze_samples))
         last_reply = ""
         for _ in range(n):
-            last_reply = self.io(lambda: omega.call(
-                self.cfg.api_key, prompts.ANALYZE_SYSTEM, messages,
-                model=self.cfg.model, max_tokens=2048))
+            last_reply = self.io(lambda: self._semantic_call(
+                prompts.ANALYZE_SYSTEM, messages, 2048))
             try:
                 samples.append(validate_analysis(last_reply))
             except ParseError:
@@ -297,12 +379,12 @@ class Controller:
                 {"role": "assistant", "content": last_reply[:1500]},
                 {"role": "user", "content": "That was not valid JSON. Reply with ONLY the "
                                             "JSON object, nothing else."}]
-            samples.append(validate_analysis(self.io(lambda: omega.call(
-                self.cfg.api_key, prompts.ANALYZE_SYSTEM, retry,
-                model=self.cfg.model, max_tokens=2048))))
+            samples.append(validate_analysis(self.io(lambda: self._semantic_call(
+                prompts.ANALYZE_SYSTEM, retry, 2048))))
         semantics = consensus.consolidate_analyses(samples)
         agreement = semantics.pop("consensus_agreement", 1.0)   # kept out of the cache
-        if e.reference != ref_path:
+        if (e.reference != ref_path or e.reference_signature != ref_signature
+                or reference_signature(ref_path) != ref_signature):
             # the reference was swapped during a gateway wait — caching the OLD image's
             # read against the NEW path would poison every later run of this camera
             raise RuntimeError("reference image changed while analyzing — run again to "
@@ -336,10 +418,9 @@ class Controller:
                 ctx.get("rig_notes", ""), ctx.get("param_history", ""),
                 ctx.get("director_note", ""))))
             try:
-                return self.io(lambda: omega.call(
-                    self.cfg.api_key, prompts.DELTAS_SYSTEM,
-                    [{"role": "user", "content": content}],
-                    model=self.cfg.model, max_tokens=2048))
+                return self.io(lambda: self._semantic_call(
+                    prompts.DELTAS_SYSTEM,
+                    [{"role": "user", "content": content}], 2048))
             except (omega.OmegaError, RuntimeError) as err:
                 self._llm_down = True
                 return ('{"assessment": "LLM offline (%s) — analytic-only from here", '
@@ -354,7 +435,7 @@ class Controller:
             return self.analyze_reference(camera_name)
         except (omega.OmegaError, RuntimeError) as err:
             self._llm_down = True
-            e = self.session.cameras.get(camera_name)
+            e = self.camera_entry(camera_name)
             if e is not None and e.semantics:
                 log(f"⚠ gateway unavailable ({err}) — using this camera's cached analysis")
                 return e.semantics
@@ -368,13 +449,13 @@ class Controller:
         PLAN (validated, digest-grounded ops). Returns (ops, lines, meta, raw_digest),
         or None when the model replied junk twice — a PLAN failure degrades to
         "no plan" so the match proceeds plan-less (unlike ANALYZE, which fails loud)."""
-        e = self.session.entry(camera_name)
+        e = self.camera_entry(camera_name, create=True)
         if not e.reference:
             raise RuntimeError("bind a reference image to this camera first")
         # snapshot the genome part BEFORE the plan touches anything — Restore pre-match
         # must return to the true starting light (the plan itself is one Ctrl+Z)
         e.pre_match = ap.read_state(self.rig(refresh=True), self._baselines,
-                                    sc.get_camera(camera_name))
+                                    self.camera_node(camera_name))
         self._plan_snapped = camera_name
         self.save_session()
         log("reading the scene — every renderer/environment/exposure/light/camera setting…")
@@ -389,8 +470,7 @@ class Controller:
             raise RuntimeError("reference image could not be prepared for the LLM")
         text = planner.plan_user_text(scenedigest.to_text(raw), semantics, camera_name)
         messages = [{"role": "user", "content": [ref_block, omega.text_block(text)]}]
-        reply = self.io(lambda: omega.call(self.cfg.api_key, planner.PLAN_SYSTEM, messages,
-                                           model=self.cfg.model, max_tokens=4096))
+        reply = self.io(lambda: self._semantic_call(planner.PLAN_SYSTEM, messages, 4096))
         try:
             ops, rejected, meta = planner.validate_plan(reply, cat)
         except ParseError:
@@ -399,9 +479,8 @@ class Controller:
                 {"role": "user", "content": "That was not valid JSON. Reply with ONLY the "
                                             "JSON object, nothing else."}]
             try:
-                ops, rejected, meta = planner.validate_plan(self.io(lambda: omega.call(
-                    self.cfg.api_key, planner.PLAN_SYSTEM, retry,
-                    model=self.cfg.model, max_tokens=4096)), cat)
+                ops, rejected, meta = planner.validate_plan(self.io(
+                    lambda: self._semantic_call(planner.PLAN_SYSTEM, retry, 4096)), cat)
             except ParseError:
                 log("⚠ plan reply was invalid JSON twice — plan skipped, continuing "
                     "with the match loop")
@@ -495,11 +574,11 @@ class Controller:
         — the cheap 'did that help?' measurement."""
         if getattr(self.cfg, "no_renders", False):
             return None                    # no-render mode: plans apply unmeasured
-        e = self.session.cameras.get(camera_name)
+        e = self.camera_entry(camera_name)
         if not (e and e.reference):
             return None
         ref = self.ref_stats(e.reference)
-        cam = sc.get_camera(camera_name)
+        cam = self.camera_node(camera_name)
         if ref is None or cam is None:
             return None
         path = self._render_exposed(
@@ -508,7 +587,7 @@ class Controller:
         cur = self.stats_for(path) if path else None
         if cur is None:
             return None
-        return critic.score(ref, cur, self.cfg.critic_weights or None).score
+        return critic.score(ref, cur, self._critic_weights()).score
 
     def execute_plan(self, ops, camera_name: str,
                      log: Callable[[str], None], measure: bool = True) -> Dict:
@@ -517,7 +596,7 @@ class Controller:
         (critic score before vs after, one probe render each side). Rig re-classified
         after so new lights join the dimmer boards immediately."""
         before_score = self.probe_score(camera_name, "preplan") if measure else None
-        cam = sc.get_camera(camera_name)
+        cam = self.camera_node(camera_name)
         report = ex.execute_plan(ops, cam)
         for c in report["changes"]:
             log(f"  {c['target']} · {c['prop']}: {c['before']} → {c['after']}")
@@ -537,7 +616,7 @@ class Controller:
 
     def state_change_rows(self, camera_name: str) -> List[Dict]:
         """pre-match → current saved state, as popup rows (the classic loop's report)."""
-        e = self.session.cameras.get(camera_name)
+        e = self.camera_entry(camera_name)
         if not (e and e.pre_match is not None and e.state is not None):
             return []
         rows = []
@@ -545,6 +624,29 @@ class Controller:
             rows.append({"target": camera_name, "prop": key,
                          "before": round(before, 2), "after": round(after, 2), "why": ""})
         return rows
+
+    def record_artist_feedback(self, camera_name: str, accepted: bool,
+                               rating: Optional[int] = None, note: str = "") -> Dict:
+        item = self.session.record_artist_feedback(
+            camera_name, accepted, rating, note, self._camera_id(camera_name))
+        self.save_session()
+        return item
+
+    def bake_lighting_animation(self, camera_name: str, keyframes,
+                                step: int = 1, easing: str = "smooth") -> Dict:
+        """Interpolate sparse ``(frame, LightingState)`` keys and bake them into Max."""
+        cam = self.camera_node(camera_name)
+        if cam is None:
+            raise RuntimeError(f"camera '{camera_name}' not found in the scene")
+        sampled = animation.sample_keyframes(keyframes, step=step, easing=easing)
+        if not sampled:
+            raise RuntimeError("animation needs at least one lighting keyframe")
+        warnings = ap.bake_animation(self.rig(refresh=True), self._baselines,
+                                     sampled, cam)
+        return {"camera": camera_name, "keys": len(sampled),
+                "start": sampled[0][0], "end": sampled[-1][0],
+                "step": max(1, int(step)), "easing": easing,
+                "warnings": warnings}
 
     # ------------------------------------------------------------------ the headline act
     def run_match(
@@ -555,17 +657,18 @@ class Controller:
         locks: Optional[set] = None,
         do_sweep: bool = False,
         deep: bool = False,
+        quality_profile: str = "standard",
         start_override: Optional[LightingState] = None,
         director_note: str = "",
     ) -> MatchResult:
-        e = self.session.entry(camera_name)
+        e = self.camera_entry(camera_name, create=True)
         if not e.reference:
             raise RuntimeError("bind a reference image to this camera first")
         rig = self.rig(refresh=True)
-        cam = sc.get_camera(camera_name)
+        cam = self.camera_node(camera_name)
         if cam is None:
             raise RuntimeError(f"camera '{camera_name}' not found in the scene")
-        sc.set_active_camera(camera_name)
+        self._set_active_camera(camera_name)
         # checklist #14 is a CRASH vector, not a perf note: V-Ray GPU loop renders while
         # a Vantage live link streams the same scene can VRAM-starve the one card and
         # take Max down. Detect the combination and say so BEFORE the first render.
@@ -660,6 +763,23 @@ class Controller:
         try:
             self._verify_exposure_host(cam, run_dir, log)
 
+            profile = profiles.resolve_profile(
+                "hero" if deep else quality_profile,
+                loop_width=self.cfg.loop_width,
+                loop_height=self.cfg.loop_height,
+                max_iterations=self.cfg.max_iterations,
+                sweep_count=self.cfg.sweep_count,
+                target_score=self.cfg.target_score,
+            )
+            sweep_part = profile.sweep_count if do_sweep else 0
+            polish_part = profile.polish_max_probes if profile.polish else 0
+            hard_cap = profile.max_iterations + sweep_part + polish_part
+            log(f"{profile.label.upper()} PROFILE: {profile.loop_width}×"
+                f"{profile.loop_height} loop · ≤{profile.max_iterations} iterations"
+                + (f" · ≤{sweep_part} low-res sweep renders" if sweep_part else "")
+                + (f" · ≤{polish_part} polish probes" if polish_part else "")
+                + f" · hard worst-case ≤{hard_cap} renders")
+
             # software exposure: apply the just-applied state's EV/WB to each loop frame
             # before it's scored, anchored at the camera's pre_match snapshot (the same
             # anchor probes/board/finals use, so all exposed pixels stay consistent)
@@ -671,9 +791,12 @@ class Controller:
                     "(renderer-independent; V-Ray GPU's exposure is display-stage only)")
 
             def render_hook(tag: str):
+                is_sweep = tag.startswith("sweep")
+                width = profile.sweep_width if is_sweep else profile.loop_width
+                height = profile.sweep_height if is_sweep else profile.loop_height
                 path = self._render_exposed(
                     cam, os.path.join(run_dir, f"{tag}.png"),
-                    self.cfg.loop_width, self.cfg.loop_height,
+                    width, height,
                     state=getattr(self, "_sw_state", None) or start, entry=e, log=log)
                 if path:
                     log(f"THUMB::{path}")   # UI renders these markers as inline thumbnails
@@ -700,9 +823,10 @@ class Controller:
 
             if do_sweep and start_override is None and rig.get("sun") is not None \
                     and "sun.azimuth_deg" not in locks:
-                log(f"sun sweep: {self.cfg.sweep_count} directions…")
+                log(f"sun sweep: {profile.sweep_count} directions at "
+                    f"{profile.sweep_width}×{profile.sweep_height}…")
                 az, alt_hint, _why = run_sun_sweep(
-                    start, rules.sweep_azimuths(self.cfg.sweep_count), hooks,
+                    start, rules.sweep_azimuths(profile.sweep_count), hooks,
                     llm_pick=lambda paths, azs: self._sweep_call(ref_block, paths, azs),
                     ref_stats=ref_stats)
                 if az is not None:
@@ -717,16 +841,17 @@ class Controller:
                             f"{start.get('sun.altitude_deg'):.0f}° ('{alt_hint}')")
 
             cfg = MatchConfig(
-                max_iterations=(max(int(self.cfg.max_iterations), 10) if deep
-                                else int(self.cfg.max_iterations)),
-                target_score=99.0 if deep else float(self.cfg.target_score),
+                max_iterations=profile.max_iterations,
+                target_score=profile.target_score,
                 analytic=ref_stats is not None,
-                weights=self.cfg.critic_weights or None,
-                polish=deep,
+                weights=self._critic_weights(),
+                polish=profile.polish,
+                polish_rounds=profile.polish_rounds,
+                polish_max_probes=profile.polish_max_probes,
             )
-            if deep:
-                log(f"DEEP MATCH: target 99 · up to {cfg.max_iterations} iterations · "
-                    "coordinate-descent polish to the scene's ceiling afterwards")
+            if profile.polish:
+                log("HERO MATCH: target 99 · bounded coordinate-descent polish "
+                    "to the measured scene ceiling")
             result = run_match(start, ref_stats, semantics, hooks, cfg, locks,
                                rig_notes="; ".join(rig.get("notes", [])),
                                director_note=director_note)
@@ -746,11 +871,27 @@ class Controller:
             log(f"match {result.stop_reason} before any successful render — "
                 "no measurement, kept previous lighting")
         else:
-            self.session.record_match(camera_name, result.best_state, result.best_score)
+            self._record_match(camera_name, result.best_state, result.best_score)
+        if result.best_score is not None:
+            result.scorecard = critic.scorecard(
+                result.best_score, result.best_components,
+                ceiling_proven=result.ceiling_proven,
+                ceiling_converged=result.ceiling_converged)
+            e.scorecard = dict(result.scorecard)
+            card = result.scorecard
+            weak = ", ".join(card["weakest"]) or "none measured"
+            log(f"scorecard: {card['confidence']} confidence · weakest: {weak} · "
+                f"metric coverage {card['coverage']:.0%}")
+            if card["content_gap"]:
+                log("diagnosis: remaining gap is likely scene content/material/albedo, "
+                    "not a lighting control the optimizer can solve")
+            log("scorecard warning: score measures tone/color/direction statistics; "
+                "artist acceptance is separate")
         self._save_or_warn(log)
         try:   # the calibration trail: every run leaves a machine-readable record
             with open(os.path.join(run_dir, "run.json"), "w", encoding="utf-8") as f:
                 json.dump({"camera": camera_name, "reference": e.reference,
+                           "quality_profile": profile.name,
                            "semantics": semantics, "llm_down": bool(self._llm_down),
                            **result.to_summary()}, f, indent=1)
         except (OSError, TypeError, ValueError):
@@ -789,7 +930,7 @@ class Controller:
         else:
             log(f"verified by read-back: {len(changes)} setting(s) applied, "
                 "0 renders fired")
-        self.session.record_match(camera_name, start, None)
+        self._record_match(camera_name, start, None)
         self.save_session()
         result = MatchResult(best_state=start, best_score=None, best_render=None,
                              stop_reason="applied (no-render mode)")
@@ -816,7 +957,7 @@ class Controller:
         winner continues into a deep match with the note pinned into every prompt.
         ``locks`` is the UI's CURRENT lock selection (run_match's convention); None
         falls back to the camera's persisted locks."""
-        e = self.session.entry(camera_name)
+        e = self.camera_entry(camera_name, create=True)
         if not e.reference:
             raise RuntimeError("bind a reference image to this camera first")
         if len(note) > MAX_NOTE_CHARS:
@@ -827,10 +968,10 @@ class Controller:
         combined = " · ".join(e.notes[-3:])
         locks = set(locks if locks is not None else e.locks)
         rig = self.rig(refresh=True)
-        cam = sc.get_camera(camera_name)
+        cam = self.camera_node(camera_name)
         if cam is None:
             raise RuntimeError(f"camera '{camera_name}' not found")
-        sc.set_active_camera(camera_name)
+        self._set_active_camera(camera_name)
         run_dir = self._new_run_dir(camera_name)
         self._llm_down = False
         semantics = self._analyze_or_fallback(camera_name, log)  # re-analyzes on ref swap
@@ -883,8 +1024,7 @@ class Controller:
             stats = self.stats_for(path) if path else None
             if stats is None or ref_stats is None:
                 return None, path
-            return critic.score(ref_stats, stats,
-                                self.cfg.critic_weights or None).score, path
+            return critic.score(ref_stats, stats, self._critic_weights()).score, path
 
         score0, path0 = probe(state0, "refine_note")
         log(f"branch note-only: {score0:.1f}" if score0 is not None
@@ -904,11 +1044,9 @@ class Controller:
                 state_table(state0, locks), semantics, [], {}, 0, 1,
                 "; ".join(rig.get("notes", [])), "", combined)))
             try:
-                reply = self.io(lambda: omega.call(
-                    self.cfg.api_key,
+                reply = self.io(lambda: self._semantic_call(
                     feedback.lens_system(prompts.DELTAS_SYSTEM, lens_line),
-                    [{"role": "user", "content": content}],
-                    model=self.cfg.model, max_tokens=2048))
+                    [{"role": "user", "content": content}], 2048))
                 proposal = validate_deltas(reply)
             except Exception as err:  # noqa: BLE001 a dead lens must not kill the round
                 log(f"lens {lens_name}: unusable ({err})")
@@ -974,11 +1112,11 @@ class Controller:
         the reference when one is bound, and leave the scene exactly as it was found.
         → [{key, label, why, state, render, score}] in board order."""
         rig = self.rig(refresh=True)
-        cam = sc.get_camera(camera_name)
+        cam = self.camera_node(camera_name)
         if cam is None:
             raise RuntimeError(f"camera '{camera_name}' not found in the scene")
-        sc.set_active_camera(camera_name)
-        e = self.session.entry(camera_name)
+        self._set_active_camera(camera_name)
+        e = self.camera_entry(camera_name, create=True)
         semantics: Optional[Dict] = None
         if e.reference:
             try:
@@ -1019,8 +1157,7 @@ class Controller:
                     if ref is not None:
                         cur = self.stats_for(path)
                         if cur is not None:
-                            score = critic.score(ref, cur,
-                                                 self.cfg.critic_weights or None).score
+                            score = critic.score(ref, cur, self._critic_weights()).score
                 log(f"scenario {cand['label']}: "
                     + (f"{score:.1f}" if score is not None else "unscored")
                     + f" — {cand['why']}")
@@ -1040,7 +1177,7 @@ class Controller:
         """Apply a board candidate and save it as the camera's state — MATCH/REFINE
         continue from it exactly like any matched state. Returns apply warnings."""
         warnings = self.apply_state(state, camera_name)
-        self.session.record_match(camera_name, state, score)
+        self._record_match(camera_name, state, score)
         self.save_session()
         return warnings
 
@@ -1049,7 +1186,7 @@ class Controller:
         """Reference → world-oriented HDR pano → dome texture, rotation zeroed (the pano
         is world-aligned; dome.rotation_deg stays live for the loop to spin). The dome's
         previous texture/rotation is snapshotted once for Restore. → build_seed meta."""
-        e = self.session.entry(camera_name)
+        e = self.camera_entry(camera_name, create=True)
         if not e.reference:
             raise RuntimeError("bind a reference image first — the seed is built from it")
         rig = self.rig(refresh=True)
@@ -1057,7 +1194,7 @@ class Controller:
         if dome is None:
             raise RuntimeError("no VRayLight dome in the rig — add one (or let a plan "
                                "create it), Read scene, then seed")
-        cam = sc.get_camera(camera_name)
+        cam = self.camera_node(camera_name)
         semantics = self.analyze_reference(camera_name)
         # sun placement: the camera's matched/current rig wins over the semantics guess
         st = e.state or ap.read_state(rig, self._baselines, cam)
@@ -1095,14 +1232,16 @@ class Controller:
         meta = domeseed.build_seed(out, ref_path=src, semantics=semantics,
                                    cam_yaw_deg=yaw, sun_az_deg=sun_az,
                                    sun_alt_deg=sun_alt,
-                                   parametric_sun_active=parametric)
+                                   parametric_sun_active=parametric,
+                                   blur_passes=self.cfg.seed_blur_passes)
         if meta is None and src == e.reference:   # plain loader failed (JPEG, no Pillow)
             png = self._transcode_ref(e.reference)
             if png:
                 meta = domeseed.build_seed(out, ref_path=png, semantics=semantics,
                                            cam_yaw_deg=yaw, sun_az_deg=sun_az,
                                            sun_alt_deg=sun_alt,
-                                           parametric_sun_active=parametric)
+                                           parametric_sun_active=parametric,
+                                           blur_passes=self.cfg.seed_blur_passes)
         if meta is None:
             raise RuntimeError("could not read the reference for seeding")
         how = self.set_dome_hdri(out)
@@ -1130,7 +1269,7 @@ class Controller:
         self.save_session()
         sun = meta.get("sun")
         log(f"dome seed: {os.path.basename(out)} ({meta['source']}, {how}, "
-            f"rotation zeroed via {rot_how})")
+            f"{meta.get('reflection_quality', 'sharp')}, rotation zeroed via {rot_how})")
         if sun:
             log(f"dome seed: sun disc at az {sun['azimuth_deg']:.0f}° / "
                 f"alt {sun['altitude_deg']:.0f}° ({sun['kelvin']:.0f}K)")
@@ -1160,12 +1299,20 @@ class Controller:
             raise RuntimeError(f"not a MaxGaffer preset: {path}")
         warnings = self.apply_state(state, camera_name)
         if camera_name:
-            self.session.record_match(camera_name, state, None)
+            self._record_match(camera_name, state, None)
             self.save_session()
         return warnings
 
-    def set_dome_hdri(self, hdri_path: str) -> str:
-        dome = self.rig().get("dome")
+    def set_dome_hdri(self, hdri_path: str, role_index: int = 0) -> str:
+        """Bind an HDRI to a role-sorted dome (0=primary, 1=reflection/fill, …)."""
+        rig = self.rig()
+        domes = list(rig.get("domes") or [])
+        if not domes and rig.get("dome") is not None:
+            domes = [rig["dome"]]
+        try:
+            dome = domes[int(role_index)]
+        except (IndexError, TypeError, ValueError):
+            dome = None
         if dome is None:
             return "failed"
         with self._dome_undo():
@@ -1186,10 +1333,9 @@ class Controller:
                 content.append(block)
         content.append(omega.text_block(prompts.sweep_user_text(azimuths)))
         try:
-            return self.io(lambda: omega.call(
-                self.cfg.api_key, prompts.SWEEP_SYSTEM,
-                [{"role": "user", "content": content}],
-                model=self.cfg.model, max_tokens=1024))
+            return self.io(lambda: self._semantic_call(
+                prompts.SWEEP_SYSTEM,
+                [{"role": "user", "content": content}], 1024))
         except (omega.OmegaError, RuntimeError):
             self._llm_down = True
             return ""      # run_sun_sweep falls back to the contrastive-metric winner
@@ -1225,7 +1371,7 @@ class Controller:
         the pre-seed dome texture/rotation (when a seed replaced them — reachable even
         with NO pre_match, so a seed-only session is restorable too), and the exposure
         control WE auto-created. Returns False when there is nothing to restore."""
-        e = self.session.cameras.get(camera_name)
+        e = self.camera_entry(camera_name)
         if e is None or (e.pre_match is None and not e.pre_seed):
             return False
         if e.pre_match is not None:
@@ -1293,7 +1439,7 @@ class Controller:
             for name in camera_names:
                 on_progress(name, "applying + exporting")
                 if use_saved_states:
-                    e = self.session.cameras.get(name)
+                    e = self.camera_entry(name)
                     if e and e.state is not None:
                         self.apply_state(e.state, name)
                     self._rebind_seed(name)    # each vrscene must carry ITS camera's sky
@@ -1364,7 +1510,7 @@ class Controller:
                     break
                 try:
                     on_progress(name, "applying state")
-                    e = self.session.cameras.get(name)
+                    e = self.camera_entry(name)
                     if e and e.state is not None:
                         self.apply_state(e.state, name)
                     self._rebind_seed(name)    # finals render under their own seed too
@@ -1409,6 +1555,10 @@ class Controller:
         jobs = self.prepare_vantage_jobs(camera_names, cfgmod.sessions_dir(), on_progress,
                                          use_saved_states=True)
         export_dir = os.path.dirname(jobs[0]["scene_file"]) if jobs else ""
+        manifest = vt.write_queue_manifest(export_dir, jobs,
+                                           self.cfg.final_width, self.cfg.final_height)
+        if manifest:
+            on_progress("", f"queue manifest ready: {manifest}")
         launched = vt.launch_vantage(self.cfg.vantage_exe,
                                      jobs[0]["scene_file"] if jobs else None)
         return jobs, launched, export_dir
@@ -1519,6 +1669,18 @@ def _safe(name: str) -> str:
     if s.split(".", 1)[0].lower() in _RESERVED_NAMES:
         s = "_" + s
     return s
+
+
+def _reference_token(path: str) -> str:
+    """Short cache-buster for transcoded references.
+
+    Max and Qt both cache decoded bitmaps by filename.  Including the source identity in
+    the output path prevents a replaced image (or two folders containing ``ref.exr``)
+    from displaying or uploading an older transcode.
+    """
+    import hashlib
+
+    return hashlib.md5(reference_signature(path).encode("utf-8", "replace")).hexdigest()[:10]
 
 
 def _stamp() -> str:

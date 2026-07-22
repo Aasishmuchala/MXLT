@@ -119,7 +119,7 @@ def restore_draft() -> List[str]:
         try:
             with open(SNAPSHOT_PATH, "r", encoding="utf-8") as f:
                 snapshot = json.load(f)
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             return ["draft: snapshot unreadable — render settings may need a manual check"]
         r = _renderer()
         if r is not None and isinstance(snapshot, dict):

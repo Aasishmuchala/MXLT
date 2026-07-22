@@ -71,12 +71,13 @@ def test_api_imports_and_exposes_contract():
 
     assert set(api.__all__) == {"match_camera", "match_all_cameras", "apply_camera_state",
                                 "render_cameras", "export_vrscenes_for_vantage",
-                                "get_controller",
-                                "seed_dome", "scenario_board", "adopt_scenario"}
+                                    "get_controller",
+                                    "seed_dome", "scenario_board", "adopt_scenario",
+                                    "bake_lighting_animation"}
     sig = inspect.signature(api.match_camera)
     assert list(sig.parameters) == ["camera_name", "reference_path", "log",
                                     "should_cancel", "locks", "sweep", "deep",
-                                    "config_overrides"]
+                                        "quality_profile", "config_overrides"]
 
 
 # --------------------------------------------------------------- config completeness

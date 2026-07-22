@@ -25,6 +25,7 @@ GATEWAY_URL = "https://omega.kesarcloud.in/v1/messages"
 TIMEOUT_S = 120
 BACKOFF_S = (2.0, 6.0, 15.0)
 DEFAULT_MODEL = "claude-opus-4-8"
+MAX_JSON_SCAN_CHARS = 16_000_000   # fuzz contract accepts a valid 10 MB object
 
 
 class OmegaError(RuntimeError):
@@ -47,37 +48,47 @@ def extract_text(payload: dict) -> str:
 
 
 def parse_json_from_text(text: str) -> Optional[dict]:
-    """First balanced top-level {...} object in the reply — thinking spill or stray prose
-    around the JSON must not break parsing."""
-    start = text.find("{")
-    while start != -1:
-        depth = 0
-        in_str = False
-        esc = False
-        for i in range(start, len(text)):
-            ch = text[i]
-            if in_str:
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == '"':
-                    in_str = False
+    """First balanced top-level ``{...}`` object, found in one linear scan.
+
+    Restarting at every opening brace made a hostile brace flood quadratic and capable of
+    freezing Max.  A character cap also bounds work if a provider ignores token limits.
+    """
+    if not isinstance(text, str) or len(text) > MAX_JSON_SCAN_CHARS:
+        return None
+    start = None
+    depth = 0
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if start is None:
+            if ch == "{":
+                start = i
+                depth = 1
+                in_str = False
+                esc = False
+            continue
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
             elif ch == '"':
-                in_str = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        obj = json.loads(text[start:i + 1])
-                        if isinstance(obj, dict):
-                            return obj
-                    except json.JSONDecodeError:
-                        break
-                    break
-        start = text.find("{", start + 1)
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    obj = json.loads(text[start:i + 1])
+                    if isinstance(obj, dict):
+                        return obj
+                except (json.JSONDecodeError, RecursionError):
+                    pass
+                start = None
     return None
 
 
@@ -138,7 +149,7 @@ def call(
             if 200 <= status < 300:
                 try:
                     payload = json.loads(text_body)
-                except ValueError:
+                except (ValueError, RecursionError):
                     payload = {}
                 text = extract_text(payload)
                 if text:

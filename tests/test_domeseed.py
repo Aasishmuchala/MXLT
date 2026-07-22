@@ -162,6 +162,7 @@ def test_build_seed_sunny_end_to_end(tmp_path):
     meta = domeseed.build_seed(out, ref_path=ref, semantics=sem, cam_yaw_deg=30.0,
                                out_w=64, out_h=32)
     assert meta is not None and meta["source"] == "reference"
+    assert meta["reflection_quality"] == "sharp" and meta["blur_passes"] == 0
     assert meta["sun"] is not None
     # bearing −45 from yaw 30 → world azimuth 345
     assert abs(meta["sun"]["azimuth_deg"] - 345.0) < 1e-6
@@ -174,7 +175,22 @@ def test_build_seed_sunny_end_to_end(tmp_path):
     out2 = str(tmp_path / "seed2.hdr")
     domeseed.build_seed(out2, ref_path=ref, semantics=sem, cam_yaw_deg=30.0,
                         out_w=64, out_h=32)
-    assert open(out, "rb").read() == open(out2, "rb").read()
+    with open(out, "rb") as first, open(out2, "rb") as second:
+        assert first.read() == second.read()
+
+
+def test_build_seed_lighting_blur_is_explicit_opt_in(tmp_path):
+    ref = _make_ref(tmp_path, "checker.png",
+                    lambda x, y: (255, 20, 20) if (x // 4) % 2 else (20, 20, 255))
+    sharp_path = str(tmp_path / "sharp.hdr")
+    blur_path = str(tmp_path / "blur.hdr")
+    sharp = domeseed.build_seed(sharp_path, ref_path=ref, out_w=64, out_h=32)
+    blurred = domeseed.build_seed(blur_path, ref_path=ref, out_w=64, out_h=32,
+                                  blur_passes=2)
+    assert sharp["reflection_quality"] == "sharp"
+    assert blurred["reflection_quality"] == "lighting_blur"
+    with open(sharp_path, "rb") as sharp_file, open(blur_path, "rb") as blur_file:
+        assert sharp_file.read() != blur_file.read()
 
 
 def test_build_seed_overcast_has_no_disc(tmp_path):

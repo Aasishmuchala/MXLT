@@ -36,7 +36,9 @@ def _load_pixels(path: str, max_dim: int = 256):
             im = im.convert("RGB")
             im.thumbnail((max_dim, max_dim))
             w, h = im.size
-            return list(im.getdata()), w, h
+            pixels = (im.get_flattened_data() if hasattr(im, "get_flattened_data")
+                      else im.getdata())
+            return list(pixels), w, h
     except Exception:
         pass
     from . import png_min

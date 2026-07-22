@@ -17,6 +17,7 @@ VERIFIED against Chaos docs/forums 2026-07-16, for Vantage 3.x:
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -242,6 +243,43 @@ def launch_vantage(vantage_exe: str, scene_file: Optional[str] = None) -> bool:
         return True
     except Exception:
         return False
+
+
+def write_queue_manifest(export_dir: str, jobs: List[Dict],
+                         width: int, height: int) -> Optional[str]:
+    """Write an ordered, machine-readable handoff for stock Vantage's in-app queue."""
+    if not export_dir:
+        return None
+    try:
+        os.makedirs(export_dir, exist_ok=True)
+    except OSError:
+        return None
+    manifest = os.path.join(export_dir, "vantage_queue.json")
+    payload = {
+        "format": 1,
+        "renderer": "Chaos Vantage in-app Batch Render",
+        "requires_in_app_queue": True,
+        "resolution": {"width": int(width), "height": int(height)},
+        "jobs": [{"order": index + 1,
+                  "camera": str(job.get("camera") or ""),
+                  "scene_file": os.path.abspath(str(job.get("scene_file") or "")),
+                  "output": os.path.abspath(str(job.get("output") or "")),
+                  "status": "ready_for_vantage_queue"}
+                 for index, job in enumerate(jobs)],
+    }
+    try:
+        with open(manifest, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2)
+        instructions = os.path.join(export_dir, "VANTAGE_BATCH_INSTRUCTIONS.txt")
+        with open(instructions, "w", encoding="utf-8") as stream:
+            stream.write(
+                "MaxGaffer prepared these scenes in render order.\n"
+                "In Chaos Vantage, open Batch Render, add the .vrscene files in the "
+                "manifest order, set the listed resolution/output paths, and start.\n"
+                "Stock Vantage 3.x does not expose this queue as a normal headless API.\n")
+        return manifest
+    except OSError:
+        return None
 
 
 def _run_console(cmd: List[str], timeout_s: float,

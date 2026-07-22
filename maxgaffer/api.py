@@ -27,7 +27,7 @@ from .maxbridge.controller import Controller
 
 __all__ = ["match_camera", "match_all_cameras", "apply_camera_state",
            "render_cameras", "export_vrscenes_for_vantage", "get_controller",
-           "seed_dome", "scenario_board", "adopt_scenario"]
+           "seed_dome", "scenario_board", "adopt_scenario", "bake_lighting_animation"]
 
 _shared: Optional[Controller] = None
 
@@ -85,17 +85,20 @@ def match_camera(
     locks: Optional[set] = None,
     sweep: bool = True,
     deep: bool = False,
+    quality_profile: str = "standard",
     config_overrides: Optional[Dict] = None,
 ) -> Dict:
     """Bind ``reference_path`` (if given) to ``camera_name`` and run the full match loop.
-    ``deep=True`` = hero-shot mode: target 99, ≥10 iterations, coordinate-descent polish;
+    ``quality_profile`` accepts ``fast``, ``standard``, or ``hero``. ``deep=True`` remains
+    a compatibility alias for Hero mode: target 99 with bounded coordinate-descent polish;
     ``ceiling_converged`` in the result means the remaining gap is content, not lighting."""
     ctrl = get_controller(config_overrides)
     if reference_path:
-        ctrl.session.set_reference(camera_name, reference_path)
+        ctrl.bind_reference(camera_name, reference_path)
         ctrl._save_or_warn(log)
     result = ctrl.run_match(camera_name, log=log, should_cancel=should_cancel,
-                            locks=locks, do_sweep=sweep, deep=deep)
+                            locks=locks, do_sweep=sweep, deep=deep,
+                            quality_profile=quality_profile)
     return {
         "score": result.best_score,
         "stop_reason": result.stop_reason,
@@ -119,10 +122,18 @@ def match_all_cameras(
     return get_controller(config_overrides).match_all(log, should_cancel, do_sweep=sweep)
 
 
+def bake_lighting_animation(camera_name: str, keyframes: Dict[int, Dict],
+                            step: int = 1, easing: str = "smooth") -> Dict:
+    """Bake sparse ``{frame: LightingState.to_dict()}`` data into native Max keys."""
+    sparse = [(int(frame), LightingState.from_dict(state))
+              for frame, state in keyframes.items()]
+    return get_controller().bake_lighting_animation(camera_name, sparse, step, easing)
+
+
 def apply_camera_state(camera_name: str) -> List[str]:
     """Re-apply a camera's saved lighting state. Returns warnings."""
     ctrl = get_controller()
-    e = ctrl.session.cameras.get(camera_name)
+    e = ctrl.camera_entry(camera_name)
     if not (e and e.state is not None):
         raise RuntimeError(f"no saved lighting state for camera '{camera_name}'")
     return ctrl.apply_state(e.state, camera_name)
@@ -138,7 +149,7 @@ def seed_dome(
     previous dome texture snapshotted — restore_pre_match puts it back). → seed meta."""
     ctrl = get_controller(config_overrides)
     if reference_path:
-        ctrl.session.set_reference(camera_name, reference_path)
+        ctrl.bind_reference(camera_name, reference_path)
         ctrl._save_or_warn(log)
     return ctrl.seed_dome(camera_name, log=log)
 

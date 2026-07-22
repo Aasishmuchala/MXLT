@@ -37,6 +37,10 @@ TIME_FALLBACK_ALTITUDE = {
 }
 
 TURBIDITY = {"none": 2.5, "light_haze": 4.5, "heavy_haze": 7.0, "fog": 8.5}
+# Native volumetric visibility distance. This complements sun turbidity: turbidity colors
+# the sky; Environment Fog/Aerial Perspective attenuates real scene depth.
+ATMOSPHERE_DISTANCE_M = {"none": 10000.0, "light_haze": 250.0,
+                         "heavy_haze": 70.0, "fog": 20.0}
 
 # sun size multiplier: hard light = small apparent sun, soft = bigger (haze/diffusion)
 SUN_SIZE = {"hard": 1.0, "mixed": 3.0, "soft": 8.0}
@@ -108,6 +112,12 @@ def initial_state(
 
     put("sun.turbidity", TURBIDITY.get(semantics.get("atmosphere", "none"), 2.5),
         f"atmosphere '{semantics.get('atmosphere', 'none')}'")
+
+    atmosphere = semantics.get("atmosphere", "none")
+    put("atmosphere.enabled", 0 if atmosphere == "none" else 1,
+        f"native volumetric depth for '{atmosphere}'")
+    put("atmosphere.distance_m", ATMOSPHERE_DISTANCE_M.get(atmosphere, 10000.0),
+        f"physical visibility distance for '{atmosphere}'")
 
     # ---- dome / sky fill
     if "dome.enabled" in st.values:

@@ -27,8 +27,14 @@ from .parse import ParseError
 MAX_OPS = 12
 CREATABLE_LIGHTS = ("VRayLight_plane", "VRayLight_sphere", "VRayLight_disc",
                     "VRayLight_dome", "VRaySun", "VRayIES")
-PLACEMENT_LIMITS = {"bearing_deg": (-180.0, 180.0), "distance": (10.0, 100000.0),
-                    "height": (-10000.0, 100000.0)}
+# New plans use physical metres. 3ds Max system units may be millimetres, centimetres,
+# inches, feet, or a custom scale, so a bare numeric distance is not portable. Legacy
+# ``distance``/``height`` plans remain valid and retain their raw-scene-unit meaning.
+PLACEMENT_LIMITS = {"bearing_deg": (-180.0, 180.0), "distance_m": (0.1, 1000.0),
+                    "height_m": (-100.0, 1000.0)}
+LEGACY_PLACEMENT_LIMITS = {"bearing_deg": (-180.0, 180.0),
+                           "distance": (10.0, 100000.0),
+                           "height": (-10000.0, 100000.0)}
 # "anything related to LIGHT" is the mandate — output paths, DR/net-render and system
 # plumbing on the renderer are never light, and a stray write there hurts a client job
 RENDERER_DENY_SUBSTR = ("savefilename", "rawfilename", "distributed", "netrender",
@@ -45,7 +51,8 @@ You may:
 - create NEW lights (types: VRayLight_plane, VRayLight_sphere, VRayLight_disc,
   VRayLight_dome, VRaySun, VRayIES) placed RELATIVE TO THE CAMERA — "placement" MUST
   contain ALL THREE numbers: bearing_deg (0 = in front of camera, +right/-left),
-  distance (scene units), height (above camera) — OR use {"at_node": "<existing name>"}.
+  distance_m (physical metres), height_m (physical metres above camera) — OR use
+  {"at_node": "<existing name>"}.
   A create_light op missing any placement number is dropped. Set key properties via
   the "props" field.
 
@@ -66,7 +73,7 @@ Reply with ONLY a JSON object:
     {"op": "set", "target": "node:VRaySun001", "prop": "turbidity", "value": 5.0,
      "why": "hazier warm sky per reference"},
     {"op": "create_light", "light_type": "VRayLight_plane", "name": "MG_window_fill",
-     "placement": {"bearing_deg": -70, "distance": 250, "height": 120},
+     "placement": {"bearing_deg": -70, "distance_m": 2.5, "height_m": 1.2},
      "aim_at_camera_target": true,
      "props": {"multiplier": 8.0, "color": [255, 230, 200]},
      "why": "soft warm fill from camera-left as in reference"}
@@ -158,7 +165,11 @@ def validate_plan(reply_text: str, cat: Dict[str, Set[str]],
             elif isinstance(placement, dict):
                 place = {}
                 ok = True
-                for k, (lo, hi) in PLACEMENT_LIMITS.items():
+                # Do not accept a mixture of metres and raw scene units: physical
+                # fields select the canonical schema, while old plans remain readable.
+                physical = any(k in placement for k in ("distance_m", "height_m"))
+                limits = PLACEMENT_LIMITS if physical else LEGACY_PLACEMENT_LIMITS
+                for k, (lo, hi) in limits.items():
                     try:
                         pv = float(placement.get(k))
                         if not math.isfinite(pv):
@@ -172,7 +183,7 @@ def validate_plan(reply_text: str, cat: Dict[str, Set[str]],
                     continue
             else:
                 rejected.append(f"create_light {name}: needs placement{{bearing_deg,"
-                                "distance,height}} or at_node")
+                                "distance_m,height_m}} or at_node")
                 continue
             props = item.get("props") if isinstance(item.get("props"), dict) else {}
             clean_props = {str(k): (list(v) if isinstance(v, tuple) else v)
@@ -198,10 +209,15 @@ def describe_plan(ops: Sequence[Dict]) -> List[str]:
         if o["op"] == "set":
             out.append(f"set  {o['target']} · {o['prop']} → {o['value']}   ({o['why']})")
         else:
-            where = (f"at node {o['placement'].get('at_node')}"
-                     if "at_node" in o["placement"] else
-                     f"bearing {o['placement'].get('bearing_deg', 0):+.0f}° · "
-                     f"dist {o['placement'].get('distance', 0):.0f} · "
-                     f"h {o['placement'].get('height', 0):+.0f}")
+            if "at_node" in o["placement"]:
+                where = f"at node {o['placement'].get('at_node')}"
+            elif "distance_m" in o["placement"]:
+                where = (f"bearing {o['placement'].get('bearing_deg', 0):+.0f}° · "
+                         f"dist {o['placement'].get('distance_m', 0):.2f}m · "
+                         f"h {o['placement'].get('height_m', 0):+.2f}m")
+            else:
+                where = (f"bearing {o['placement'].get('bearing_deg', 0):+.0f}° · "
+                         f"dist {o['placement'].get('distance', 0):.0f}u · "
+                         f"h {o['placement'].get('height', 0):+.0f}u")
             out.append(f"new  {o['light_type']} '{o['name']}' {where}   ({o['why']})")
     return out

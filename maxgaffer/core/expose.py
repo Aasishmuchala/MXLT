@@ -107,7 +107,9 @@ def expose_image_file(src: str, dst: str, ev: float, base_ev: float,
     try:
         with Image.open(src) as im:
             im = im.convert("RGB")
-            exposed = expose_pixels(list(im.getdata()), ev, base_ev,
+            pixels = (im.get_flattened_data() if hasattr(im, "get_flattened_data")
+                      else im.getdata())
+            exposed = expose_pixels(list(pixels), ev, base_ev,
                                     wb_kelvin, base_wb)
             out = Image.new("RGB", im.size)
             out.putdata(exposed)

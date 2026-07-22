@@ -19,6 +19,7 @@ from typing import Dict, List, Optional
 from PySide6 import QtCore, QtGui, QtWidgets  # type: ignore
 
 from ..core.genome import GROUP_PREFIX, LightingState, spec_for
+from ..core import providers
 from ..core.omega import OmegaError, ping
 from ..maxbridge import config as cfgmod
 from ..maxbridge.controller import Controller
@@ -119,6 +120,8 @@ def _bounded_pixmap(path: str, target: QtCore.QSize) -> QtGui.QPixmap:
     at match end on a box already loaded with V-Ray + Vantage. QImageReader scales JPEGs
     DURING decode (never materializes full res); anything still huge is rejected."""
     reader = QtGui.QImageReader(path)
+    reader.setDecideFormatFromContent(True)
+    reader.setAutoTransform(True)       # phone references must preview with EXIF orientation
     size = reader.size()
     if size.isValid():
         # >120 MP even defeats a scaled decode's scratch buffers on some formats — skip
@@ -165,10 +168,16 @@ class MaxGafferDock(QtWidgets.QWidget):
         self._cancel = False
         self._busy = False
         self._active_camera = ""
+        self._active_camera_id = ""
+        self._camera_fingerprint = ()
         self._sliders: Dict[str, QtWidgets.QDoubleSpinBox] = {}
         _reset_log_mirror()   # crash forensics: last_session.log starts fresh per dock
         self._build()
         self.refresh_cameras()
+        self._camera_timer = QtCore.QTimer(self)
+        self._camera_timer.setInterval(1000)
+        self._camera_timer.timeout.connect(self._poll_cameras)
+        self._camera_timer.start()
         self._recover_draft_snapshot()
         app = QtWidgets.QApplication.instance()
         if app is not None:                      # drain workers before Qt tears down
@@ -224,6 +233,11 @@ class MaxGafferDock(QtWidgets.QWidget):
                                   "and matched lighting state.")
         self.cam_combo.currentIndexChanged.connect(self._on_camera_combo)
         head.addWidget(self.cam_combo)
+        btn_refresh_cams = QtWidgets.QPushButton("↻")
+        btn_refresh_cams.setFixedWidth(34)
+        btn_refresh_cams.setToolTip("Refresh cameras after adding, deleting or renaming shots.")
+        btn_refresh_cams.clicked.connect(self.refresh_cameras)
+        head.addWidget(btn_refresh_cams)
         self.lbl_score = QtWidgets.QLabel("—")
         self.lbl_score.setObjectName("dim")
         self.lbl_score.setToolTip("Last match score for this camera.")
@@ -275,11 +289,12 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.btn_match.clicked.connect(self._start_match)
         bar.addWidget(self.btn_match, 1)
         self.cmb_mode = QtWidgets.QComboBox()
-        self.cmb_mode.addItems(["Standard", "Deep → 99", "Loop only"])
+        self.cmb_mode.addItems(["Standard", "Hero → 99", "Loop only", "Fast"])
         self.cmb_mode.setToolTip(
-            "Standard — scene-wide plan + match loop.\n"
-            "Deep → 99 — plan + loop + coordinate-descent polish to the ceiling.\n"
-            "Loop only — skip the scene-wide plan.")
+            "Standard — scene-wide plan + balanced match loop.\n"
+            "Hero → 99 — bounded plan + loop + coordinate polish (under 100 renders).\n"
+            "Loop only — skip the scene-wide plan.\n"
+            "Fast — lower-resolution preview with a small render budget.")
         bar.addWidget(self.cmb_mode)
 
         self.btn_locks = QtWidgets.QPushButton("Locks ▾")
@@ -338,6 +353,10 @@ class MaxGafferDock(QtWidgets.QWidget):
         crow.addWidget(_cap("CHANGES"))
         crow.addStretch(1)
         for label, slot, tip in (("A/B", self._ab_flip, "Flip pre-match ↔ matched."),
+                                 ("Accept", lambda: self._artist_feedback(True),
+                                  "Record that the artist accepts this result."),
+                                 ("Needs work", lambda: self._artist_feedback(False),
+                                  "Record that the score did not satisfy the artist."),
                                  ("Restore", self._restore_pre_match,
                                   "Return to the pre-match light."),
                                  ("Runs", self._open_run_dir, "Open the run folder.")):
@@ -460,6 +479,20 @@ class MaxGafferDock(QtWidgets.QWidget):
                 [r["prop"], str(r["before"]), str(r["after"])]))
         for w in pr["warnings"]:
             top.addChild(QtWidgets.QTreeWidgetItem(["! " + w, "", ""]))
+        cam = self._current_camera()
+        entry = self._camera_entry(cam) if cam else None
+        card = getattr(entry, "scorecard", {}) if entry is not None else {}
+        if card:
+            group = QtWidgets.QTreeWidgetItem([
+                f"Scorecard · {card.get('confidence', 'unknown')} confidence",
+                f"coverage {float(card.get('coverage', 0)):.0%}",
+                "content gap" if card.get("content_gap") else "lighting gap"])
+            for key, value in sorted((card.get("components") or {}).items()):
+                group.addChild(QtWidgets.QTreeWidgetItem(
+                    [key, "", f"{float(value) * 100:.0f}%"]))
+            group.addChild(QtWidgets.QTreeWidgetItem(
+                [str(card.get("disclaimer") or "proxy score—not an artist verdict"), "", ""]))
+            top.addChild(group)
         top.setExpanded(True)
 
     # ================================================================= helpers
@@ -521,9 +554,34 @@ class MaxGafferDock(QtWidgets.QWidget):
     def _current_camera(self) -> str:
         data = self.cam_combo.currentData() if hasattr(self, "cam_combo") else None
         return data or ""
+    def _current_camera_id(self) -> str:
+        if not hasattr(self, "cam_combo") or self.cam_combo.currentIndex() < 0:
+            return ""
+        return str(self.cam_combo.currentData(QtCore.Qt.UserRole + 1) or "")
+    def _camera_entry(self, cam: str):
+        if hasattr(self.ctrl, "camera_entry"):
+            return self.ctrl.camera_entry(cam)
+        return self.ctrl.session.cameras.get(cam)
+    def _find_camera_index(self, name: str, camera_id: str = "") -> int:
+        for i in range(self.cam_combo.count()):
+            if self.cam_combo.itemData(i) == name:
+                item_id = str(self.cam_combo.itemData(i, QtCore.Qt.UserRole + 1) or "")
+                if not camera_id or item_id == str(camera_id):
+                    return i
+        return -1
+    def _poll_cameras(self):
+        if self._busy or not hasattr(self.ctrl, "camera_fingerprint"):
+            return
+        try:
+            fingerprint = self.ctrl.camera_fingerprint()
+        except Exception:
+            return
+        if fingerprint != self._camera_fingerprint:
+            self.refresh_cameras()
     # ================================================================= cameras
     def refresh_cameras(self):
         current = self._current_camera()
+        current_id = self._current_camera_id()
         self.cam_combo.blockSignals(True)
         self.cam_combo.clear()
         try:
@@ -531,14 +589,26 @@ class MaxGafferDock(QtWidgets.QWidget):
         except Exception as e:  # noqa: BLE001
             self._log(f"camera scan failed: {e}")
             cams = []
+        active_cam = next((c for c in cams if c.get("active")), {})
+        active = active_cam.get("name", "")
+        active_id = str(active_cam.get("id", ""))
         for c in cams:
             mark = "●  " if c.get("reference") else "○  "
             score = f"   ·  {c['score']:.0f}" if c.get("score") is not None else ""
-            self.cam_combo.addItem(mark + c["name"] + score, c["name"])
-        idx = self.cam_combo.findData(current)
+            duplicate = (f"   [id {str(c.get('id') or '?')[-6:]}]"
+                         if c.get("duplicate") else "")
+            self.cam_combo.addItem(mark + c["name"] + score + duplicate, c["name"])
+            self.cam_combo.setItemData(self.cam_combo.count() - 1, str(c.get("id") or ""),
+                                       QtCore.Qt.UserRole + 1)
+        idx = self._find_camera_index(current, current_id)
+        if idx < 0:
+            idx = self._find_camera_index(active, active_id)
         self.cam_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.cam_combo.blockSignals(False)
         self._active_camera = self._current_camera()
+        self._active_camera_id = self._current_camera_id()
+        self._camera_fingerprint = tuple((str(c.get("id", "")), c.get("name", ""),
+                                          c.get("class", "")) for c in cams)
         try:
             self.act_apply_select.setChecked(
                 bool(self.ctrl.session.settings.get("apply_on_select", True)))
@@ -547,29 +617,41 @@ class MaxGafferDock(QtWidgets.QWidget):
         self._sync_score_badge()
         self.rebuild_rig_controls()
         self._rebuild_locks(self._current_camera())
+        self._show_reference(self._current_camera())
 
     def _sync_score_badge(self):
-        e = self.ctrl.session.cameras.get(self._current_camera())
+        e = self._camera_entry(self._current_camera())
         self.lbl_score.setText(f"{e.score:.1f}" if (e and e.score is not None) else "—")
     def _on_camera_combo(self, _idx: int):
         if self._busy:
             self._log("busy — camera switch ignored until the current run finishes")
-            idx = self.cam_combo.findData(self._active_camera)
+            idx = self._find_camera_index(self._active_camera, self._active_camera_id)
             if idx >= 0:                     # point the combo back at the camera actually running
                 self.cam_combo.blockSignals(True)
                 self.cam_combo.setCurrentIndex(idx)
                 self.cam_combo.blockSignals(False)
             return
         name = self._current_camera()
+        camera_id = self._current_camera_id()
         if not name:
             return
-        self._active_camera = name
+        previous = self._active_camera
         self._ab_on_pre = False
         try:
-            for w in self.ctrl.select_camera(name):
+            for w in self.ctrl.select_camera(name, camera_id=camera_id):
                 self._log("⚠ " + w)
         except Exception as e:  # noqa: BLE001
             self._log(f"select failed: {e}")
+            idx = self._find_camera_index(previous, self._active_camera_id)
+            if idx >= 0:
+                self.cam_combo.blockSignals(True)
+                self.cam_combo.setCurrentIndex(idx)
+                self.cam_combo.blockSignals(False)
+            return
+        self._active_camera = name
+        self._active_camera_id = camera_id
+        self.match_thumb.setPixmap(QtGui.QPixmap())
+        self.match_thumb.setText("no match preview")
         self._show_reference(name)
         self._rebuild_locks(name)
         self._sync_score_badge()
@@ -588,10 +670,18 @@ class MaxGafferDock(QtWidgets.QWidget):
             self._log("select a camera first")
             return
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, f"Reference for {cam}", "", "Images (*.jpg *.jpeg *.png *.webp)")
+            self, f"Reference for {cam}", "",
+            "Images (*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff *.exr *.hdr);;"
+            "All files (*.*)")
         if not path:
             return
-        self.ctrl.session.set_reference(cam, path)
+        if not os.path.isfile(path):
+            self._log(f"reference file not found: {path}")
+            return
+        if hasattr(self.ctrl, "bind_reference"):
+            self.ctrl.bind_reference(cam, path)
+        else:
+            self.ctrl.session.set_reference(cam, path)
         if not self.ctrl.save_session():
             self._log("⚠ scene not saved yet — bindings live in memory only until you "
                       "save the .max file")
@@ -599,9 +689,9 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.refresh_cameras()
 
     def _show_reference(self, cam: str):
-        e = self.ctrl.session.cameras.get(cam)
+        e = self._camera_entry(cam)
         ref = e.reference if e else ""
-        if ref and os.path.exists(ref):
+        if ref and os.path.isfile(ref):
             pix = _bounded_pixmap(ref, self.ref_thumb.size())
             if not pix.isNull():
                 self.ref_thumb.setPixmap(pix)
@@ -616,13 +706,24 @@ class MaxGafferDock(QtWidgets.QWidget):
                     info += f"\nlast match: {e.score:.1f}/100 at {e.matched_at}"
                 self.lbl_ref_info.setText(info)
                 return
+            self.ref_thumb.setPixmap(QtGui.QPixmap())
+            self.ref_thumb.setText("preview unavailable")
+            self.lbl_ref_info.setText(
+                os.path.basename(ref) + "\nQt cannot preview this format; MaxGaffer will "
+                "still try Pillow / 3ds Max bitmap ingestion when matching.")
+            return
         self.ref_thumb.setPixmap(QtGui.QPixmap())
-        self.ref_thumb.setText("no reference")
-        self.lbl_ref_info.setText("Bind a lighting reference image to this camera.")
+        if ref:
+            self.ref_thumb.setText("reference missing")
+            self.lbl_ref_info.setText(os.path.basename(ref) +
+                                      "\nFile moved or was deleted — load it again.")
+        else:
+            self.ref_thumb.setText("no reference")
+            self.lbl_ref_info.setText("Bind a lighting reference image to this camera.")
 
     def _rebuild_locks(self, cam: str):
         self.lock_menu.clear()
-        e = self.ctrl.session.cameras.get(cam)
+        e = self._camera_entry(cam)
         locked = set(e.locks) if e else set()
         try:
             state = self.ctrl.read_state(cam)
@@ -684,7 +785,7 @@ class MaxGafferDock(QtWidgets.QWidget):
             # a manual pick outranks the seed — otherwise the next camera switch would
             # silently re-bind the seed over the artist's explicit choice
             cam = self._current_camera()
-            e = self.ctrl.session.cameras.get(cam) if cam else None
+            e = self._camera_entry(cam) if cam else None
             if e is not None and e.seed_hdri:
                 e.seed_hdri = ""
                 self.ctrl.save_session()
@@ -699,7 +800,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         if not cam:
             self._log("select a camera first")
             return
-        e = self.ctrl.session.cameras.get(cam)
+        e = self._camera_entry(cam)
         if not (e and e.reference):
             self._log("bind a reference image first — the seed is built FROM it")
             return
@@ -808,19 +909,20 @@ class MaxGafferDock(QtWidgets.QWidget):
         if not cam:
             self._log("select a camera first")
             return
-        e = self.ctrl.session.cameras.get(cam)
+        e = self._camera_entry(cam)
         if not (e and e.reference):
             self._log("bind a reference image first")
             return
-        if not self.cfg.api_key:
-            self._log("no API key — open Settings and paste your oc_ key")
-            return
+        if not self.cfg.api_key and self.cfg.semantic_provider not in (
+                "offline", "openai_compatible", "local"):
+            self._log("no semantic API key — continuing with the reduced-intelligence "
+                      "offline analytic solver")
         self._busy = True
         self._cancel = False
         for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
             b.setEnabled(False)
         self.btn_cancel.setEnabled(True)
-        mode = self.cmb_mode.currentIndex()          # 0 standard · 1 deep · 2 loop-only
+        mode = self.cmb_mode.currentIndex()       # 0 standard · 1 hero · 2 loop-only · 3 fast
         self.cfg.auto_execute_plan = self.act_autoexec.isChecked()
         self.cfg.draft_sampler = self.act_draft.isChecked()
         self.log.clear()
@@ -849,7 +951,9 @@ class MaxGafferDock(QtWidgets.QWidget):
                 should_cancel=lambda: self._cancel,
                 locks=self._locks(),
                 do_sweep=self.act_sweep.isChecked(),
-                deep=(mode == 1))
+                deep=(mode == 1),
+                quality_profile=("fast" if mode == 3 else
+                                 "hero" if mode == 1 else "standard"))
             score = f"{result.best_score:.1f}" if result.best_score is not None else "n/a"
             ceiling = ""
             if (result.best_score or 0) < 99:
@@ -939,7 +1043,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         if not cam or not note:
             self._log("select a camera and type a note first")
             return
-        e = self.ctrl.session.cameras.get(cam)
+        e = self._camera_entry(cam)
         if not (e and e.reference):
             self._log("bind a reference image first")
             return
@@ -1006,7 +1110,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         if self._busy:
             return
         cam = self._current_camera()
-        e = self.ctrl.session.cameras.get(cam) if cam else None
+        e = self._camera_entry(cam) if cam else None
         if not (e and e.pre_match is not None and e.state is not None):
             self._log("A/B needs both a pre-match snapshot and a matched state — run a "
                       "match first")
@@ -1018,6 +1122,17 @@ class MaxGafferDock(QtWidgets.QWidget):
             self.rebuild_rig_controls()
         except Exception as err:  # noqa: BLE001
             self._log(f"A/B failed: {err}")
+
+    def _artist_feedback(self, accepted: bool):
+        cam = self._current_camera()
+        if not cam:
+            self._log("select a camera before recording feedback")
+            return
+        try:
+            self.ctrl.record_artist_feedback(cam, accepted)
+            self._log("artist verdict recorded: " + ("accepted" if accepted else "needs work"))
+        except Exception as err:  # noqa: BLE001
+            self._log(f"could not record artist feedback: {err}")
 
     # ================================================================= vantage
     def _start_live_link(self):
@@ -1088,6 +1203,10 @@ class MaxGafferDock(QtWidgets.QWidget):
             jobs, launched, export_dir = self.ctrl.export_and_open_vantage(
                 cams, on_progress=lambda c, s: self._log(f"export {c}: {s}"))
             self._log(f"✓ {len(jobs)} vrscene(s) → {export_dir}")
+            QtWidgets.QApplication.clipboard().setText(
+                "\n".join(job["scene_file"] for job in jobs))
+            self._log("ordered vrscene list copied to the clipboard; queue manifest and "
+                      "Batch Render instructions are beside the exports")
             self._log("Vantage opened — add the files to its Batch Render queue"
                       if launched else
                       f"⚠ could not launch Vantage ({self.cfg.vantage_exe}) — open the "
@@ -1283,7 +1402,15 @@ class SettingsDialog(QtWidgets.QDialog):
         form = QtWidgets.QFormLayout(self)
         self.ed_key = QtWidgets.QLineEdit(cfg.api_key)
         self.ed_key.setEchoMode(QtWidgets.QLineEdit.Password)
-        form.addRow("oc_ API key", self.ed_key)
+        form.addRow("semantic API key", self.ed_key)
+        self.cmb_provider = QtWidgets.QComboBox()
+        self.cmb_provider.addItems(["omega", "anthropic", "openai",
+                                    "openai_compatible", "offline"])
+        self.cmb_provider.setCurrentText(getattr(cfg, "semantic_provider", "omega"))
+        form.addRow("semantic provider", self.cmb_provider)
+        self.ed_base_url = QtWidgets.QLineEdit(getattr(cfg, "semantic_base_url", ""))
+        self.ed_base_url.setPlaceholderText("optional/custom: https://host/v1/chat/completions")
+        form.addRow("provider URL", self.ed_base_url)
         self.ed_model = QtWidgets.QLineEdit(cfg.model)
         form.addRow("model", self.ed_model)
         self.ed_vantage = QtWidgets.QLineEdit(cfg.vantage_console)
@@ -1327,13 +1454,17 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cmb_backend.setCurrentText(
             getattr(cfg, "final_render_backend", "vray") or "vray")
         form.addRow("finals backend", self.cmb_backend)
+        self.cmb_preference = QtWidgets.QComboBox()
+        self.cmb_preference.addItems(["balanced", "direction", "color_mood", "tonal"])
+        self.cmb_preference.setCurrentText(getattr(cfg, "artist_preference", "balanced"))
+        form.addRow("score preference", self.cmb_preference)
         self.ed_vantage_exe = QtWidgets.QLineEdit(getattr(cfg, "vantage_exe", ""))
         form.addRow("vantage.exe", self.ed_vantage_exe)
         self.lbl_status = QtWidgets.QLabel("")
         self.lbl_status.setObjectName("dim")
         form.addRow(self.lbl_status)
         btns = QtWidgets.QHBoxLayout()
-        self.btn_test = QtWidgets.QPushButton("Test gateway")
+        self.btn_test = QtWidgets.QPushButton("Test semantic provider")
         self.btn_test.clicked.connect(self._test)
         btns.addWidget(self.btn_test)
         b_ok = QtWidgets.QPushButton("Save")
@@ -1351,12 +1482,18 @@ class SettingsDialog(QtWidgets.QDialog):
         the result lands in the status label when the worker finishes."""
         key = self.ed_key.text().strip()
         model = self.ed_model.text().strip()
+        provider = self.cmb_provider.currentText()
+        base_url = self.ed_base_url.text().strip()
         self.lbl_status.setText("pinging…")
         self.btn_test.setEnabled(False)
         try:
             io_runner = getattr(self.parent(), "_run_blocking_io", None)
             run = io_runner or (lambda fn: fn())   # standalone use: no pump available
-            self.lbl_status.setText(run(lambda: ping(key, model)))
+            if provider == "omega":
+                self.lbl_status.setText(run(lambda: ping(key, model)))
+            else:
+                self.lbl_status.setText(run(
+                    lambda: providers.ping(provider, key, model, base_url)))
             self.lbl_status.setStyleSheet(f"color:{OK};")
         except OmegaError as e:
             self.lbl_status.setText(str(e))
@@ -1369,6 +1506,8 @@ class SettingsDialog(QtWidgets.QDialog):
 
     def _save(self):
         self.cfg.api_key = self.ed_key.text().strip()
+        self.cfg.semantic_provider = self.cmb_provider.currentText() or "omega"
+        self.cfg.semantic_base_url = self.ed_base_url.text().strip()
         self.cfg.model = self.ed_model.text().strip() or "claude-opus-4-8"
         self.cfg.vantage_console = self.ed_vantage.text().strip()
         self.cfg.system_python = self.ed_syspy.text().strip()
@@ -1379,6 +1518,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cfg.no_renders = bool(self.cb_norender.isChecked())
         self.cfg.software_exposure = bool(self.cb_swexpose.isChecked())
         self.cfg.final_render_backend = self.cmb_backend.currentText() or "vray"
+        self.cfg.artist_preference = self.cmb_preference.currentText() or "balanced"
         self.cfg.vantage_exe = self.ed_vantage_exe.text().strip()
         self.accept()
 
@@ -1404,6 +1544,9 @@ def show_dock():
             _dock_wrapper.show()
             _dock_wrapper.raise_()
             if _dock_instance is not None:
+                # The panel may have been hidden while another .max scene was opened or
+                # cameras were edited.  Never re-show a stale shot list/reference card.
+                _dock_instance.refresh_cameras()
                 return _dock_instance
         except RuntimeError:                 # C++ object deleted (Max shutdown, teardown)
             _dock_wrapper = None             # — fall through and rebuild cleanly

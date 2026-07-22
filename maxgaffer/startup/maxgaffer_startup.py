@@ -20,7 +20,7 @@ def _repo_path() -> str:
             data = json.load(f)
         if isinstance(data, dict):           # a hand-edited/non-dict config must not
             return str(data.get("repo_path") or "")  # raise AttributeError out of startup
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         pass
     return os.environ.get("MAXGAFFER", "")
 

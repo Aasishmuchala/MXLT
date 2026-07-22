@@ -1,4 +1,5 @@
 import json
+import shutil
 
 import pytest
 
@@ -48,6 +49,52 @@ def test_new_reference_invalidates_cached_analysis(tmp_path):
     s.entry("cam").semantics = {"k": 1}
     s.set_reference("cam", "b.jpg")
     assert s.entry("cam").semantics == {"k": 1}
+
+
+def test_overwritten_reference_at_same_path_invalidates_cached_analysis(tmp_path):
+    ref = tmp_path / "reference.jpg"
+    ref.write_bytes(b"first")
+    s = Session()
+    s.set_reference("cam", str(ref))
+    e = s.entry("cam")
+    e.semantics = {"time_of_day": "day"}
+    e.score = 88.0
+
+    ref.write_bytes(b"a different image payload")
+    s.set_reference("cam", str(ref))
+
+    assert e.semantics == {}
+    assert e.score is None
+    assert e.reference_signature
+
+
+def test_camera_identity_survives_rename_and_disambiguates_duplicates():
+    s = Session()
+    first = s.entry("Camera", "101")
+    first.score = 77.0
+    assert s.entry("Renamed Camera", "101") is first
+    assert first.camera_name == "Renamed Camera" and first.score == 77.0
+    second = s.entry("Renamed Camera", "202")
+    assert second is not first
+    assert second.camera_id == "202"
+
+
+def test_project_relative_reference_survives_folder_move(tmp_path):
+    source = tmp_path / "source"
+    (source / "refs").mkdir(parents=True)
+    ref = source / "refs" / "look.jpg"
+    ref.write_bytes(b"image")
+    sidecar = source / "scene.maxgaffer.json"
+    s = Session(str(sidecar))
+    s.set_reference("Cam", str(ref), "42")
+    assert s.entry("Cam", "42").reference_relative == str(
+        ref.relative_to(source))
+    assert s.save()
+
+    moved = tmp_path / "moved"
+    shutil.move(str(source), str(moved))
+    loaded = Session.load(str(moved / "scene.maxgaffer.json"))
+    assert loaded.entry("Cam", "42").reference == str(moved / "refs" / "look.jpg")
 
 
 def test_session_survives_corrupt_file(tmp_path):

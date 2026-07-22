@@ -70,6 +70,16 @@ def bound(ctrl, name="CamA"):
     return ctrl.session.cameras[name]
 
 
+def test_select_deleted_camera_fails_before_applying_its_saved_light(ctrl, monkeypatch):
+    ctrl.session.record_match("Gone", make_state(), 80.0)
+    monkeypatch.setattr(ctl.sc, "set_active_camera", lambda name: False)
+
+    with pytest.raises(RuntimeError, match="no longer available"):
+        ctrl.select_camera("Gone")
+
+    assert ctrl._test_applies == []
+
+
 # ------------------------------------------- (a) cancel/fail must not wipe accepted state
 @pytest.mark.parametrize("reason", ["cancelled", "render_failed"])
 def test_unmeasured_run_keeps_previous_state(ctrl, monkeypatch, reason):

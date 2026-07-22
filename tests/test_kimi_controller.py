@@ -74,6 +74,22 @@ def _semantics():
             "sun_bearing_deg": 15.0, "wb_kelvin_estimate": 4300.0, "key_notes": "warm"}
 
 
+def test_analyze_detects_reference_overwritten_without_rebinding(monkeypatch, tmp_path):
+    c, cm = _ctrl(monkeypatch, tmp_path, analyze_samples=1)
+    ref = tmp_path / "reference.png"
+    ref.write_bytes(b"old")
+    c.session.set_reference("Cam", str(ref))
+    e = c.session.entry("Cam")
+    e.semantics = {"sem": "old"}
+    e.score = 91.0
+    ref.write_bytes(b"new image bytes")
+    monkeypatch.setattr(c, "_image_block", lambda path: {"type": "image"})
+    _stub_llm(monkeypatch, cm, semantics={"sem": "new"})
+
+    assert c.analyze_reference("Cam") == {"sem": "new"}
+    assert e.score is None
+
+
 # --------------------------------------------------------------------- _safe / dirs
 def test_safe_strips_windows_reserved_device_names():
     from maxgaffer.maxbridge.controller import _safe

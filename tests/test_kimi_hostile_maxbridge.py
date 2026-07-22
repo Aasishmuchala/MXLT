@@ -10,8 +10,7 @@ Assertions come in three flavors:
     typed errors);
   * no partial mutation on failure paths — the runtime's ``mutation_log`` must
     show nothing changed (or the documented rollback/restore calls happened);
-  * known REAL bugs are reproduced as ``xfail(strict=False)`` — each names the
-    exact file:line; when the source is fixed they XPASS (and the marker can go).
+  * every previously reproduced defect is now a normal passing regression test.
 
 Deterministic: FakeMaxRuntime is seeded (CHAOS_SEED) and chaos draws are the
 only randomness. Python 3.11 (Max 2026) + 3.12 compatible.
@@ -140,6 +139,25 @@ def test_list_cameras_empty_scene(max_rt):
     assert sc.scene_path() == ""
 
 
+def test_active_camera_name_tracks_viewport_and_degrades(max_rt):
+    assert sc.active_camera_name() == ""
+    cam = make_cam(max_rt, "Hero")
+    max_rt.viewport.setCamera(cam)
+    assert sc.active_camera_name() == "Hero"
+    cam.set_stale()
+    assert sc.active_camera_name() == ""
+
+
+def test_camera_identity_resolves_duplicate_names_by_handle(max_rt):
+    a = make_cam(max_rt, "Same")
+    b = make_cam(max_rt, "Same")
+    handles = {id(a): 101, id(b): 202}
+    max_rt.getHandleByAnim = lambda node: handles[id(node)]
+    listed = sc.list_cameras()
+    assert [c["id"] for c in listed] == ["101", "202"]
+    assert sc.get_camera("Same", "202") is b
+
+
 def test_list_cameras_duplicates_flagged_and_first_wins(max_rt):
     a = make_cam(max_rt, "Cam01")
     b = make_cam(max_rt, "Cam01")
@@ -211,15 +229,53 @@ def test_classify_rig_sky_env_and_stale_light(max_rt):
     assert rig["groups"].get("sconces") == [keep]  # stale node skipped, survivor kept
 
 
-def test_classify_rig_duplicate_sun_and_dome_noted(max_rt):
+def test_classify_rig_duplicate_sun_and_dome_become_matchable_roles(max_rt):
     s1 = make_sun(max_rt, "Sun_A")
     make_sun(max_rt, "Sun_B")
     d1 = make_dome(max_rt, "Dome_A")
     make_dome(max_rt, "Dome_B")
     rig = sc.classify_rig()
     assert rig["sun"] is s1 and rig["dome"] is d1     # first wins
-    assert any("extra VRaySun" in n for n in rig["notes"])
-    assert any("extra dome" in n for n in rig["notes"])
+    assert rig["suns"][:2] == [s1, max_rt.lights[1]]
+    assert len(rig["domes"]) == 2
+    assert any("multi-sun" in n for n in rig["notes"])
+    assert any("multi-dome" in n for n in rig["notes"])
+
+
+def test_multi_sun_and_dome_roles_roundtrip(max_rt):
+    sun_key = make_sun(max_rt, "Key_Sun")
+    sun_fill = make_sun(max_rt, "Fill_Sun")
+    dome_key = make_dome(max_rt, "Lighting_Dome", rotation=15.0)
+    dome_refl = make_dome(max_rt, "Reflection_Dome", rotation=75.0)
+    rig = sc.classify_rig()
+    st = ap.read_state(rig, {})
+    assert st.get("sun2.intensity") == pytest.approx(1.0)
+    assert st.get("dome2.rotation_deg") == pytest.approx(75.0)
+    st.set("sun2.intensity", 2.5)
+    st.set("dome2.intensity", 3.5)
+    st.set("dome2.rotation_deg", 120.0)
+    assert ap.apply_state(rig, {}, st) == []
+    assert sun_fill.get_raw("intensity_multiplier") == pytest.approx(2.5)
+    assert dome_refl.get_raw("multiplier") == pytest.approx(3.5)
+    assert dome_tex(dome_refl).get_raw("horizontalRotation") == pytest.approx(120.0)
+    assert rig["sun"] is sun_key and rig["dome"] is dome_key
+
+
+def test_atmosphere_roundtrip_uses_physical_metres(max_rt):
+    fog = MockObject(max_rt, "VRayEnvironmentFog",
+                     {"enabled": True, "fog_distance": 25000.0,
+                      "fog_height": 1200.0})
+    rig = {"sun": None, "dome": None, "groups": {}, "atmosphere": fog}
+    st = ap.read_state(rig, {})
+    assert st.get("atmosphere.enabled") == 1.0
+    assert st.get("atmosphere.distance_m") == pytest.approx(250.0)
+    assert st.get("atmosphere.height_m") == pytest.approx(12.0)
+    st.set("atmosphere.distance_m", 20.0)
+    st.set("atmosphere.height_m", 5.0)
+    warnings = ap.apply_state(rig, {}, st)
+    assert warnings == []
+    assert fog.get_raw("fog_distance") == pytest.approx(2000.0)
+    assert fog.get_raw("fog_height") == pytest.approx(500.0)
 
 
 def test_sun_stale_read_placeholder_write_refused(max_rt, capsys):
@@ -491,8 +547,7 @@ def test_apply_state_empty_rig_and_state(max_rt):
 
 
 def test_apply_state_junk_values_that_ARE_isolated(max_rt):
-    """The params the audit hardened (sun.intensity, group factors) downgrade to
-    warnings even against the real mock — contrast with the xfail bugs below."""
+    """Malformed public state downgrades to warnings even against the real mock."""
     n = basic_rig(max_rt)
     st = LightingState()
     st.values["sun.intensity"] = "junk"          # raw write past the clamps
@@ -503,8 +558,7 @@ def test_apply_state_junk_values_that_ARE_isolated(max_rt):
 
 
 def test_apply_state_junk_dome_rotation_without_texmap_warns(max_rt):
-    """The dome rotation NODE fallback is fault-isolated — unlike the texmap path
-    (see the xfail below); this locks the documented inconsistency."""
+    """The dome rotation node fallback is fault-isolated too."""
     n = basic_rig(max_rt)
     n["dome"] = make_dome(max_rt, name="BareDome", with_texmap=False)
     rig = rig_of(n)
@@ -931,9 +985,7 @@ def test_chaos_write_paths_no_escape_and_mutation_invariants(max_rt, tmp_path,
     log must keep its invariants: failed dome-texture ⇒ nothing bound; any
     draft mutation ⇒ a snapshot file exists; execute deletes only roll back.
 
-    The scene carries NO exposure control: an EC object whose classOf read
-    fails escapes the host chain — that is KNOWN BUG #5 (exposure.py:71),
-    reproduced deterministically in test_known_bug_exposure_host_unreadable_ec.
+    The scene carries no exposure control so hostile host lookup must degrade.
     """
     rt = max_rt
     n = basic_rig(rt)                            # build the scene BEFORE chaos
@@ -1000,7 +1052,7 @@ def test_chaos_exposure_control_creation_no_escape(max_rt):
     rt.chaos_set = 0.30
     for _ in range(30):
         # force an empty slot (raw write, bypasses hostility) each round —
-        # an EC already IN the slot hits KNOWN BUG #5 (exposure.py:71) instead
+        # force every hostile creation attempt to start from the same empty slot
         rt.SceneExposureControl._mg["props"]["exposureControl"] = None
         msg = exp.ensure_exposure_control()
         assert msg is None or isinstance(msg, str)
@@ -1009,8 +1061,7 @@ def test_chaos_exposure_control_creation_no_escape(max_rt):
 def test_chaos_read_paths_no_escape(max_rt):
     """Seeded random failures on rt services + property READS against a
     read-only scene. Enumeration and state reads must degrade, never raise.
-    No EC in the slot — classOf on a hostile EC object is KNOWN BUG #5
-    (exposure.py:71), covered by its own deterministic xfail repro."""
+    Exposure-control host lookup is included in the fault-isolation contract."""
     rt = max_rt
     n = basic_rig(rt)                            # build the scene BEFORE chaos
     rt.SceneExposureControl._mg["props"]["exposureControl"] = None   # see above
@@ -1024,7 +1075,8 @@ def test_chaos_read_paths_no_escape(max_rt):
         cam_node = sc.get_camera("Cam01")        # ONE call per round (chaos varies)
         assert cam_node is None or cam_node.get_raw("name") == "Cam01"
         out = sc.classify_rig()
-        assert set(out) == {"sun", "dome", "sky_env", "groups", "notes"}
+        assert set(out) == {"sun", "dome", "suns", "domes", "atmosphere",
+                            "sky_env", "groups", "notes"}
         d = dg.build_digest()
         assert set(d) == {"renderer", "environment", "exposure",
                           "lights", "cameras", "stats"}
@@ -1056,49 +1108,11 @@ def test_chaos_vantage_and_render_entry_points(max_rt):
         assert rd.transcode_to_png("ref.exr", "ref.png") is None
 
 
-# ===================================================================== KNOWN REAL BUGS
-# Reproduced here as xfail(strict=False): the suite stays green, each failure
-# names the exact source line, and a future fix turns these into XPASS.
-# NOTHING in maxbridge was modified by this suite.
+# ===================================================================== FIXED REGRESSIONS
+# These hostile inputs previously escaped the bridge's per-parameter isolation.  They are
+# normal passing tests now: malformed public state or stale Max handles must never crash.
 
-_BUG1 = ("REAL BUG maxbridge/exposure.py:151 — read_ev(): int(gain_type) is the "
-         "only unguarded conversion in the file; a hostile exposure_gain_type "
-         "(junk string / undefined) raises ValueError/TypeError out of an "
-         "Optional[float] API, escaping apply.read_state (apply.py:135) and "
-         "write_ev's legacy fallback (exposure.py:184) on Max's main thread")
-
-_BUG2A = ("REAL BUG maxbridge/apply.py:171-173 + scene.py:308 — sun.azimuth_deg/"
-          "sun.altitude_deg bypass _state_float: raw junk in the public "
-          "state.values dict reaches math.radians() outside any guard and "
-          "raises TypeError inside the undo record")
-
-_BUG2B = ("REAL BUG maxbridge/apply.py:198 + scene.py:347 — dome.rotation_deg "
-          "bypasses _state_float: write_dome_rotation computes "
-          "float(degrees_ % 360.0) OUTSIDE any try on the texmap path "
-          "(the node fallback IS guarded — inconsistent isolation)")
-
-_BUG2C = ("REAL BUG maxbridge/apply.py:217-221 + exposure.py:177/183/216 — "
-          "exposure.ev / exposure.wb_kelvin bypass _state_float: float() of a "
-          "raw junk state value raises ValueError inside write_ev/"
-          "write_wb_kelvin, escaping apply_state's undo record")
-
-_BUG3 = ("REAL BUG maxbridge/apply.py:213 — the 'has no multiplier' warning "
-         "does getattr(lt, 'name', '?') on the light whose set_prop just "
-         "failed; on a stale (deleted) node .name raises RuntimeError, which "
-         "getattr's default does NOT catch — the fault-isolation path itself "
-         "crashes apply_state on exactly the deleted-node scenario it guards")
-
-_BUG5 = ("REAL BUG maxbridge/exposure.py:71 — _find_exposure_control calls "
-         "str(rt.classOf(ec)) UNGUARDED on whatever the scene slot holds; a "
-         "stale/corrupt exposure-control object (deleted EC, hostile plugin) "
-         "raises RuntimeError out of ExposureHost.__init__, escaping "
-         "apply.read_state (apply.py:134), apply_state (apply.py:216) and "
-         "ensure_exposure_control (exposure.py:84) on Max's main thread. "
-         "Found by the seeded chaos sweep (chaos_rt on classOf)")
-
-
-@pytest.mark.xfail(reason=_BUG1, strict=False)
-def test_known_bug_read_ev_hostile_gain_type_never_raises(max_rt):
+def test_regression_read_ev_hostile_gain_type_never_raises(max_rt):
     junk_cam = make_cam(max_rt, "JunkGain",
                         extra={"exposure_gain_type": "target EV (junk)"})
     ev = exp.ExposureHost(junk_cam).read_ev()    # contract: Optional[float]
@@ -1109,8 +1123,7 @@ def test_known_bug_read_ev_hostile_gain_type_never_raises(max_rt):
     assert ev2 is None or isinstance(ev2, float)
 
 
-@pytest.mark.xfail(reason=_BUG2A, strict=False)
-def test_known_bug_apply_junk_sun_angles_warns_not_raises(max_rt):
+def test_regression_apply_junk_sun_angles_warns_not_raises(max_rt):
     n = basic_rig(max_rt)
     st = LightingState()
     st.values["sun.azimuth_deg"] = "junk"        # raw write into the public dict
@@ -1122,8 +1135,7 @@ def test_known_bug_apply_junk_sun_angles_warns_not_raises(max_rt):
     assert any("sun.altitude_deg" in w for w in warnings2)
 
 
-@pytest.mark.xfail(reason=_BUG2B, strict=False)
-def test_known_bug_apply_junk_dome_rotation_texmap_path_warns_not_raises(max_rt):
+def test_regression_apply_junk_dome_rotation_texmap_path_warns_not_raises(max_rt):
     n = basic_rig(max_rt)                        # dome HAS a texmap → unguarded path
     st = LightingState()
     st.values["dome.rotation_deg"] = "junk"
@@ -1131,8 +1143,7 @@ def test_known_bug_apply_junk_dome_rotation_texmap_path_warns_not_raises(max_rt)
     assert any("dome.rotation_deg" in w for w in warnings)
 
 
-@pytest.mark.xfail(reason=_BUG2C, strict=False)
-def test_known_bug_apply_junk_exposure_values_warn_not_raise(max_rt):
+def test_regression_apply_junk_exposure_values_warn_not_raise(max_rt):
     n = basic_rig(max_rt)                        # V-Ray EC host is writable
     st = LightingState()
     st.values["exposure.ev"] = "junk"
@@ -1144,8 +1155,7 @@ def test_known_bug_apply_junk_exposure_values_warn_not_raise(max_rt):
     assert any("exposure.wb_kelvin" in w for w in warnings2)
 
 
-@pytest.mark.xfail(reason=_BUG3, strict=False)
-def test_known_bug_apply_stale_group_light_warns_not_raises(max_rt):
+def test_regression_apply_stale_group_light_warns_not_raises(max_rt):
     n = basic_rig(max_rt)
     n["l1"].set_stale()                          # deleted mid-session, rig cached
     st = LightingState()
@@ -1155,7 +1165,7 @@ def test_known_bug_apply_stale_group_light_warns_not_raises(max_rt):
 
 
 def test_classify_rig_duplicate_sun_hostile_name(max_rt):
-    """FIXED (was _BUG4): duplicate-sun/dome notes now read names via _node_name."""
+    """Unreadable names in multi-light role notes never escape classification."""
     make_sun(max_rt, "Sun_A")
     evil = make_sun(max_rt, "Sun_B")
     evil.arm_get("name")                         # class readable, name is not
@@ -1163,8 +1173,7 @@ def test_classify_rig_duplicate_sun_hostile_name(max_rt):
     assert rig["sun"] is not None
 
 
-@pytest.mark.xfail(reason=_BUG5, strict=False)
-def test_known_bug_exposure_host_unreadable_ec_class(max_rt):
+def test_regression_exposure_host_unreadable_ec_class(max_rt):
     """A stale (deleted) exposure-control object still referenced by the scene
     slot: host detection must treat it as 'no usable host', never raise."""
     ec = MockObject(max_rt, "VRayExposureControl", {"ev": 11.0})
