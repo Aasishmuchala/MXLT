@@ -55,6 +55,34 @@ def set_prop(obj, names: Tuple[str, ...], value) -> Optional[str]:
     return None
 
 
+def matched_prop(obj, names: Tuple[str, ...]) -> Optional[str]:
+    """Report the first candidate name that EXISTS on ``obj`` — the read-only twin of set_prop.
+
+    Walks ``names`` in order through the SAME ``rt.isProperty(obj, rt.Name(n))`` test set_prop
+    writes through and returns the first hit, so the reported name is exactly what set_prop
+    would target. Writes nothing. ``obj`` is None → None; off-Max (pymxs unavailable) → None;
+    a per-name probe that raises is skipped (record-don't-raise).
+
+    Divergence from get_prop (documented, not hidden): get_prop keeps its getattr INSIDE the
+    try and continues on a getattr exception, so a property that isProperty-passes but whose
+    getattr raises (write-only / context-dependent) is skipped by get_prop yet reported here.
+    That is the accepted edge — matched_prop tracks the WRITE target, not the readable value.
+    """
+    if obj is None:
+        return None
+    try:
+        rt = _rt()
+    except Exception:
+        return None
+    for n in names:
+        try:
+            if rt.isProperty(obj, rt.Name(n)):
+                return n
+        except Exception:
+            continue
+    return None
+
+
 SUN_INTENSITY = ("intensity_multiplier", "intensityMultiplier", "intensity")
 SUN_SIZE = ("size_multiplier", "sizeMultiplier")
 SUN_TURBIDITY = ("turbidity",)
@@ -66,6 +94,16 @@ DOME_TEX_ON = ("texmap_on", "useTexmap", "use_texture")
 FOG_ON = ("enabled", "on", "active")
 FOG_DISTANCE = ("fog_distance", "fogDistance", "distance")
 FOG_HEIGHT = ("fog_height", "fogHeight", "height")
+
+# Report-only candidate tails used ONLY by report_aliases / matched_prop — NEVER the write
+# path. The shared LIGHT_MULT / FOG_DISTANCE / FOG_HEIGHT tuples above stay byte-identical:
+# apply.py's capture_baselines / read_state / _apply_inner consume them to SET values, so
+# appending these class-specific analogs there would turn a current silent no-op into an
+# actively-wrong, unit-mismatched WRITE (a VRayIES "power" is in lumens ≈1700; a
+# VRayAerialPerspective has no fog-height plane). Kept apart, they only ever surface a name.
+LIGHT_MULT_REPORT = LIGHT_MULT + ("power",)                 # VRayIES intensity (lumens)
+FOG_DISTANCE_REPORT = FOG_DISTANCE + ("visibility_range",)  # VRayAerialPerspective distance
+FOG_HEIGHT_REPORT = FOG_HEIGHT + ("atmo_height",)           # aerial-perspective approx analog
 
 
 def world_units(metres: float) -> float:
@@ -555,3 +593,48 @@ def set_dome_texture(dome, hdri_path: str) -> str:
             return "failed"                 # dome.texmap untouched — still clean
     set_prop(dome, DOME_TEX_ON, True)   # best-effort; missing prop is fine
     return f"texmap.{used}"
+
+
+# ------------------------------------------------------------------ alias self-report
+LAST_ALIASES: Dict[str, Optional[str]] = {}     # last report_aliases(record=True) snapshot
+
+
+def report_aliases(rig: Dict, record: bool = False) -> Dict[str, Optional[str]]:
+    """Map each logical rig parameter to the REAL property name the bridge would touch.
+
+    For every logical name the classifier exposes, walk its candidate tuple with matched_prop
+    and surface the first property that actually exists on the target object — the on-box
+    checklist reads this to confirm which V-Ray build alias won without firing a single write.
+    The dome texmap is resolved exactly as read_dome_rotation does (get_prop(dome, ("texmap",)));
+    a texmap-less (or entirely absent) dome leaves the tex_* rows None instead of raising, and
+    all 12 keys are always present. The atmosphere/dome-intensity rows use the report-only
+    *_REPORT tuples, so the shared write tuples are never consulted here.
+
+    record=True stores the result in module-level LAST_ALIASES. Off-Max → {} (record-don't-raise).
+    """
+    try:
+        _rt()
+    except Exception:
+        return {}
+    sun = rig.get("sun")
+    dome = rig.get("dome")
+    atmosphere = rig.get("atmosphere")
+    tex = get_prop(dome, ("texmap",))       # None when the dome is absent or carries no texmap
+    aliases: Dict[str, Optional[str]] = {
+        "sun.intensity": matched_prop(sun, SUN_INTENSITY),
+        "sun.size": matched_prop(sun, SUN_SIZE),
+        "sun.turbidity": matched_prop(sun, SUN_TURBIDITY),
+        "sun.enabled": matched_prop(sun, LIGHT_ON),
+        "dome.enabled": matched_prop(dome, LIGHT_ON),
+        "dome.intensity": matched_prop(dome, LIGHT_MULT_REPORT),
+        "dome.tex_on": matched_prop(dome, DOME_TEX_ON),
+        "dome.tex_rotation": matched_prop(tex, DOME_TEX_ROT),
+        "dome.tex_file": matched_prop(tex, DOME_TEX_FILE),
+        "atmosphere.enabled": matched_prop(atmosphere, FOG_ON),
+        "atmosphere.distance": matched_prop(atmosphere, FOG_DISTANCE_REPORT),
+        "atmosphere.height": matched_prop(atmosphere, FOG_HEIGHT_REPORT),
+    }
+    if record:
+        global LAST_ALIASES
+        LAST_ALIASES = aliases
+    return aliases

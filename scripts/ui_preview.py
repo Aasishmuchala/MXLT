@@ -20,6 +20,23 @@ if REPO not in sys.path:
 OUT = os.path.join(REPO, "docs", "ui")
 
 
+def _ensure_fonts() -> None:
+    """The offscreen Qt platform on Windows can start with an EMPTY font DB — labels then
+    render as tofu (□). Load the stock Windows fonts the dock names — Segoe UI (prose),
+    Consolas (mono instrument labels), Segoe UI Symbol (icon glyphs ↻ ✕ → ↔ ⚠) — so the
+    previews match what real 3ds Max shows. No-op where a font DB already exists (CI/mac)."""
+    from PySide6 import QtGui
+
+    if QtGui.QFontDatabase.families():
+        return
+    win_fonts = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+    for name in ("segoeui.ttf", "segoeuib.ttf", "seguisb.ttf", "consola.ttf",
+                 "consolab.ttf", "seguisym.ttf"):
+        path = os.path.join(win_fonts, name)
+        if os.path.exists(path):
+            QtGui.QFontDatabase.addApplicationFont(path)
+
+
 def _fake_render(path: str, w: int = 480, h: int = 270, warm: bool = True) -> str:
     from PIL import Image
 
@@ -47,6 +64,7 @@ def main() -> None:
     dockmod.Controller = T.FakeController
     dockmod.cfgmod.load = lambda: Config(api_key="oc_preview")
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    _ensure_fonts()
 
     ref_warm = _fake_render(os.path.join(OUT, "_ref.png"), warm=True)
     ref_cool = _fake_render(os.path.join(OUT, "_render.png"), warm=False)
@@ -139,7 +157,7 @@ def main() -> None:
             os.remove(os.path.join(OUT, f))
         except OSError:
             pass
-    print(f"previews → {OUT}: dock.png, board.png, report.png, plan.png, settings.png")
+    print(f"previews -> {OUT}: dock.png, board.png, report.png, plan.png, settings.png")
 
 
 if __name__ == "__main__":

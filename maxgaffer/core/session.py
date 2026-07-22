@@ -21,7 +21,7 @@ from .genome import LightingState
 
 log = logging.getLogger(__name__)
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 
 
 def _str_list(value) -> List:
@@ -54,6 +54,52 @@ def reference_signature(path: str) -> str:
 
 
 @dataclass
+class RefEntry:
+    """One reference image bound to a camera.
+
+    A camera can carry several (a hero angle plus supporting views); the FIRST entry is
+    always the PRIMARY and its fields are mirrored onto the legacy single-reference columns
+    of :class:`CameraEntry` for backward compatibility.  ``semantics`` / ``score`` are only
+    meaningful for the primary today — Route A never feeds the extra views to the solve.
+    """
+
+    path: str = ""                            # reference image path
+    relative: str = ""                        # portable path relative to the scene folder
+    signature: str = ""                       # path + stat identity for in-place changes
+    role: str = "primary"                     # "primary" | "angle_N" | artist-supplied label
+    semantics: Dict = field(default_factory=dict)   # cached ANALYZE result (primary only)
+    score: Optional[float] = None
+
+    def to_dict(self) -> Dict:
+        return {
+            "path": self.path,
+            "relative": self.relative,
+            "signature": self.signature,
+            "role": self.role,
+            "semantics": self.semantics,
+            "score": self.score,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "RefEntry":
+        score_raw = d.get("score")
+        try:
+            score = float(score_raw) if isinstance(score_raw, (int, float)) else None
+            if score is not None and not math.isfinite(score):
+                score = None
+        except (TypeError, ValueError):
+            score = None
+        return cls(
+            path=str(d.get("path") or ""),
+            relative=str(d.get("relative") or ""),
+            signature=str(d.get("signature") or ""),
+            role=str(d.get("role") or "primary"),
+            semantics=d.get("semantics") if isinstance(d.get("semantics"), dict) else {},
+            score=score,
+        )
+
+
+@dataclass
 class CameraEntry:
     camera_id: str = ""                       # persistent Max anim handle when available
     camera_name: str = ""                     # display label; may change without losing state
@@ -71,6 +117,58 @@ class CameraEntry:
     pre_seed: Dict = field(default_factory=dict)    # dome texture/rotation before seeding
     scorecard: Dict = field(default_factory=dict)   # component confidence + honest gap read
     artist_feedback: List[Dict] = field(default_factory=list)
+    # MULTI-REFERENCE (appended last, all existing fields unchanged): references[0] is the
+    # PRIMARY. The legacy reference / reference_relative / reference_signature / semantics /
+    # score columns ABOVE always mirror references[0]; when references == [] and a legacy
+    # reference is set the primary is synthesized on demand (to_dict/_effective_refs) so an
+    # in-memory legacy-only entry serializes IDENTICALLY to its post-load form.
+    references: List["RefEntry"] = field(default_factory=list)
+
+    # -- primary mirror helpers -----------------------------------------------------------
+    def _synth_primary(self) -> "RefEntry":
+        """The single primary RefEntry implied by the legacy columns."""
+        return RefEntry(path=self.reference, relative=self.reference_relative,
+                        signature=self.reference_signature, role="primary",
+                        semantics=self.semantics, score=self.score)
+
+    def _effective_refs(self) -> List["RefEntry"]:
+        """The reference list this entry serializes as.
+
+        When ``references`` is populated the PRIMARY is re-synced from the authoritative
+        legacy columns first — record_match / analyze update the legacy trio+semantics+score,
+        not the stored RefEntry — so to_dict stays symmetric with from_dict.  When empty but a
+        legacy reference is set, the primary is synthesized on demand; when both empty, [].
+        """
+        if self.references:
+            primary = self.references[0]
+            primary.path = self.reference
+            primary.relative = self.reference_relative
+            primary.signature = self.reference_signature
+            primary.role = "primary"
+            primary.semantics = self.semantics
+            primary.score = self.score
+            return self.references
+        if self.reference != "":
+            return [self._synth_primary()]
+        return []
+
+    def _mirror_primary(self) -> None:
+        """Re-mirror the legacy trio + semantics + score onto references[0] (or clear when
+        the list is empty, reproducing set_reference('')'s '|missing' cleared signature)."""
+        if self.references:
+            p = self.references[0]
+            p.role = "primary"
+            self.reference = p.path
+            self.reference_relative = p.relative
+            self.reference_signature = p.signature
+            self.semantics = p.semantics
+            self.score = p.score
+        else:
+            self.reference = ""
+            self.reference_relative = ""
+            self.reference_signature = reference_signature("")
+            self.semantics = {}
+            self.score = None
 
     def to_dict(self) -> Dict:
         return {
@@ -90,6 +188,7 @@ class CameraEntry:
             "pre_seed": dict(self.pre_seed),
             "scorecard": dict(self.scorecard),
             "artist_feedback": list(self.artist_feedback),
+            "references": [r.to_dict() for r in self._effective_refs()],
         }
 
     @classmethod
@@ -103,7 +202,7 @@ class CameraEntry:
                 score = None
         except (TypeError, ValueError):
             score = None
-        return cls(
+        entry = cls(
             camera_id=str(d.get("camera_id") or ""),
             camera_name=str(d.get("camera_name") or ""),
             reference=str(d.get("reference") or ""),
@@ -122,6 +221,17 @@ class CameraEntry:
             artist_feedback=[dict(x) for x in _str_list(d.get("artist_feedback"))
                              if isinstance(x, dict)][-50:],
         )
+        raw_refs = d.get("references")
+        parsed = ([RefEntry.from_dict(r) for r in raw_refs if isinstance(r, dict)]
+                  if isinstance(raw_refs, (list, tuple)) else [])
+        if parsed:
+            entry.references = parsed
+            entry._mirror_primary()          # self-heal the legacy trio to references[0]
+        elif entry.reference != "":
+            entry.references = [entry._synth_primary()]   # legacy / v2 sidecar → 1 primary
+        else:
+            entry.references = []
+        return entry
 
 
 class Session:
@@ -203,12 +313,21 @@ class Session:
                     loaded = CameraEntry.from_dict(entry)
                     if not loaded.camera_name:
                         loaded.camera_name = str(name)
-                    if loaded.reference_relative and path:
-                        candidate = os.path.normpath(os.path.join(
-                            os.path.dirname(path), loaded.reference_relative))
-                        # Prefer the project-relative copy after a project folder move.
-                        if os.path.isfile(candidate):
-                            loaded.reference = candidate
+                    if path and loaded.references:
+                        for ref in loaded.references:
+                            if not ref.relative:
+                                continue
+                            candidate = os.path.normpath(os.path.join(
+                                os.path.dirname(path), ref.relative))
+                            # Prefer the project-relative copy after a project folder move.
+                            if os.path.isfile(candidate):
+                                ref.path = candidate
+                                try:
+                                    ref.relative = os.path.relpath(
+                                        candidate, os.path.dirname(path))
+                                except (OSError, ValueError):
+                                    pass
+                        loaded._mirror_primary()   # re-mirror the FULL trio to references[0]
                     s.cameras[str(name)] = loaded
                 except Exception as e:  # one corrupt camera must not kill the rest
                     log.warning("MaxGaffer: skipping corrupt camera entry %r in %s: %s",
@@ -303,23 +422,153 @@ class Session:
         self.cameras[key] = entry
         return entry
 
-    def set_reference(self, camera: str, ref_path: str, camera_id: str = "") -> None:
-        e = self.entry(camera, camera_id)
-        rel = ""
+    def _relative_to_sidecar(self, ref_path: str) -> str:
+        """Portable path of ``ref_path`` relative to the sidecar folder ("" when not
+        expressible as a forward-only relative, or when there is no bound scene)."""
         if ref_path and self.path:
             try:
                 rel_candidate = os.path.relpath(ref_path, os.path.dirname(self.path))
                 if rel_candidate != os.pardir and not rel_candidate.startswith(os.pardir + os.sep):
-                    rel = rel_candidate
+                    return rel_candidate
             except (OSError, ValueError):
                 pass
+        return ""
+
+    def set_reference(self, camera: str, ref_path: str, camera_id: str = "") -> None:
+        """Replace ALL references with a single primary (unchanged single-reference API).
+
+        The change-gate compares against the OLD primary path/signature: binding the same
+        reference does NOT reset the cached analysis or score; binding a new one (or the same
+        path whose file changed in place) does — byte-identical to the previous behavior."""
+        e = self.entry(camera, camera_id)
+        rel = self._relative_to_sidecar(ref_path)
         signature = reference_signature(ref_path)
-        if e.reference != ref_path or e.reference_signature != signature:
-            e.reference = ref_path
-            e.reference_relative = rel
-            e.reference_signature = signature
+        changed = (e.reference != ref_path or e.reference_signature != signature)
+        if not changed:
+            # Same primary: preserve the legacy trio / semantics / score EXACTLY (a
+            # byte-identical no-op for the single-reference case), only collapsing any extra
+            # angle references down to the one primary per the replace-all contract.
+            if ref_path == "":
+                e.references = []
+            else:
+                e.references = [RefEntry(path=e.reference, relative=e.reference_relative,
+                                         signature=e.reference_signature, role="primary",
+                                         semantics=e.semantics, score=e.score)]
+            return
+        if ref_path == "":
+            e.references = []
+            e.reference = ""
+            e.reference_relative = ""
+            e.reference_signature = signature      # reference_signature("") == "|missing"
             e.semantics = {}          # a new reference invalidates the cached analysis
             e.score = None
+        else:
+            e.references = [RefEntry(path=ref_path, relative=rel, signature=signature,
+                                     role="primary", semantics={}, score=None)]
+            e._mirror_primary()
+
+    def add_reference(self, camera: str, ref_path: str, role: str = "",
+                      camera_id: str = "") -> None:
+        """Append a supporting reference without disturbing the primary.
+
+        No-op for an empty path or a duplicate signature.  When the camera has no reference
+        yet the added one becomes the primary (identical to :meth:`set_reference`)."""
+        if ref_path == "":
+            return
+        e = self.entry(camera, camera_id)
+        if not e.references:
+            if e.reference != "":
+                e.references = [e._synth_primary()]   # materialize the legacy-only primary
+            else:
+                self.set_reference(camera, ref_path, camera_id)
+                return
+        signature = reference_signature(ref_path)
+        for r in e.references:
+            if r.signature == signature:
+                return
+        e.references.append(RefEntry(path=ref_path,
+                                     relative=self._relative_to_sidecar(ref_path),
+                                     signature=signature,
+                                     role=(role or f"angle_{len(e.references)}")))
+
+    def set_references(self, camera: str, items: List, camera_id: str = "") -> None:
+        """Replace the whole reference list; ``items`` are path strings or {"path","role"}.
+
+        The first surviving item is the primary (role forced "primary"); the rest keep their
+        given role or default to ``angle_<i>``.  Duplicates (by signature) are dropped, first
+        wins.  The primary's cached analysis / score is only reset when the new primary
+        path/signature differs from the old primary (same gate as set_reference).  Empty
+        ``items`` is equivalent to ``set_reference(camera, "")``."""
+        normalized: List = []
+        for it in items or []:
+            if isinstance(it, dict):
+                p = str(it.get("path") or "")
+                role = str(it.get("role") or "")
+            else:
+                p = str(it or "")
+                role = ""
+            if p != "":
+                normalized.append((p, role))
+        if not normalized:
+            self.set_reference(camera, "", camera_id)
+            return
+        e = self.entry(camera, camera_id)
+        old_primary_path = e.reference
+        old_primary_sig = e.reference_signature
+        new_refs: List["RefEntry"] = []
+        seen: Set[str] = set()
+        for i, (p, role) in enumerate(normalized):
+            sig = reference_signature(p)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            forced_role = "primary" if i == 0 else (role or f"angle_{i}")
+            new_refs.append(RefEntry(path=p, relative=self._relative_to_sidecar(p),
+                                     signature=sig, role=forced_role))
+        primary = new_refs[0]
+        if old_primary_path == primary.path and old_primary_sig == primary.signature:
+            primary.semantics = e.semantics   # unchanged primary → preserve cached analysis
+            primary.score = e.score
+        e.references = new_refs
+        e._mirror_primary()
+
+    def references(self, camera: str, camera_id: str = "") -> List["RefEntry"]:
+        """The resolved camera's references (camera_id-first lookup); [] when unknown.
+        Returns the stored list, or the synthesized 1-item primary for a legacy-only entry.
+        Read-only — does not create an entry."""
+        e = self.find(camera, camera_id)
+        if e is None:
+            return []
+        return list(e._effective_refs())
+
+    def remove_reference(self, camera: str, ref, camera_id: str = "") -> bool:
+        """Remove a reference by int index or str path/signature; True if one was removed.
+        When the primary (index 0) is removed the next reference becomes primary (or the
+        legacy columns clear when the list empties) and the legacy trio re-mirrors."""
+        e = self.find(camera, camera_id)
+        if e is None:
+            return False
+        if not e.references and e.reference != "":
+            e.references = [e._synth_primary()]   # materialize the legacy-only primary
+        if not e.references:
+            return False
+        idx: Optional[int] = None
+        if isinstance(ref, bool):                 # bool is an int subclass — never an index
+            return False
+        if isinstance(ref, int):
+            if 0 <= ref < len(e.references):
+                idx = ref
+        else:
+            target = str(ref)
+            for i, r in enumerate(e.references):
+                if r.path == target or r.signature == target:
+                    idx = i
+                    break
+        if idx is None:
+            return False
+        e.references.pop(idx)
+        e._mirror_primary()
+        return True
 
     def record_match(self, camera: str, state: LightingState,
                      score: Optional[float], camera_id: str = "") -> None:
@@ -347,25 +596,44 @@ class Session:
         return [(e.camera_name or n) for n, e in self.cameras.items() if e.state is not None]
 
     def relink_references(self, roots: List[str]) -> Dict[str, str]:
-        """Relink missing references by their portable relative path or unique basename."""
+        """Relink missing references by their portable relative path or unique basename.
+
+        EVERY RefEntry a camera carries is repaired — a hit rewrites its path, signature AND
+        portable relative (the old single-reference path did not refresh the relative; the
+        per-RefEntry rewrite fixes that) — then the legacy trio is re-mirrored to the primary.
+        The returned dict is still keyed camera name -> newly-resolved PRIMARY path (only
+        cameras whose primary was relinked appear)."""
         changed: Dict[str, str] = {}
         valid_roots = [os.path.abspath(r) for r in roots if r and os.path.isdir(r)]
         for key, entry in self.cameras.items():
-            if not entry.reference or os.path.isfile(entry.reference):
-                continue
-            candidates: List[str] = []
-            for root in valid_roots:
-                if entry.reference_relative:
-                    candidates.append(os.path.join(root, entry.reference_relative))
-                basename = os.path.basename(entry.reference)
-                candidates.extend(os.path.join(dp, basename) for dp, _dirs, files in os.walk(root)
-                                  if basename in files)
-            hits = [os.path.normpath(p) for p in candidates if os.path.isfile(p)]
-            hits = list(dict.fromkeys(hits))
-            if len(hits) == 1:
-                entry.reference = hits[0]
-                entry.reference_signature = reference_signature(hits[0])
-                changed[entry.camera_name or key] = hits[0]
+            if not entry.references and entry.reference != "":
+                entry.references = [entry._synth_primary()]   # materialize legacy-only primary
+            touched = False
+            primary_relinked = False
+            for idx, ref in enumerate(entry.references):
+                if not ref.path or os.path.isfile(ref.path):
+                    continue
+                candidates: List[str] = []
+                for root in valid_roots:
+                    if ref.relative:
+                        candidates.append(os.path.join(root, ref.relative))
+                    basename = os.path.basename(ref.path)
+                    candidates.extend(os.path.join(dp, basename)
+                                      for dp, _dirs, files in os.walk(root)
+                                      if basename in files)
+                hits = [os.path.normpath(p) for p in candidates if os.path.isfile(p)]
+                hits = list(dict.fromkeys(hits))
+                if len(hits) == 1:
+                    ref.path = hits[0]
+                    ref.signature = reference_signature(hits[0])
+                    ref.relative = self._relative_to_sidecar(hits[0]) or ref.relative
+                    touched = True
+                    if idx == 0:
+                        primary_relinked = True
+            if touched:
+                entry._mirror_primary()
+            if primary_relinked:
+                changed[entry.camera_name or key] = entry.references[0].path
         return changed
 
 

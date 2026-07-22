@@ -27,7 +27,9 @@ from .maxbridge.controller import Controller
 
 __all__ = ["match_camera", "match_all_cameras", "apply_camera_state",
            "render_cameras", "export_vrscenes_for_vantage", "get_controller",
-           "seed_dome", "scenario_board", "adopt_scenario", "bake_lighting_animation"]
+           "seed_dome", "scenario_board", "adopt_scenario", "bake_lighting_animation",
+           "add_reference", "list_references", "remove_reference",
+           "assess_reference_fairness"]
 
 _shared: Optional[Controller] = None
 
@@ -87,13 +89,23 @@ def match_camera(
     deep: bool = False,
     quality_profile: str = "standard",
     config_overrides: Optional[Dict] = None,
+    references: Optional[List] = None,
 ) -> Dict:
     """Bind ``reference_path`` (if given) to ``camera_name`` and run the full match loop.
     ``quality_profile`` accepts ``fast``, ``standard``, or ``hero``. ``deep=True`` remains
     a compatibility alias for Hero mode: target 99 with bounded coordinate-descent polish;
-    ``ceiling_converged`` in the result means the remaining gap is content, not lighting."""
+    ``ceiling_converged`` in the result means the remaining gap is content, not lighting.
+
+    ``references`` (optional) supersedes ``reference_path`` when supplied: a list of path
+    strings and/or ``{"path", "role"}`` dicts, the FIRST becoming the primary. Left None
+    (default), the single ``reference_path`` bind is used exactly as before. The returned
+    dict keys are unchanged either way; use ``assess_reference_fairness`` for the fairness
+    verdict."""
     ctrl = get_controller(config_overrides)
-    if reference_path:
+    if references is not None:
+        ctrl.set_references(camera_name, references)
+        ctrl._save_or_warn(log)
+    elif reference_path:
         ctrl.bind_reference(camera_name, reference_path)
         ctrl._save_or_warn(log)
     result = ctrl.run_match(camera_name, log=log, should_cancel=should_cancel,
@@ -120,6 +132,39 @@ def match_all_cameras(
 ) -> Dict[str, str]:
     """Match every camera that has a reference bound (unattended queue)."""
     return get_controller(config_overrides).match_all(log, should_cancel, do_sweep=sweep)
+
+
+def add_reference(camera_name: str, path: str, role: str = "") -> Dict:
+    """Append one more reference view to ``camera_name`` (the primary is untouched — the
+    first bound reference stays authoritative for the solve). Empty ``path`` is a no-op;
+    a duplicate signature is deduped. → the camera's full reference list after the add."""
+    ctrl = get_controller()
+    ctrl.add_reference(camera_name, path, role)
+    return {"references": ctrl.references(camera_name)}
+
+
+def list_references(camera_name: str) -> List[Dict]:
+    """The camera's references as plain dicts — ``{path, relative, signature, role, score,
+    has_semantics}`` each, primary first (a legacy single-ref camera reports its lone
+    synthesized primary)."""
+    return get_controller().references(camera_name)
+
+
+def remove_reference(camera_name: str, ref) -> Dict:
+    """Drop a reference by int index OR by path/signature string. Removing the primary
+    promotes the next view to primary (legacy fields re-mirror). → ``{"removed": bool,
+    "references": [...]}``."""
+    ctrl = get_controller()
+    removed = ctrl.remove_reference(camera_name, ref)
+    return {"removed": removed, "references": ctrl.references(camera_name)}
+
+
+def assess_reference_fairness(camera_name: str) -> Dict:
+    """Read-only fairness verdict for the camera's PRIMARY reference vs the current/last
+    render: can the scene be constrained to the reference, or do albedo/content gaps make
+    an exact match physically unreachable (→ lock exposure by eye)? Never mutates the rig.
+    → the fairness.assess(...) dict (predictive pre-match path — no director signals)."""
+    return get_controller().assess_fairness(camera_name)
 
 
 def bake_lighting_animation(camera_name: str, keyframes: Dict[int, Dict],

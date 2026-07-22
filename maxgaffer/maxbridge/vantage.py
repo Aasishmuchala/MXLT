@@ -69,6 +69,38 @@ def _probe_live_link(rt):
     return None
 
 
+def _global_name(expr: str) -> str:
+    """The bare identifier for an ``isGlobal`` existence test — a live-link entry point is
+    stored as a call expression (``name()``); drop the trailing ``()``."""
+    return expr[:-2] if expr.endswith("()") else expr
+
+
+def _probe_live_link_gated(rt):
+    """Existence-gated twin of :func:`_probe_live_link`, for the NON-destructive
+    ``probe_entrypoints`` census. A state query is rt.execute'd ONLY when
+    ``rt.globalVars.isGlobal`` confirms the global exists, so an undefined name is never
+    evaluated — and a VERIFIED state query is inherently safe to read (unlike the TOGGLE
+    globals, which are existence-tested but never executed). → True/False when a gated probe
+    answered, None when the state is undetectable or globalVars is unavailable."""
+    try:
+        is_global = rt.globalVars.isGlobal
+    except Exception:
+        return None
+    for expr in LIVE_LINK_PROBES:
+        try:
+            if not bool(is_global(rt.Name(_global_name(expr)))):
+                continue
+        except Exception:
+            continue
+        try:
+            val = rt.execute(expr)
+        except Exception:
+            continue
+        if isinstance(val, bool):
+            return val
+    return None
+
+
 LIVE_LINK_PORTS = (20701, 20703)   # 20701 stock · 20703 on V-Ray 7.3 DR2
 
 
@@ -155,6 +187,85 @@ def _find_live_link_action():
     return None
 
 
+def probe_entrypoints() -> Dict:
+    """NON-DESTRUCTIVE census of every live-link entry point — the toggle is NEVER fired.
+    The V-Ray "Initiate a Live-Link" action is a TOGGLE (executing it flips an active link
+    OFF), so this reports what EXISTS without ever executing it:
+
+      * ``link_running()`` is the authoritative attach signal — a real socket listener on a
+        live-link port (NOTE: it can false-positive if an unrelated process happens to hold
+        20701/20703);
+      * the toggle globals are existence-tested via ``globalVars.isGlobal`` ONLY;
+      * each state-query global is existence-gated before its (safe) read;
+      * ``_find_live_link_action()`` is LOCATED but NOT executed.
+
+    Degrades off-Max: ``in_max`` False, ``action_present``/``globals_present`` False/[], but
+    the socket probe (pure stdlib) still runs."""
+    port = link_running()
+    result: Dict = {
+        "link_running_port": port,
+        "link_attached": port is not None,
+        "probe_state": None,
+        "action_present": False,
+        "action_label": None,
+        "globals_present": [],
+        "ports": list(LIVE_LINK_PORTS),
+        "in_max": False,
+    }
+    try:
+        rt = _rt()
+    except Exception:
+        return result
+    result["in_max"] = True
+    result["probe_state"] = _probe_live_link_gated(rt)      # gated read, never a toggle
+    present: List[str] = []
+    for expr in LIVE_LINK_GLOBALS:                           # TOGGLE globals: existence only
+        name = _global_name(expr)
+        try:
+            if bool(rt.globalVars.isGlobal(rt.Name(name))):
+                present.append(name)
+        except Exception:
+            continue
+    result["globals_present"] = present
+    try:
+        hit = _find_live_link_action()                      # located, NOT executed
+    except Exception:
+        hit = None
+    if hit is not None:
+        _action, label = hit
+        result["action_present"] = True
+        result["action_label"] = str(label) if label else None
+    return result
+
+
+def _export_vrscene_call(rt, path: str, frame: int) -> bool:
+    """Invoke ``rt.vrayExportVRScene`` with a KEYWORD-PROBE that RETAINS compression across
+    V-Ray builds. The compression-keyword spelling and the startFrame/endFrame keywords vary
+    by build and are unverified off-box, so the richest signature is tried first and, when a
+    build REJECTS a keyword (TypeError / MAXScript keyword mismatch), the next candidate is
+    tried — the compression keyword is kept as long as possible and the bare path is only a
+    LAST resort (dropping straight to the bare path would silently lose the compression that
+    keeps multi-GB interiors manageable). The onbox smoke harness records which candidate the
+    live build accepted. → True when a call completed without raising (the caller still
+    verifies the file was written)."""
+    for kwargs in (
+        {"compressed": True, "startFrame": frame, "endFrame": frame},
+        {"exportCompressed": True, "startFrame": frame, "endFrame": frame},
+        {"compressed": True},
+        {"exportCompressed": True},
+    ):
+        try:
+            rt.vrayExportVRScene(path, **kwargs)
+            return True
+        except Exception:      # noqa: BLE001 rejected keyword / build mismatch → next candidate
+            continue
+    try:                       # bare-path fallback, last — an uncompressed export beats none
+        rt.vrayExportVRScene(path)
+        return True
+    except Exception:          # noqa: BLE001
+        return False
+
+
 def export_vrscene(path: str, camera_name: Optional[str] = None) -> Optional[str]:
     """Export the current scene (single frame, active camera) as .vrscene. The viewport's
     previously active camera is restored afterwards — a batch export must not leave the
@@ -175,13 +286,8 @@ def export_vrscene(path: str, camera_name: Optional[str] = None) -> Optional[str
             frame = int(rt.currentTime.frame) if hasattr(rt.currentTime, "frame") else 0
         except Exception:
             frame = 0
-        try:  # rich signature first (compressed keeps multi-GB interiors manageable)
-            rt.vrayExportVRScene(path, exportCompressed=True, startFrame=frame, endFrame=frame)
-        except Exception:
-            try:
-                rt.vrayExportVRScene(path)
-            except Exception:
-                return None
+        if not _export_vrscene_call(rt, path, frame):   # keyword-probe retains compression
+            return None
         return path if os.path.exists(path) else None
     finally:
         if prev_cam is not None:
@@ -189,6 +295,40 @@ def export_vrscene(path: str, camera_name: Optional[str] = None) -> Optional[str
                 rt.viewport.setCamera(prev_cam)
             except Exception:
                 pass
+
+
+def vrscene_export_available(cfg=None) -> Dict:
+    """NON-DESTRUCTIVE report on the .vrscene export path — nothing is exported. Reports
+    whether the MaxScript exporter global exists (``hasattr(rt, "vrayExportVRScene")``) plus,
+    when a config is supplied, whether the Vantage console/app executables are on disk. The
+    exporter's signature keywords vary across V-Ray builds, so :func:`export_vrscene`
+    keyword-probes them at export time; stock Vantage 3.x has no headless CLI render (finals
+    go through V-Ray in Max or the in-app batch queue). Off-Max the exporter reads
+    unavailable; the executable checks are pure ``os.path.exists``."""
+    try:
+        available = hasattr(_rt(), "vrayExportVRScene")
+    except Exception:
+        available = False
+    console_present: Optional[bool] = None
+    vantage_present: Optional[bool] = None
+    if cfg is not None:
+        try:
+            console_present = os.path.exists(str(getattr(cfg, "vantage_console", "") or ""))
+        except Exception:
+            console_present = None
+        try:
+            vantage_present = os.path.exists(str(getattr(cfg, "vantage_exe", "") or ""))
+        except Exception:
+            vantage_present = None
+    return {
+        "available": available,
+        "method": "vrayExportVRScene" if available else "unavailable",
+        "console_exe_present": console_present,
+        "vantage_exe_present": vantage_present,
+        "notes": ("vrayExportVRScene(path[, compressed|exportCompressed, startFrame, "
+                  "endFrame]) — keyword spelling varies by V-Ray build and is keyword-probed "
+                  "at export time; stock Vantage 3.x has no headless CLI render."),
+    }
 
 
 def _output_written(output: str, min_mtime: Optional[float] = None) -> bool:

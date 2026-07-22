@@ -22,7 +22,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List
 
-from .metrics import cosine, hist_emd
+from .metrics import cosine, hist_emd, illuminant_similarity
 
 DEFAULT_WEIGHTS: Dict[str, float] = {
     "key": 0.19,
@@ -32,6 +32,12 @@ DEFAULT_WEIGHTS: Dict[str, float] = {
     "hue": 0.13,
     "direction": 0.15,   # 3×3 luminance-grid cosine — WHERE the light lives
 }
+
+# Report-only note the scorecard fairness fallback carries when a content gap is suspected.
+# Kept distinct from the director's "white room vs dark wood" remedy so the two never read as
+# competing verdicts (the remedy belongs to fairness.assess / the director diagnosis).
+_ALBEDO_NOTE = ("reference and scene may differ in albedo/material distribution, "
+                "not lighting alone")
 
 PREFERENCE_PROFILES: Dict[str, Dict[str, float]] = {
     "balanced": dict(DEFAULT_WEIGHTS),
@@ -58,7 +64,8 @@ def weights_for(preference: str = "balanced", overrides: Dict[str, float] = None
 
 
 def scorecard(score_value: float, components: Dict[str, float], *,
-              ceiling_proven: bool = False, ceiling_converged: bool = False) -> Dict:
+              ceiling_proven: bool = False, ceiling_converged: bool = False,
+              fairness: Dict = None) -> Dict:
     """Honest human-readable interpretation of the proxy score and its likely gap."""
     clean = {key: max(0.0, min(1.0, _num(value)))
              for key, value in (components or {}).items() if key in DEFAULT_WEIGHTS}
@@ -83,6 +90,25 @@ def scorecard(score_value: float, components: Dict[str, float], *,
     if content_gap:
         likely.append("scene content/albedo/material distribution—not lighting alone")
     confidence = "high" if coverage >= 0.90 else "medium" if coverage >= 0.65 else "low"
+    # A full fairness.assess() result rides through verbatim; when absent we synthesize a
+    # self-contained fallback carrying the SAME keys assess() returns, so the dock's
+    # per-field reads never KeyError on older/ungraded runs. Opaque data downstream.
+    if isinstance(fairness, dict):
+        fairness_card = fairness
+    else:
+        fairness_card = {
+            "verdict": "unknown",
+            "constrainable": None,
+            "albedo_risk": 0.0,
+            "same_scene": False,
+            "predicted_ev_gap": 0.0,
+            "predicted_wb_gap": 0.0,
+            "unreconstructable": [],
+            "predicts_leash_trip": False,
+            "remedy": "",
+            "albedo_suspect": bool(content_gap),
+            "notes": (_ALBEDO_NOTE if content_gap else ""),
+        }
     return {
         "score": score_value,
         "components": clean,
@@ -92,6 +118,7 @@ def scorecard(score_value: float, components: Dict[str, float], *,
         "weakest": weakest,
         "likely_gap": likely,
         "content_gap": content_gap,
+        "fairness": fairness_card,
         "ceiling": "proven" if ceiling_proven else
                    "plateau" if ceiling_converged else "not_tested",
         "disclaimer": ("This measures tonal, color, and direction statistics; it is not "
@@ -103,6 +130,9 @@ def scorecard(score_value: float, components: Dict[str, float], *,
 class Verdict:
     score: float                      # 0..100
     components: Dict[str, float] = field(default_factory=dict)   # each 0..1
+    # diagnostic ONLY (e.g. {"illuminant_match": …}); NEVER enters the score. Populating it
+    # diverges two otherwise-equal Verdicts, so Verdict must never be compared by == / asdict.
+    fairness: Dict = field(default_factory=dict)
 
     def summary(self) -> str:
         parts = ", ".join(f"{k}={v:.2f}" for k, v in sorted(self.components.items()))
@@ -216,10 +246,13 @@ def score(ref: Dict, cur: Dict, weights: Dict[str, float] = None) -> Verdict:
         g_ref, g_cur = _seq(ref.get("grid")), _seq(cur.get("grid"))
     if g_ref and g_cur and len(g_ref) == len(g_cur) and any(abs(v) > 1e-6 for v in g_ref):
         comps["direction"] = max(0.0, (cosine(g_ref, g_cur) + 1.0) / 2.0)
+    # diagnostic ONLY — the illuminant estimate is absent from DEFAULT_WEIGHTS and from
+    # comps, so it NEVER enters the weighted score; None on legacy stats without illum_*
+    fairness_diag = {"illuminant_match": illuminant_similarity(ref, cur)}
     # only weigh what was measurable — old stats without a grid renormalize cleanly;
     # NOTHING measurable = unmeasurable comparison, scored 0 (never a false perfect)
     if not comps:
-        return Verdict(score=0.0, components={})
+        return Verdict(score=0.0, components={}, fairness=fairness_diag)
     total_w = sum(w[k] for k in comps) or 1.0
     total = sum(w[k] * comps[k] for k in comps) / total_w
-    return Verdict(score=round(100.0 * total, 2), components=comps)
+    return Verdict(score=round(100.0 * total, 2), components=comps, fairness=fairness_diag)

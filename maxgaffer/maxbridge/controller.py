@@ -20,9 +20,9 @@ import subprocess
 import time
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from ..core import (animation, consensus, critic, domeseed, expose, feedback, metrics, omega,
-                    planner, profiles, prompts, providers, rules, scenedigest,
-                    scenarios as scen)
+from ..core import (animation, consensus, critic, domeseed, expose, fairness, feedback,
+                    metrics, omega, planner, profiles, prompts, providers, rules,
+                    scenedigest, scenarios as scen)
 from ..core.director import Hooks, MatchConfig, MatchResult, run_match, run_sun_sweep
 from ..core.genome import LightingState
 from ..core.parse import ParseError, validate_analysis
@@ -151,6 +151,35 @@ class Controller:
 
     def bind_reference(self, camera_name: str, path: str) -> None:
         self.session.set_reference(camera_name, path, self._camera_id(camera_name))
+
+    def add_reference(self, camera_name: str, path: str, role: str = "") -> None:
+        """Append a supporting reference view (Route A: the primary stays authoritative for
+        the solve; extra views only DENOISE the semantic ANALYZE). No-op on an empty path or
+        a duplicate signature; persists the session."""
+        self.session.add_reference(camera_name, path, role, self._camera_id(camera_name))
+        self.save_session()
+
+    def set_references(self, camera_name: str, items: List) -> None:
+        """Replace the whole reference list — ``items`` are path strings and/or
+        ``{"path", "role"}`` dicts, the FIRST becoming the primary. Empty → clears them."""
+        self.session.set_references(camera_name, items, self._camera_id(camera_name))
+        self.save_session()
+
+    def remove_reference(self, camera_name: str, ref) -> bool:
+        """Drop a reference by int index OR path/signature string; True when one was removed.
+        Removing the primary promotes the next view (the legacy mirror re-syncs)."""
+        removed = self.session.remove_reference(camera_name, ref,
+                                                self._camera_id(camera_name))
+        self.save_session()
+        return removed
+
+    def references(self, camera_name: str) -> List[Dict]:
+        """The camera's references as plain dicts (primary first). A legacy single-reference
+        camera reports its lone synthesized primary — ``{path, relative, signature, role,
+        score, has_semantics}`` each. Read-only."""
+        return [{"path": r.path, "relative": r.relative, "signature": r.signature,
+                 "role": r.role, "score": r.score, "has_semantics": bool(r.semantics)}
+                for r in self.session.references(camera_name, self._camera_id(camera_name))]
 
     def _record_match(self, camera_name: str, state: LightingState,
                       score: Optional[float]) -> None:
@@ -331,10 +360,19 @@ class Controller:
         return None
 
     def analyze_reference(self, camera_name: str) -> Dict:
-        """ANALYZE call (cached in the session until the reference changes)."""
+        """ANALYZE call (cached in the session until the reference changes).
+
+        A single reference (the default) takes the byte-for-byte original path. When the
+        camera carries MORE than one reference, each view is analyzed under its own signature
+        gate and the reads are FUSED with the same consensus consolidator — a denoised primary
+        ANALYZE (Route A: extra views sharpen the semantic consensus; they never reach the
+        solve/critic/LLM and never constrain unseen geometry). The fused read is mirrored onto
+        the primary (``e.semantics``), so run_match / scenarios / seed_dome are untouched."""
         e = self.camera_entry(camera_name, create=True)
         if not e.reference:
             raise RuntimeError("no reference image bound to this camera")
+        if len(e.references) > 1:
+            return self._analyze_multi_reference(e)
         current_signature = reference_signature(e.reference)
         if e.reference_signature != current_signature:
             if not e.reference_signature and e.semantics:
@@ -396,6 +434,79 @@ class Controller:
         e.semantics = semantics
         self.save_session()
         return semantics
+
+    def _analyze_samples(self, path: str) -> Dict:
+        """N-sample self-consistency ANALYZE of ONE image → a consolidated semantics dict
+        (the single-image ``consensus_agreement`` is stripped — it is not a cross-reference
+        signal). The reused engine behind the multi-reference fusion; the single-reference
+        path keeps its own inline body with the reference-swap guard."""
+        block = self._image_block(path)
+        if block is None:
+            raise RuntimeError(f"could not read reference image: {path}")
+        messages = [{"role": "user",
+                     "content": [block, omega.text_block(prompts.analyze_user_text())]}]
+        samples = []
+        n = max(1, int(self.cfg.analyze_samples))
+        last_reply = ""
+        for _ in range(n):
+            last_reply = self.io(lambda: self._semantic_call(
+                prompts.ANALYZE_SYSTEM, messages, 2048))
+            try:
+                samples.append(validate_analysis(last_reply))
+            except ParseError:
+                continue
+        if not samples:   # every sample was junk — one strict retry, then give up loudly
+            retry = messages + [
+                {"role": "assistant", "content": last_reply[:1500]},
+                {"role": "user", "content": "That was not valid JSON. Reply with ONLY the "
+                                            "JSON object, nothing else."}]
+            samples.append(validate_analysis(self.io(lambda: self._semantic_call(
+                prompts.ANALYZE_SYSTEM, retry, 2048))))
+        out = consensus.consolidate_analyses(samples)
+        out.pop("consensus_agreement", None)
+        return out
+
+    def _analyze_multi_reference(self, e) -> Dict:
+        """Fuse every bound reference's ANALYZE into a denoised primary read (see
+        analyze_reference). Cross-reference scatter is intentional, so the single-image
+        contested-consensus flag is suppressed (``self._last_analyze_agreement = None``).
+
+        The extra views are preserved as durable per-RefEntry data; the FUSED read is written
+        to the primary mirror so the solve/critic/LLM — which only ever see the primary — get
+        a sharper, cross-angle consensus without any radiance ever reaching the solve."""
+        self._last_analyze_agreement = None
+        primary_sig = reference_signature(e.reference)
+        angles = e.references[1:]
+        angle_stale = [(not ref.semantics)
+                       or (ref.signature != reference_signature(ref.path))
+                       for ref in angles]
+        primary_stale = (e.reference_signature != primary_sig)
+        if e.semantics and not primary_stale and not any(angle_stale):
+            return e.semantics          # the fused read is cached on the primary mirror
+        # A recompute re-analyzes the primary fresh — its individual read is not recoverable
+        # from the fused mirror — reuses fresh angle caches, and (re)reads only stale angles.
+        per_ref: List[Dict] = [self._analyze_samples(e.reference)]
+        for ref, stale in zip(angles, angle_stale):
+            if stale:
+                try:
+                    read = self._analyze_samples(ref.path)
+                except (omega.OmegaError, RuntimeError):
+                    continue            # a dead / unreadable angle must not kill the fusion
+                ref.signature = reference_signature(ref.path)
+                ref.semantics = read
+            if ref.semantics:
+                per_ref.append(ref.semantics)
+        if reference_signature(e.reference) != primary_sig:
+            # the primary was swapped during a gateway wait — caching the OLD read under the
+            # NEW path would poison every later run (mirrors the single-reference guard)
+            raise RuntimeError("reference image changed while analyzing — run again to "
+                               "analyze the new reference")
+        fused = consensus.consolidate_analyses(per_ref)
+        fused.pop("consensus_agreement", None)
+        e.reference_signature = primary_sig
+        e.semantics = fused             # Route A mirror: the solve/critic/LLM see this
+        self.save_session()
+        return fused
 
     def _llm_deltas_hook(self, ref_block: dict) -> Callable[[Dict], str]:
         def call_llm(ctx: Dict) -> str:
@@ -648,6 +759,58 @@ class Controller:
                 "step": max(1, int(step)), "easing": easing,
                 "warnings": warnings}
 
+    # ------------------------------------------------------------------ fairness / probes
+    def assess_fairness(self, camera_name: str,
+                        log: Callable[[str], None] = lambda _m: None) -> Dict:
+        """Read-only PREDICTIVE fairness estimate (D9): the camera's PRIMARY reference vs the
+        current scene render, WITHOUT the director leash / critic content-gap signals (they do
+        not exist before a match), so the guarantee narrows to "consistent with the numbers
+        fairness can see" (stated in the result's notes). Renders one probe of the current
+        scene for cur_stats (skipped in no-render mode) but NEVER applies a state, records a
+        match, or saves — the rig is untouched. → a fully-shaped fairness.assess(...) dict."""
+        e = self.camera_entry(camera_name)
+        if e is None or not e.reference:
+            return fairness.assess(None, None)
+        refs = self.references(camera_name)
+        ref_stats = self.ref_stats(e.reference)
+        cur_stats = None
+        if not getattr(self.cfg, "no_renders", False):
+            cam = self.camera_node(camera_name)
+            if cam is not None:
+                path = self._render_exposed(
+                    cam, os.path.join(self._ensure_run_dir(_safe(camera_name)),
+                                      "fairness_probe.png"),
+                    self.cfg.loop_width, self.cfg.loop_height, entry=e, log=log)
+                cur_stats = self.stats_for(path) if path else None
+        return fairness.assess(ref_stats, cur_stats,
+                               components=None, coverage=None,
+                               n_references=len(refs),
+                               roles=[r["role"] for r in refs])
+
+    def rig_report(self, record: bool = False) -> Dict:
+        """Read-only census of the LIVE rig: the real property aliases the bridge would touch
+        (scene.report_aliases), the scene's colour-management mode (render.probe_colorspace),
+        and every Vantage live-link entry point (vantage.probe_entrypoints). Every probe is
+        strictly non-destructive — fires no render, flips no toggle, mutates nothing — and
+        record-don't-raise, degrading to its empty/legacy shape off-Max. Surfaced under
+        run.json's ``probes`` and available to the UI; ``record=True`` also snapshots the
+        aliases into scene.LAST_ALIASES for the on-box checklist. → {aliases, colorspace,
+        vantage}."""
+        report: Dict = {}
+        try:
+            report["aliases"] = sc.report_aliases(self.rig(), record=record)
+        except Exception:  # noqa: BLE001 a diagnostic probe must never fail the caller
+            report["aliases"] = {}
+        try:
+            report["colorspace"] = rd.probe_colorspace()
+        except Exception:  # noqa: BLE001
+            report["colorspace"] = {}
+        try:
+            report["vantage"] = vt.probe_entrypoints()
+        except Exception:  # noqa: BLE001
+            report["vantage"] = {}
+        return report
+
     # ------------------------------------------------------------------ the headline act
     def run_match(
         self,
@@ -873,10 +1036,33 @@ class Controller:
         else:
             self._record_match(camera_name, result.best_state, result.best_score)
         if result.best_score is not None:
-            result.scorecard = critic.scorecard(
+            # A preliminary card yields the authoritative critic content_gap + metric
+            # coverage; those, with the director's leash_hits when the result surfaces them,
+            # feed the READ-ONLY fairness estimate (D8) so it can only ever read
+            # as-bad-or-worse than the director/critic, never softer. The reference is judged
+            # against the accepted iteration's OWN render (best_render, already on file — no
+            # new render fired); fairness.assess never raises and degrades to "unknown".
+            prelim = critic.scorecard(
                 result.best_score, result.best_components,
                 ceiling_proven=result.ceiling_proven,
                 ceiling_converged=result.ceiling_converged)
+            refs = self.references(camera_name)
+            best_cur_stats = (self.stats_for(result.best_render)
+                              if result.best_render else None)
+            fairness_card = fairness.assess(
+                ref_stats, best_cur_stats,
+                components=result.best_components,
+                coverage=prelim.get("coverage"),
+                n_references=len(refs),
+                roles=[r["role"] for r in refs],
+                ceiling_proven=result.ceiling_proven,
+                content_gap=prelim.get("content_gap"),
+                leash_hits=getattr(result, "leash_hits", None))
+            result.scorecard = critic.scorecard(
+                result.best_score, result.best_components,
+                ceiling_proven=result.ceiling_proven,
+                ceiling_converged=result.ceiling_converged,
+                fairness=fairness_card)
             e.scorecard = dict(result.scorecard)
             card = result.scorecard
             weak = ", ".join(card["weakest"]) or "none measured"
@@ -885,14 +1071,27 @@ class Controller:
             if card["content_gap"]:
                 log("diagnosis: remaining gap is likely scene content/material/albedo, "
                     "not a lighting control the optimizer can solve")
+            # fairness LOGGED ALONGSIDE the content_gap diagnosis, never replacing it
+            fair = card.get("fairness") or {}
+            if fair.get("verdict") in ("marginal", "unfair"):
+                remedy = fair.get("remedy") or ""
+                log("fairness: reference constrains this scene "
+                    + ("poorly" if fair.get("verdict") == "unfair" else "only partially")
+                    + f" ({fair.get('verdict')})"
+                    + (f" — {remedy}" if remedy else ""))
             log("scorecard warning: score measures tone/color/direction statistics; "
                 "artist acceptance is separate")
         self._save_or_warn(log)
+        try:                          # read-only rig census — diagnostic, never fails the run
+            probes = self.rig_report()
+        except Exception:  # noqa: BLE001 a probe must never abort a completed match
+            probes = {}
         try:   # the calibration trail: every run leaves a machine-readable record
             with open(os.path.join(run_dir, "run.json"), "w", encoding="utf-8") as f:
                 json.dump({"camera": camera_name, "reference": e.reference,
                            "quality_profile": profile.name,
                            "semantics": semantics, "llm_down": bool(self._llm_down),
+                           "probes": probes,
                            **result.to_summary()}, f, indent=1)
         except (OSError, TypeError, ValueError):
             pass

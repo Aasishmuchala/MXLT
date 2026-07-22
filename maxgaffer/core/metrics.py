@@ -91,6 +91,15 @@ def _rgb_to_hue_chroma(r: int, g: int, b: int) -> Tuple[float, float]:
     return h * 60.0, c
 
 
+def _unit3(vec: Sequence[float]) -> List[float]:
+    """Unit-normalize a 3-vector. Degenerate input (near-zero norm — a flat or black
+    frame) → [0.0, 0.0, 0.0], which every consumer reads as 'estimate unavailable'."""
+    norm = math.sqrt(sum(c * c for c in vec))
+    if norm < 1e-12:
+        return [0.0, 0.0, 0.0]
+    return [c / norm for c in vec]
+
+
 # --------------------------------------------------------------------------- stats
 def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
     loaded = _load_pixels(path, max_dim=max_dim)
@@ -119,6 +128,13 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
     grid_n = [0] * 9
     g5_sum = [0.0] * 25
     g5_n = [0] * 25
+    # illuminant-ESTIMATE accumulators (gray-world / gray-edge assumption — see illum_*
+    # below): all read from the SAME linear channels the tonal loop already decodes, so both
+    # engines agree exactly as the existing keys do
+    sog_sum = [0.0, 0.0, 0.0]         # Σ linear_c**6 per channel → Shades-of-Gray L6
+    grid_log_sum = [0.0] * 9          # per-pixel log-luminance, 3×3 spatial descriptor
+    g5_log_sum = [0.0] * 25           # per-pixel log-luminance, 5×5 spatial descriptor
+    lin_rgb: List[Tuple[float, float, float]] = []   # kept for the 1-pass gray-edge gradient
     for idx, (r, g, b) in enumerate(pixels):
         mean_rgb[0] += r
         mean_rgb[1] += g
@@ -127,6 +143,10 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
         lin_r = _srgb_to_linear(r / 255.0)
         lin_g = _srgb_to_linear(g / 255.0)
         lin_b = _srgb_to_linear(b / 255.0)
+        lin_rgb.append((lin_r, lin_g, lin_b))    # for the gray-edge gradient pass below
+        sog_sum[0] += lin_r ** 6                  # Shades-of-Gray L6 (Minkowski p=6)
+        sog_sum[1] += lin_g ** 6
+        sog_sum[2] += lin_b ** 6
         lin_l = 0.2126 * lin_r + 0.7152 * lin_g + 0.0722 * lin_b
         log_l = math.log(max(lin_l, 1e-5))
         log_sum += log_l
@@ -139,9 +159,11 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
         cell = min(2, x * 3 // max(1, w)) + 3 * min(2, y * 3 // max(1, h))
         grid_sum[cell] += lum
         grid_n[cell] += 1
+        grid_log_sum[cell] += log_l          # same cell, log-luminance (spatial descriptor)
         c5 = min(4, x * 5 // max(1, w)) + 5 * min(4, y * 5 // max(1, h))
         g5_sum[c5] += lum
         g5_n[c5] += 1
+        g5_log_sum[c5] += log_l
         L, a, bb = _lab_from_linear(lin_r, lin_g, lin_b)
         for i, v in enumerate((L, a, bb)):
             lab_sum[i] += v
@@ -197,11 +219,48 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
     grid = [(grid_sum[i] / grid_n[i] - grid_mean) if grid_n[i] else 0.0 for i in range(9)]
     g5_mean = sum(g5_sum) / max(1, sum(g5_n)) or 1e-6
     grid5 = [(g5_sum[i] / g5_n[i] - g5_mean) if g5_n[i] else 0.0 for i in range(25)]
+    # illuminant ESTIMATES (gray-world / gray-edge) — valid only under a flat-albedo
+    # assumption, NOT albedo-invariant: a strongly chromatic uniform albedo (a walnut
+    # library) biases them toward the wall/wood, so consumers treat these as advisory WB
+    # cues and NEVER feed them to the weighted score
+    illum_sog = _unit3([(sog_sum[i] / n) ** (1.0 / 6.0) for i in range(3)])
+    edge_sum = [0.0, 0.0, 0.0]                # 1st-order gray-edge: one |dx|+|dy| pass
+    for i in range(n):
+        pr, pg, pb = lin_rgb[i]
+        if i % w + 1 < w:                     # right neighbor, same row
+            nr, ng, nb = lin_rgb[i + 1]
+            edge_sum[0] += abs(pr - nr)
+            edge_sum[1] += abs(pg - ng)
+            edge_sum[2] += abs(pb - nb)
+        if i + w < n:                         # neighbor one row below
+            nr, ng, nb = lin_rgb[i + w]
+            edge_sum[0] += abs(pr - nr)
+            edge_sum[1] += abs(pg - ng)
+            edge_sum[2] += abs(pb - nb)
+    illum_edge = _unit3(edge_sum)
+    illum = _unit3([(illum_sog[i] + illum_edge[i]) / 2.0 for i in range(3)])
+    # per-pixel log-luminance grids, mean-centered exactly like grid / grid5 above; spatial
+    # descriptors of WHERE the light lives in log space, NOT albedo-invariant
+    grid_log_mean = sum(grid_log_sum) / max(1, sum(grid_n)) or 1e-6
+    grid_log = [(grid_log_sum[i] / grid_n[i] - grid_log_mean) if grid_n[i] else 0.0
+                for i in range(9)]
+    g5_log_mean = sum(g5_log_sum) / max(1, sum(g5_n)) or 1e-6
+    grid5_log = [(g5_log_sum[i] / g5_n[i] - g5_log_mean) if g5_n[i] else 0.0
+                 for i in range(25)]
     return {
         "count": n,
         "mean_rgb": [v / n / 255.0 for v in mean_rgb],
         "grid": [round(g, 5) for g in grid],   # mean-centered 3×3 luminance pattern
         "grid5": [round(g, 5) for g in grid5],  # 5×5 — finer directional acuity
+        # illuminant ESTIMATES (unit RGB, linear) under the gray-world / gray-edge
+        # assumption — advisory WB cues, deliberately OUTSIDE the weighted critic score;
+        # [0,0,0] means "unavailable" (degenerate/flat frame)
+        "illum_sog": illum_sog,
+        "illum_edge": illum_edge,
+        "illum": illum,
+        # mean-centered per-pixel log-luminance grids (spatial descriptors, like grid/grid5)
+        "grid_log": [round(g, 5) for g in grid_log],
+        "grid5_log": [round(g, 5) for g in grid5_log],
         "lab_mean_hi": ([s / hi_n for s in hi_sum] if hi_n else lab_mean),
         # INCLUSIVE highlight mean (clipped pixels counted, neutral-drag and all) — the
         # solver switches to it when BOTH images clip heavily: same-scene matches need
@@ -238,3 +297,41 @@ def cosine(a: Sequence[float], b: Sequence[float]) -> float:
     if na < 1e-9 or nb < 1e-9:
         return 1.0 if na < 1e-9 and nb < 1e-9 else 0.0
     return dot / (na * nb)
+
+
+def _illum_vec(value) -> Optional[List[float]]:
+    """Validated 3-vector for illuminant comparison: exactly-3, all finite, non-degenerate
+    (norm above the noise floor). Anything else → None (read as 'estimate unavailable')."""
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        return None
+    try:
+        vec = [float(c) for c in value]
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(c) for c in vec):
+        return None
+    if math.sqrt(sum(c * c for c in vec)) < 1e-9:
+        return None
+    return vec
+
+
+def illuminant_similarity(ref: Dict, cur: Dict) -> Optional[float]:
+    """Similarity of two illuminant ESTIMATES (gray-world / gray-edge). A diagnostic WB cue,
+    NOT a scored metric and NOT albedo-invariant.
+
+    Prefers illum_edge on both sides (gray-edge is the more albedo-robust estimator), then
+    illum_sog, then the blended illum. GUARDS FIRST: any missing / wrong-length / degenerate
+    ([0,0,0] / near-zero) vector → None BEFORE cosine() is ever called, so cosine's
+    zero-vector convention (1.0 for two zeros, 0.0 for one) can never leak a fake score.
+
+    Returns (cosine + 1) / 2. Physical illuminant vectors are non-negative unit vectors, so
+    cosine ∈ [0, 1] and the EFFECTIVE range here is [0.5, 1] (not the full 0..1). Legacy
+    stats dicts (no illum_* keys) → None, leaving every current consumer unaffected."""
+    if not isinstance(ref, dict) or not isinstance(cur, dict):
+        return None
+    for key in ("illum_edge", "illum_sog", "illum"):
+        v_ref = _illum_vec(ref.get(key))
+        v_cur = _illum_vec(cur.get(key))
+        if v_ref is not None and v_cur is not None:
+            return (cosine(v_ref, v_cur) + 1.0) / 2.0
+    return None

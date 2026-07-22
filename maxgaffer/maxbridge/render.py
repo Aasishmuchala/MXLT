@@ -13,7 +13,7 @@ path when neither Pillow nor a sidecar python exists.
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Dict, Optional
 
 
 def _rt():
@@ -122,3 +122,129 @@ def transcode_to_png(src_path: str, dst_png: str, max_dim: int = 1024) -> Option
                     rt.close(bm)
             except Exception:
                 pass
+
+
+# ColorPipelineMgr (Max 2024+) accessor candidates. Only ``.mode`` is load-bearing — it
+# drives the gamma-vs-OCIO classification and its name is doc-stable; the view-transform and
+# display-gamma spellings below DRIFT across Max builds and were unverifiable off-box, so
+# every read is a best-effort candidate probe that degrades to None (ON-BOX CALIBRATION item).
+CS_VIEW_TRANSFORM = ("OCIOViewTransform", "displayViewTransform", "viewTransform",
+                     "OCIODisplayView", "displayView", "view_transform")
+CS_DISPLAY_GAMMA = ("displayGamma", "gamma", "outputGamma", "dispGamma")
+# The active renderer's VFB display-correction intent (V-Ray). Spelling is a V-Ray-build
+# calibration item; unknown → None.
+VRAY_DISPLAY_CORRECTION = ("output_srgb", "output_gamma", "display_srgb", "srgb_display",
+                           "vfb_display_correction", "display_correction")
+
+#: The honest caveat every colorspace report carries: the loop's saved plate is a RAW
+#: framebuffer. render_frame's ``rt.save(bm)`` writes the framebuffer as rendered, so a
+#: color-managed VFB view (OCIO view transform / GPU sRGB display correction) is a VIEW-only
+#: correction that is NOT baked into the saved PNG — the critic scores the raw plate, which
+#: can differ from what the artist sees in the VFB whenever a display transform is active.
+_COLORSPACE_RISK = (
+    "GPU/VFB display transforms (OCIO view, sRGB display correction) are VIEW-only and may "
+    "NOT bake into saved PNGs — render_frame's rt.save(bm) writes the raw framebuffer, so a "
+    "color-managed VFB view is not reflected in the saved loop image the critic scores; when "
+    "color_management is 'ocio'/'aces' the saved plate can differ from the VFB view."
+)
+
+
+def _first_attr(obj, names, coerce=None):
+    """First readable attribute in ``names`` (each getattr guarded), optionally passed
+    through ``coerce`` (a coercion failure skips to the next candidate). → the value or None.
+    Interface spellings drift across Max builds, so this never raises — it degrades to None."""
+    if obj is None:
+        return None
+    for n in names:
+        try:
+            val = getattr(obj, n)
+        except Exception:
+            continue
+        if val is None:
+            continue
+        if coerce is None:
+            return val
+        try:
+            return coerce(val)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _probe_vray_display_correction(rt) -> Optional[str]:
+    """Best-effort read of the ACTIVE renderer's VFB display-correction intent (sRGB / OCIO /
+    none). The property spelling is a V-Ray-build calibration item; unknown → None. This is a
+    VIEW-only correction — see ``_COLORSPACE_RISK``."""
+    try:
+        renderer = rt.renderers.current
+    except Exception:
+        return None
+    val = _first_attr(renderer, VRAY_DISPLAY_CORRECTION)
+    if val is None:
+        return None
+    try:
+        return str(val)
+    except Exception:
+        return None
+
+
+def probe_colorspace() -> Dict:
+    """NON-destructive report of the scene's colour management / display-correction mode
+    (sRGB/gamma vs OCIO/ACES). Pure read via ColorPipelineMgr (Max 2024+); fires no render
+    and changes no settings. Degrades to ``legacy``/``unknown`` when the interface is absent
+    (pre-2024 Max) or off-Max.
+
+    Why this matters: the loop's scores are only as trustworthy as the saved plate. A
+    color-managed VFB view is a display-side transform that render_frame's raw-framebuffer
+    ``rt.save`` does NOT bake in (see ``_COLORSPACE_RISK`` / render_frame line ~76), so an
+    active OCIO/ACES display can silently desync the saved PNG from what the artist sees. The
+    on-box smoke run flags that mismatch; this probe surfaces the mode so it can.
+
+    Classification is by NORMALIZED substring (lower/strip, drop a leading ``#``) rather than
+    an exact ``#gamma`` literal, because pymxs Name-value stringification varies across
+    builds. The exact OCIO enum literals, the view-transform accessor, and the display-gamma
+    /V-Ray display-correction spellings are ON-BOX CALIBRATION ITEMS — each is probed
+    best-effort and None-guarded so an unverified name stays safe.
+
+    Keys: available, color_management ("gamma"|"ocio"|"legacy"|"unknown"), mode (raw str),
+    ocio_active, view_transform, display_gamma, vray_display_correction, risk."""
+    result: Dict = {
+        "available": False,
+        "color_management": "unknown",
+        "mode": "",
+        "ocio_active": False,
+        "view_transform": None,
+        "display_gamma": None,
+        "vray_display_correction": None,
+        "risk": _COLORSPACE_RISK,
+    }
+    try:
+        rt = _rt()
+    except Exception:                       # off-Max: mode is undetectable, saved plate is raw
+        return result
+    try:
+        mgr = rt.ColorPipelineMgr
+    except Exception:
+        mgr = None
+    if mgr is None:                         # pre-2024 Max → the classic gamma/sRGB pipeline
+        result["color_management"] = "legacy"
+        return result
+    raw = _first_attr(mgr, ("mode",))
+    if raw is None:                         # interface present but no mode → treat as legacy
+        result["color_management"] = "legacy"
+        return result
+    result["available"] = True
+    result["mode"] = str(raw)
+    norm = str(raw).lower().strip().lstrip("#")
+    if "ocio" in norm or "aces" in norm:
+        result["color_management"] = "ocio"
+        result["ocio_active"] = True
+    elif "gamma" in norm or "srgb" in norm:
+        result["color_management"] = "gamma"
+    else:                                   # an unrecognized mode string — do not guess
+        result["color_management"] = "unknown"
+    view = _first_attr(mgr, CS_VIEW_TRANSFORM, coerce=str)
+    result["view_transform"] = view if view else None
+    result["display_gamma"] = _first_attr(mgr, CS_DISPLAY_GAMMA, coerce=float)
+    result["vray_display_correction"] = _probe_vray_display_correction(rt)
+    return result

@@ -24,63 +24,93 @@ from ..core.omega import OmegaError, ping
 from ..maxbridge import config as cfgmod
 from ..maxbridge.controller import Controller
 
-# Apple-dark design language (macOS system palette): flat surfaces, ONE hairline border
-# everywhere, ONE accent color, no shadows, no gradients — the layout does the talking.
-ACCENT = "#0a84ff"          # systemBlue (dark) — primary actions, selection, links. The
-                            # only color in the app; everything else is a gray.
-BG = "#1c1c1e"              # window
-PANEL = "#2c2c2e"           # cards
-INSET = "#1c1c1e"           # wells: inputs, thumbs, trees, transcript
-FILL = "#3a3a3c"            # neutral controls (buttons, popups)
-HAIR = "1px solid rgba(255,255,255,0.10)"
-TEXT = "#f2f2f7"
-DIM = "#98989d"             # secondary text / captions
-FAINT = "#636366"           # disabled / placeholders
-ERR = "#ff453a"             # systemRed (dark) — error emphasis only
-OK = "#f2f2f7"
+# SthyraDesign2 — the REFGRADE grading-bay language, ported to Qt. The desk stays NEUTRAL
+# (every gray R=G=B, so the UI never biases color judgment next to Resolve); ONE signal
+# color (mint green = live/active/go); depth from surface steps (bay→panel→raise), not
+# shadows; hairline borders; 2px corners; mono instrument labels, sans prose.
+SIGNAL = "#57e39a"          # the ONLY accent — live / active / go / selection / links
+SIGNAL_HI = "#7aecb2"       # signal hover (brighter)
+SIGNAL_LO = "#3fbe80"       # signal pressed (deeper)
+SIGNAL_SEL = "rgba(87,227,160,0.22)"   # selection halo — readable under light text
+SIGNAL_DIM = "rgba(87,227,160,0.16)"   # signal fills / armed tint
+ALERT = "#f0a54a"           # amber — offline / attention (sparingly)
+ACCENT = SIGNAL             # the one accent is signal green (name kept for call sites)
+INK = "#0f1712"             # near-black text ON a signal fill
+BG = "#171717"              # bay — surround / deepest surface / window
+PANEL = "#1e1e1e"           # panels: instrument bar, command dock, cards, sheets
+RAISE = "#262626"           # raised controls: buttons, chips, combos
+RAISE_HI = "#2f2f2f"        # control hover
+RAISE_LO = "#1a1a1a"        # control pressed / disabled
+FILL = RAISE                # neutral controls (name kept for call sites)
+INSET = "#121212"           # input / tree wells (a step under the bay)
+WELLIMG = "#0a0a0a"         # image / plate wells (near black, so imagery pops)
+LINE = "rgba(255,255,255,0.09)"    # hairline dividers
+LINE2 = "rgba(255,255,255,0.16)"   # emphasized / focused borders
+HAIR = f"1px solid {LINE}"
+WELLINE = f"1px solid {LINE}"
+TEXT = "#e7e7e7"            # primary text
+DIM = "#9b9b9b"             # secondary values
+FAINT = "#6a6a6a"           # labels, captions, idle glyph
+ERR = "#ff7b72"             # coral — failure / notice
+OK = "#e7e7e7"
+RAD = "2px"                 # everything — tight, machined, instrument-like
+UI = "'Segoe UI','SF Pro Text',system-ui,sans-serif"           # prose
+MONO = "'JetBrains Mono','Cascadia Mono',Consolas,'SF Mono',monospace"  # instrument labels
 
 STYLE = (
-    f"QWidget{{background:{BG};color:{TEXT};font-family:'SF Pro Text','Segoe UI Variable',"
-    f"'Segoe UI',Inter;font-size:13px;}}"
-    f"QFrame#card{{background:{PANEL};border:{HAIR};border-radius:12px;}}"
+    # base is prose sans; labels/readouts/controls opt into mono below (the voice is the
+    # contrast between clipped mono instrument labels and humane sans prose).
+    f"QWidget{{background:{BG};color:{TEXT};font-family:{UI};font-size:12px;}}"
+    f"QFrame#card{{background:{PANEL};border:{HAIR};border-radius:{RAD};}}"
     f"QLabel{{background:transparent;}}"
-    f"QPushButton{{background:{FILL};border:none;border-radius:8px;padding:7px 14px;"
-    f"color:{TEXT};}}"
+    f"QPushButton{{background:{RAISE};border:{HAIR};border-radius:{RAD};padding:6px 13px;"
+    f"color:{TEXT};font-family:{MONO};letter-spacing:1px;}}"
     f"QPushButton::menu-indicator{{image:none;width:0;}}"
-    f"QPushButton:hover{{background:#48484a;}}"
-    f"QPushButton:pressed{{background:#2c2c2e;}}"
-    f"QPushButton:disabled{{background:#2c2c2e;color:{FAINT};}}"
-    f"QPushButton#primary{{background:{ACCENT};color:#ffffff;font-weight:600;}}"
-    f"QPushButton#primary:hover{{background:#2f95ff;}}"
-    f"QPushButton#primary:pressed{{background:#0774e8;}}"
-    f"QPushButton#primary:disabled{{background:#2c2c2e;color:{FAINT};}}"
-    f"QPushButton#ghost{{background:transparent;border:none;color:{ACCENT};"
-    f"padding:5px 8px;}}"
-    f"QPushButton#ghost:hover{{color:#66b3ff;}}"
-    f"QPushButton#ghost:pressed{{color:#0774e8;}}"
-    f"QLineEdit,QTextEdit,QPlainTextEdit,QSpinBox,QDoubleSpinBox{{background:{INSET};"
-    f"border:{HAIR};border-radius:8px;padding:5px 8px;"
-    f"selection-background-color:{ACCENT};selection-color:#ffffff;}}"
-    f"QComboBox{{background:{FILL};border:none;border-radius:8px;padding:6px 10px;}}"
-    f"QComboBox:hover{{background:#48484a;}}"
-    f"QComboBox::drop-down{{border:none;width:20px;}}"
+    f"QPushButton:hover{{background:{RAISE_HI};border-color:{LINE2};}}"
+    f"QPushButton:pressed{{background:{RAISE_LO};}}"
+    f"QPushButton:disabled{{background:{RAISE_LO};color:{FAINT};border-color:{LINE};}}"
+    f"QPushButton#primary{{background:{SIGNAL};color:{INK};font-weight:700;border:none;}}"
+    f"QPushButton#primary:hover{{background:{SIGNAL_HI};}}"
+    f"QPushButton#primary:pressed{{background:{SIGNAL_LO};}}"
+    f"QPushButton#primary:disabled{{background:{RAISE_LO};color:{FAINT};}}"
+    f"QPushButton#ghost{{background:transparent;border:none;color:{SIGNAL};"
+    f"padding:5px 8px;font-family:{MONO};letter-spacing:1px;}}"
+    f"QPushButton#ghost:hover{{color:{SIGNAL_HI};}}"
+    f"QPushButton#ghost:pressed{{color:{SIGNAL_LO};}}"
+    f"QLineEdit,QTextEdit,QPlainTextEdit{{background:{INSET};"
+    f"border:{WELLINE};border-radius:{RAD};padding:5px 8px;"
+    f"selection-background-color:{SIGNAL_SEL};selection-color:{TEXT};}}"
+    f"QSpinBox,QDoubleSpinBox{{background:{INSET};border:{WELLINE};border-radius:{RAD};"
+    f"padding:5px 8px;font-family:{MONO};"
+    f"selection-background-color:{SIGNAL_SEL};selection-color:{TEXT};}}"
+    f"QLineEdit:focus,QTextEdit:focus,QPlainTextEdit:focus,QSpinBox:focus,"
+    f"QDoubleSpinBox:focus{{border:1px solid {SIGNAL};}}"
+    f"QComboBox{{background:{RAISE};border:{HAIR};border-radius:{RAD};padding:5px 10px;"
+    f"font-family:{MONO};letter-spacing:1px;}}"
+    f"QComboBox:hover{{background:{RAISE_HI};border-color:{LINE2};}}"
+    f"QComboBox::drop-down{{border:none;width:18px;}}"
     f"QComboBox QLineEdit{{background:transparent;border:none;padding:0;}}"
-    f"QComboBox QAbstractItemView{{background:{PANEL};border:{HAIR};padding:4px;"
-    f"selection-background-color:{ACCENT};selection-color:#ffffff;}}"
-    f"QMenu{{background:{PANEL};border:{HAIR};border-radius:10px;padding:6px;}}"
-    f"QMenu::item{{padding:6px 24px;border-radius:6px;}}"
-    f"QMenu::item:selected{{background:{ACCENT};color:#ffffff;}}"
-    f"QTreeWidget,QListWidget{{background:{INSET};border:{HAIR};border-radius:10px;"
-    f"padding:4px;selection-background-color:{ACCENT};selection-color:#ffffff;}}"
+    f"QComboBox QAbstractItemView{{background:{PANEL};border:{HAIR};padding:3px;"
+    f"font-family:{MONO};selection-background-color:{SIGNAL_SEL};selection-color:{TEXT};}}"
+    f"QMenu{{background:{PANEL};border:{HAIR};border-radius:{RAD};padding:5px;"
+    f"font-family:{MONO};}}"
+    f"QMenu::item{{padding:6px 24px;border-radius:{RAD};}}"
+    f"QMenu::item:selected{{background:{SIGNAL_SEL};color:{TEXT};}}"
+    f"QTreeWidget,QListWidget{{background:{INSET};border:{WELLINE};border-radius:{RAD};"
+    f"padding:3px;font-family:{MONO};selection-background-color:{SIGNAL_SEL};"
+    f"selection-color:{TEXT};outline:none;}}"
     f"QLabel#dim{{color:{DIM};}}"
-    f"QLabel#h{{color:{TEXT};font-weight:600;letter-spacing:3px;}}"
-    f"QLabel#cap{{color:{DIM};font-size:11px;font-weight:600;letter-spacing:1px;}}"
-    f"QHeaderView::section{{background:transparent;color:{DIM};border:none;"
-    f"border-bottom:{HAIR};padding:5px 8px;font-size:11px;}}"
-    f"QScrollBar:vertical{{background:transparent;width:8px;margin:2px;}}"
-    f"QScrollBar::handle:vertical{{background:#48484a;border-radius:4px;min-height:30px;}}"
+    f"QLabel#h{{color:{TEXT};font-family:{MONO};font-weight:700;letter-spacing:3px;}}"
+    f"QLabel#cap{{color:{FAINT};font-family:{MONO};font-size:10px;font-weight:600;"
+    f"letter-spacing:2px;}}"
+    f"QHeaderView::section{{background:{PANEL};color:{FAINT};border:none;"
+    f"border-bottom:{HAIR};padding:5px 8px;font-family:{MONO};font-size:10px;"
+    f"letter-spacing:1px;}}"
+    f"QScrollBar:vertical{{background:transparent;width:10px;margin:2px;}}"
+    f"QScrollBar::handle:vertical{{background:{RAISE};border-radius:{RAD};min-height:28px;}}"
+    f"QScrollBar::handle:vertical:hover{{background:{RAISE_HI};}}"
     f"QScrollBar::add-line,QScrollBar::sub-line{{height:0;}}"
-    f"QToolTip{{background:{PANEL};color:{TEXT};border:{HAIR};padding:5px;}}"
+    f"QToolTip{{background:{PANEL};color:{TEXT};border:{HAIR};padding:5px;font-family:{MONO};}}"
 )
 
 
@@ -258,8 +288,8 @@ class MaxGafferDock(QtWidgets.QWidget):
             t = QtWidgets.QLabel(placeholder)
             t.setFixedSize(272, 153)
             t.setAlignment(QtCore.Qt.AlignCenter)
-            t.setStyleSheet(f"background:{INSET};border:{HAIR};border-radius:10px;"
-                            f"color:{FAINT};")
+            t.setStyleSheet(f"background:{WELLIMG};border:{WELLINE};border-radius:{RAD};"
+                            f"color:{FAINT};font-family:{MONO};letter-spacing:1px;")
             wrap.addWidget(t)
             wrap.addWidget(_cap(cap), 0, QtCore.Qt.AlignHCenter)
             thumbs.addLayout(wrap)
@@ -272,12 +302,51 @@ class MaxGafferDock(QtWidgets.QWidget):
         btn_ref = QtWidgets.QPushButton("Load / swap reference…")
         btn_ref.clicked.connect(self._pick_reference)
         side.addWidget(btn_ref)
+        btn_add_ref = QtWidgets.QPushButton("Add reference…")
+        btn_add_ref.setToolTip(
+            "Bind an EXTRA observed angle (the first reference stays the primary — swap "
+            "it above). Extra views denoise the reference read; they do NOT reconstruct "
+            "unseen geometry, so the single-view caveats still hold.")
+        btn_add_ref.clicked.connect(self._add_reference)
+        side.addWidget(btn_add_ref)
         self.lbl_ref_info = QtWidgets.QLabel("")
         self.lbl_ref_info.setObjectName("dim")
         self.lbl_ref_info.setWordWrap(True)
         side.addWidget(self.lbl_ref_info, 1)
         thumbs.addLayout(side, 1)
         lr.addLayout(thumbs)
+
+        # ---- multi-reference roster + honest FAIRNESS readout (additive; the primary
+        # still binds/swaps above via _pick_reference). Both reveal themselves only when
+        # there is something to show — a single reference stays clutter-free.
+        refs_row = QtWidgets.QHBoxLayout()
+        self.ref_list_cap = _cap("REFERENCES")
+        refs_row.addWidget(self.ref_list_cap)
+        refs_row.addStretch(1)
+        self.btn_ref_remove = QtWidgets.QPushButton("Remove")
+        self.btn_ref_remove.setObjectName("ghost")
+        self.btn_ref_remove.setToolTip("Remove the selected reference. Removing the "
+                                       "primary promotes the next one.")
+        self.btn_ref_remove.clicked.connect(self._remove_reference)
+        refs_row.addWidget(self.btn_ref_remove)
+        lr.addLayout(refs_row)
+        self.ref_list = QtWidgets.QListWidget()
+        self.ref_list.setMaximumHeight(78)
+        self.ref_list.setToolTip("Every reference bound to this camera (role · file). The "
+                                 "first is the primary the solve uses; the rest denoise "
+                                 "the reference read (Route A).")
+        lr.addWidget(self.ref_list)
+        self.lbl_fairness = QtWidgets.QLabel("")
+        self.lbl_fairness.setWordWrap(True)
+        self.lbl_fairness.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.lbl_fairness.setToolTip("Can the reference actually constrain this scene? A "
+                                     "read-only honesty check from the last match — it "
+                                     "advises LOCK, never proposes values.")
+        lr.addWidget(self.lbl_fairness)
+        self.ref_list_cap.setVisible(False)
+        self.btn_ref_remove.setVisible(False)
+        self.ref_list.setVisible(False)
+        self.lbl_fairness.setVisible(False)
 
         # ---- card: action bar (dropdowns, not checkbox walls)
         la = self._card(col)
@@ -461,7 +530,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         t = self.changes_tree
         t.clear()
         top = QtWidgets.QTreeWidgetItem([headline, "", ""])
-        top.setForeground(0, QtGui.QBrush(QtGui.QColor("#f2f2f2")))
+        top.setForeground(0, QtGui.QBrush(QtGui.QColor(TEXT)))
         t.addTopLevelItem(top)
         pr = plan_report or {"changes": [], "created": [], "warnings": []}
         if pr.get("effect"):
@@ -618,6 +687,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.rebuild_rig_controls()
         self._rebuild_locks(self._current_camera())
         self._show_reference(self._current_camera())
+        self._refresh_reference_panel(self._current_camera())
 
     def _sync_score_badge(self):
         e = self._camera_entry(self._current_camera())
@@ -653,6 +723,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.match_thumb.setPixmap(QtGui.QPixmap())
         self.match_thumb.setText("no match preview")
         self._show_reference(name)
+        self._refresh_reference_panel(name)
         self._rebuild_locks(name)
         self._sync_score_badge()
         self.rebuild_rig_controls()
@@ -720,6 +791,141 @@ class MaxGafferDock(QtWidgets.QWidget):
         else:
             self.ref_thumb.setText("no reference")
             self.lbl_ref_info.setText("Bind a lighting reference image to this camera.")
+
+    # ------------------------------------------------------------- multi-reference + fairness
+    def _add_reference(self):
+        """Bind an EXTRA observed angle to this camera (Route A: denoises the reference
+        read; does NOT reconstruct unseen geometry). The primary is unchanged — swap it
+        with 'Load / swap reference…' above."""
+        if self._busy:
+            self._log("busy — reference add ignored until the current run finishes")
+            return
+        cam = self._current_camera()
+        if not cam:
+            self._log("select a camera first")
+            return
+        if not hasattr(self.ctrl, "add_reference"):
+            self._log("this build has no multi-reference support — use Load / swap reference")
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, f"Add reference for {cam}", "",
+            "Images (*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff *.exr *.hdr);;"
+            "All files (*.*)")
+        if not path:
+            return
+        if not os.path.isfile(path):
+            self._log(f"reference file not found: {path}")
+            return
+        try:
+            self.ctrl.add_reference(cam, path)
+        except Exception as e:  # noqa: BLE001 — a stale rig must not escape the slot
+            self._log(f"✗ add reference: {e}")
+            return
+        if not self.ctrl.save_session():
+            self._log("⚠ scene not saved yet — bindings live in memory only until you "
+                      "save the .max file")
+        self._log(f"added reference: {os.path.basename(path)}")
+        self._refresh_reference_panel(cam)
+
+    def _remove_reference(self):
+        cam = self._current_camera()
+        if self._busy:
+            self._log("busy — reference remove ignored until the current run finishes")
+            return
+        if not cam:
+            return
+        if not hasattr(self.ctrl, "remove_reference"):
+            self._log("this build has no multi-reference support")
+            return
+        item = self.ref_list.currentItem()
+        if item is None:
+            self._log("select a reference in the list to remove")
+            return
+        ref = item.data(QtCore.Qt.UserRole)      # signature (stable) or path fallback
+        try:
+            removed = bool(self.ctrl.remove_reference(cam, ref))
+        except Exception as e:  # noqa: BLE001
+            self._log(f"✗ remove reference: {e}")
+            return
+        if not removed:
+            self._log("reference not found")
+            return
+        self.ctrl.save_session()
+        self._log("reference removed")
+        self.refresh_cameras()    # the primary may have changed → re-mirror thumb + panel
+
+    def _refresh_reference_panel(self, cam: str):
+        """Additive companion to _show_reference: repaint the reference roster and the
+        fairness readout. Never raises — a controller without the multi-reference surface,
+        a stale entry, or an older run with no fairness must all degrade silently."""
+        try:
+            self._refresh_reference_list(cam)
+        except Exception:                        # noqa: BLE001 — UI-only, never fatal
+            pass
+        try:
+            self._show_fairness(cam)
+        except Exception:                        # noqa: BLE001
+            pass
+
+    def _refresh_reference_list(self, cam: str):
+        self.ref_list.clear()
+        refs: List[Dict] = []
+        if cam and hasattr(self.ctrl, "references"):
+            refs = list(self.ctrl.references(cam) or [])
+        for r in refs:
+            role = str(r.get("role") or "ref")
+            base = os.path.basename(str(r.get("path") or "")) or "—"
+            item = QtWidgets.QListWidgetItem(f"{role} · {base}")
+            item.setData(QtCore.Qt.UserRole,
+                         str(r.get("signature") or r.get("path") or ""))
+            if not bool(r.get("has_semantics")):
+                item.setForeground(QtGui.QBrush(QtGui.QColor(DIM)))
+            self.ref_list.addItem(item)
+        # single reference is the DEFAULT — keep the roster hidden until an extra angle
+        # is added (the primary always shows in the plate + info above)
+        show = len(refs) > 1
+        self.ref_list_cap.setVisible(show)
+        self.ref_list.setVisible(show)
+        self.btn_ref_remove.setVisible(show)
+
+    def _show_fairness(self, cam: str):
+        """Read the last match's honest fairness verdict off the scorecard (C5-shaped, so
+        the full assess() dict and the fallback both render), per-sub-field null-guarded.
+        No 'fairness' key (older runs) → the badge stays hidden. Read-only: it names the
+        gap and advises LOCK, it never proposes values."""
+        entry = self._camera_entry(cam) if cam else None
+        card = getattr(entry, "scorecard", {}) if entry is not None else {}
+        fair = (card or {}).get("fairness") or {}
+        if not fair:
+            self.lbl_fairness.clear()
+            self.lbl_fairness.setVisible(False)
+            return
+        verdict = str(fair.get("verdict") or "unknown").lower()
+        # mint = go/fair · amber = attention/marginal · coral = poor · faint = unknown
+        color = {"fair": SIGNAL, "marginal": ALERT, "unfair": ERR}.get(verdict, FAINT)
+        reasons: List[str] = []
+        c = fair.get("constrainable")
+        if isinstance(c, (int, float)):
+            reasons.append(f"constrainable {max(0.0, min(1.0, float(c))):.0%}")
+        ev = fair.get("predicted_ev_gap")
+        wb = fair.get("predicted_wb_gap")
+        if (isinstance(ev, (int, float)) and isinstance(wb, (int, float))
+                and (float(ev) > 0.05 or float(wb) > 1.0)):
+            reasons.append(f"predicted gap ~{float(ev):.1f} stops · ~{float(wb):.0f}K")
+        if fair.get("same_scene"):
+            reasons.append("same scene — exposure / WB only")
+        parts = [f'<span style="font-family:{MONO};color:{color};font-weight:700;">'
+                 f'FAIRNESS · {_html.escape(verdict.upper())}</span>']
+        if reasons:
+            parts.append(f'<span style="color:{DIM};">'
+                         f'{_html.escape(" · ".join(reasons))}</span>')
+        remedy = fair.get("remedy")
+        if remedy:
+            parts.append(f'<span style="color:{color};">{_html.escape(str(remedy))}</span>')
+        for caveat in list(fair.get("unreconstructable", []) or [])[:3]:
+            parts.append(f'<span style="color:{FAINT};">— {_html.escape(str(caveat))}</span>')
+        self.lbl_fairness.setText("<br>".join(parts))
+        self.lbl_fairness.setVisible(True)
 
     def _rebuild_locks(self, cam: str):
         self.lock_menu.clear()
@@ -1261,10 +1467,10 @@ class ScenarioBoardDialog(QtWidgets.QDialog):
                     btn.setIcon(QtGui.QIcon(pix))
                     btn.setIconSize(QtCore.QSize(240, 135))
             btn.setStyleSheet(
-                f"QToolButton{{background:{INSET};border:{HAIR};border-radius:12px;"
-                f"padding:10px;color:{TEXT};}}"
-                f"QToolButton:checked{{border:2px solid {ACCENT};"
-                f"background:rgba(10,132,255,0.12);}}")
+                f"QToolButton{{background:{WELLIMG};border:{WELLINE};border-radius:{RAD};"
+                f"padding:10px;color:{TEXT};font-family:{MONO};letter-spacing:1px;}}"
+                f"QToolButton:checked{{border:2px solid {SIGNAL};"
+                f"background:{SIGNAL_DIM};}}")
             btn.clicked.connect(lambda _=False, idx=i: setattr(self, "chosen", idx))
             grid.addWidget(btn, i // 3, i % 3)
             self._cards.append(btn)
@@ -1344,7 +1550,8 @@ class ChangeReportDialog(QtWidgets.QDialog):
         self.setMinimumWidth(600)
         lay = QtWidgets.QVBoxLayout(self)
         head = QtWidgets.QLabel(headline)
-        head.setStyleSheet(f"color:{ACCENT};font-weight:600;letter-spacing:1px;")
+        head.setStyleSheet(f"color:{SIGNAL};font-family:{MONO};font-weight:700;"
+                           f"letter-spacing:1px;")
         lay.addWidget(head)
         tree = QtWidgets.QTreeWidget()
         tree.setHeaderLabels(["what", "before", "after", "why"])
@@ -1368,7 +1575,7 @@ class ChangeReportDialog(QtWidgets.QDialog):
             eff_lbl = QtWidgets.QLabel(
                 f"plan effect (measured): critic {eff['before']:.1f} → {eff['after']:.1f}"
                 + ("   ⚠ worse — one Ctrl+Z reverts the plan" if worse else ""))
-            eff_lbl.setStyleSheet(f"color:{ERR};" if worse else f"color:{OK};")
+            eff_lbl.setStyleSheet(f"color:{ERR};" if worse else f"color:{SIGNAL};")
             lay.addWidget(eff_lbl)
         add_group("Plan — values changed", pr["changes"], lambda c: [
             f"{c['target']} · {c['prop']}", str(c["before"]), str(c["after"]),
@@ -1494,7 +1701,7 @@ class SettingsDialog(QtWidgets.QDialog):
             else:
                 self.lbl_status.setText(run(
                     lambda: providers.ping(provider, key, model, base_url)))
-            self.lbl_status.setStyleSheet(f"color:{OK};")
+            self.lbl_status.setStyleSheet(f"color:{SIGNAL};")
         except OmegaError as e:
             self.lbl_status.setText(str(e))
             self.lbl_status.setStyleSheet(f"color:{ERR};")
