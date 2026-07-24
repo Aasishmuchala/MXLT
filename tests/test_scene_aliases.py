@@ -260,15 +260,23 @@ def test_off_max_returns_empty_and_never_records(monkeypatch):
 
 # ===================================================================== G3 invariant: tuples apart
 def test_shared_write_tuples_stay_byte_identical():
-    """The report-only ``*_REPORT`` tuples are the shared write tuples PLUS a class-specific
-    tail — the shared tuples themselves are byte-identical, so apply.py's capture/set path is
-    never widened by an alias the report needs (G3)."""
+    """The write tuples must never SILENTLY gain a report-only alias that would turn a no-op
+    into an actively-wrong WRITE. Two report-only aliases stay OUT of the write path on
+    purpose: LIGHT_MULT never gains "power" (VRayIES intensity is in lumens ~1700, a unit
+    mismatch vs a 0..N multiplier factor) and FOG_HEIGHT never gains "atmo_height"
+    (unconfirmed; on-box, VRayAerialPerspective reports height=null). ``visibility_range`` is
+    the ONE DELIBERATE promotion: it is VRayAerialPerspective's distance — a world-unit
+    distance exactly like fog_distance — CONFIRMED on-box (Max 2026.2 + V-Ray 7.30), so it is
+    write-safe and lives in the FOG_DISTANCE write tuple."""
     assert sc.LIGHT_MULT == ("multiplier", "intensity")
-    assert sc.FOG_DISTANCE == ("fog_distance", "fogDistance", "distance")
     assert sc.FOG_HEIGHT == ("fog_height", "fogHeight", "height")
-    assert sc.LIGHT_MULT_REPORT == sc.LIGHT_MULT + ("power",)
-    assert sc.FOG_DISTANCE_REPORT == sc.FOG_DISTANCE + ("visibility_range",)
+    assert sc.FOG_DISTANCE == ("fog_distance", "fogDistance", "distance", "visibility_range")
+    # the genuinely unit-mismatched / unconfirmed aliases stay REPORT-ONLY, never written
+    assert "power" not in sc.LIGHT_MULT and sc.LIGHT_MULT_REPORT == sc.LIGHT_MULT + ("power",)
+    assert "atmo_height" not in sc.FOG_HEIGHT
     assert sc.FOG_HEIGHT_REPORT == sc.FOG_HEIGHT + ("atmo_height",)
+    # visibility_range is now write-safe, so the fog-distance report tuple == the write tuple
+    assert sc.FOG_DISTANCE_REPORT == sc.FOG_DISTANCE
 
 
 # ===================================================================== get_prop / set_prop / matched_prop

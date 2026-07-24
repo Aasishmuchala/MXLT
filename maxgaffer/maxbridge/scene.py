@@ -92,18 +92,24 @@ DOME_TEX_ROT = ("horizontalRotation", "horizontal_rotation", "hRot", "tex_hrotat
 DOME_TEX_FILE = ("HDRIMapName", "fileName", "filename", "bitmap_filename")
 DOME_TEX_ON = ("texmap_on", "useTexmap", "use_texture")
 FOG_ON = ("enabled", "on", "active")
-FOG_DISTANCE = ("fog_distance", "fogDistance", "distance")
+# visibility_range: VRayAerialPerspective's far-visibility distance — CONFIRMED on-box
+# (Max 2026.2 + V-Ray 7.30) as the aerial distance property, and it is a world-unit
+# distance exactly like fog_distance, so it is write-safe here (apply.py writes
+# world_units(metres) to it, semantically correct). Env-fog uses fog_distance; aerial
+# falls through to visibility_range — different classes, no collision.
+FOG_DISTANCE = ("fog_distance", "fogDistance", "distance", "visibility_range")
 FOG_HEIGHT = ("fog_height", "fogHeight", "height")
 
 # Report-only candidate tails used ONLY by report_aliases / matched_prop — NEVER the write
-# path. The shared LIGHT_MULT / FOG_DISTANCE / FOG_HEIGHT tuples above stay byte-identical:
-# apply.py's capture_baselines / read_state / _apply_inner consume them to SET values, so
-# appending these class-specific analogs there would turn a current silent no-op into an
-# actively-wrong, unit-mismatched WRITE (a VRayIES "power" is in lumens ≈1700; a
-# VRayAerialPerspective has no fog-height plane). Kept apart, they only ever surface a name.
+# path. The shared LIGHT_MULT / FOG_HEIGHT tuples above stay byte-identical: apply.py's
+# capture_baselines / read_state / _apply_inner consume them to SET values, so appending
+# these class-specific analogs there would turn a current silent no-op into an actively-
+# wrong, unit-mismatched WRITE — a VRayIES "power" is in lumens (~1700), not a 0..N
+# multiplier factor; VRayAerialPerspective has no fog-height plane (on-box: height=null),
+# so atmo_height was never confirmed and stays report-only.
 LIGHT_MULT_REPORT = LIGHT_MULT + ("power",)                 # VRayIES intensity (lumens)
-FOG_DISTANCE_REPORT = FOG_DISTANCE + ("visibility_range",)  # VRayAerialPerspective distance
-FOG_HEIGHT_REPORT = FOG_HEIGHT + ("atmo_height",)           # aerial-perspective approx analog
+FOG_DISTANCE_REPORT = FOG_DISTANCE                          # visibility_range now write-safe
+FOG_HEIGHT_REPORT = FOG_HEIGHT + ("atmo_height",)           # unconfirmed aerial analog
 
 
 def world_units(metres: float) -> float:
