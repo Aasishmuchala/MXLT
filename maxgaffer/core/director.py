@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from . import critic, solver
-from .genome import LightingState, apply_changes, spec_for, state_table
+from .genome import GROUP_PREFIX, LightingState, apply_changes, spec_for, state_table
 from .parse import ParseError
 
 
@@ -114,7 +114,34 @@ _POLISH_PAIRS = (
     ("exposure.ev", "sun.altitude_deg"),
     ("sun.azimuth_deg", "sun.altitude_deg"),
     ("exposure.ev", "dome.intensity"),
+    # measured couples from the 2026-07-24 archetype matrix: overall brightness can be
+    # faked by the sun as well as the dome, and haze warmth trades against camera WB
+    ("exposure.ev", "sun.intensity"),
+    ("sun.turbidity", "exposure.wb_kelvin"),
 )
+
+
+def _has_axis(state: LightingState, key: str) -> bool:
+    """Group-aware membership: ``group.<name>`` lives in state.groups, not state.values
+    (state.get/set already route the prefix — only membership tests need this)."""
+    if key.startswith(GROUP_PREFIX):
+        return key[len(GROUP_PREFIX):] in state.groups
+    return key in state.values
+
+
+def polish_axes(state: LightingState) -> tuple:
+    """The static POLISH_PARAMS plus this run's DYNAMIC axes: one log2 dimmer axis per
+    light group present on the state, and the fog distance when the rig carries an
+    atmosphere. Measured need (2026-07-24 archetype matrix): group recovery rode on the
+    LLM alone — an aerial city scene never re-lit its 4 zones — and the fog solve landed
+    in the right haze BUCKET (250 m vs a 20 m target) with no way to fine-tune. Both are
+    ordinary measurable axes; polish just needs to know they exist for this rig."""
+    axes = list(POLISH_PARAMS)
+    for g in sorted(state.groups):
+        axes.append((GROUP_PREFIX + g, 0.35, True, 0.06))
+    if "atmosphere.distance_m" in state.values:
+        axes.append(("atmosphere.distance_m", 0.5, True, 0.08))
+    return tuple(axes)
 
 
 @dataclass
@@ -539,7 +566,8 @@ def run_polish(
     best_score = score_now
     hooks._polish_best_components = {}
     probes = 0
-    steps = {k: s for k, s, _log, _floor in POLISH_PARAMS}
+    axes = polish_axes(state)               # static params + this rig's groups/fog
+    steps = {k: s for k, s, _log, _floor in axes}
     # fail-memo: (step, score) at last failure per param — while neither has changed,
     # re-probing would render the exact same comparison again
     dead: Dict[str, Tuple[float, float]] = {}
@@ -567,12 +595,12 @@ def run_polish(
         for rnd in range(cfg.polish_rounds):
             improved_any = False
             round_start = best_score
-            for key, _init, is_log, floor in POLISH_PARAMS:
+            for key, _init, is_log, floor in axes:
                 if hooks.should_cancel() or best_score >= cfg.polish_stop_at \
                         or probes >= cfg.polish_max_probes:
                     hooks.apply(best)
                     return best, best_score, probes, False, False
-                if key in locks or key not in best.values:
+                if key in locks or not _has_axis(best, key):
                     continue
                 step = steps[key]
                 if dead.get(key) == (step, best_score):
@@ -621,7 +649,7 @@ def run_polish(
                 # coupled pairs diagonally with the CURRENT steps (Powell-style) — one
                 # bounded pass per stall, still under the probe budget.
                 escaped = False
-                is_log = {k: l for k, _s, l, _f in POLISH_PARAMS}
+                is_log = {k: l for k, _s, l, _f in axes}
 
                 def _diag_probe(ka: str, kb: str, sa: float, sb: float,
                                 mult: float) -> Optional[float]:
@@ -641,8 +669,8 @@ def run_polish(
                     if escaped or hooks.should_cancel() \
                             or probes >= cfg.polish_max_probes:
                         break
-                    if ka in locks or kb in locks or ka not in best.values \
-                            or kb not in best.values:
+                    if ka in locks or kb in locks or not _has_axis(best, ka) \
+                            or not _has_axis(best, kb):
                         continue
                     for sa in (1.0, -1.0):
                         if escaped:
@@ -689,11 +717,11 @@ def run_polish(
                     hooks.apply(best)                 # two diminishing rounds AND the diagonal
                     return best, best_score, probes, True, False   # escape failed — plateau
                 all_floored = all(steps[k] <= floor + 1e-9
-                                  for k, _s, _l, floor in POLISH_PARAMS)
+                                  for k, _s, _l, floor in axes)
                 if all_floored:
                     hooks.apply(best)
                     return best, best_score, probes, True, True   # proven local optimum
-                for k, _s, _l, floor in POLISH_PARAMS:
+                for k, _s, _l, floor in axes:
                     steps[k] = max(floor, steps[k] / 2.0)
             elif low_gain_rounds >= 2:
                 hooks.apply(best)

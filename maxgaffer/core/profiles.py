@@ -62,9 +62,13 @@ def resolve_profile(name: str, *, loop_width: int, loop_height: int,
                             False, 0, 0)
     if key == "hero":
         sw, sh = _scaled(width, height, 0.5, floor_w=192)
+        # polish budget 10 rounds / 160 probes: the old 6/48 cap was measured EXHAUSTED
+        # with gains still coming (2026-07-24 on-box hero runs: polish_gain +43..+49 and
+        # ceiling_converged False at the cap, three runs in a row) — and the axis list
+        # is now dynamic (groups + fog), so the budget must cover more parameters too.
         return MatchProfile("hero", "Hero", width, height, sw, sh,
                             max(iterations, 8), min(sweeps, 6), 99.0,
-                            True, 6, 48)
+                            True, 10, 160)
 
     sw, sh = _scaled(width, height, 0.5, floor_w=192)
     return MatchProfile("standard", "Standard", width, height, sw, sh,

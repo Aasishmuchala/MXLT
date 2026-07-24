@@ -20,11 +20,15 @@ def test_fast_profile_only_reduces_cost():
     assert p.worst_case_renders == 7
 
 
-def test_hero_profile_has_strict_sub_100_render_cap():
+def test_hero_profile_has_strict_finite_render_cap():
+    # polish budget deliberately raised 48 -> 160 (2026-07-24: the 48-probe cap was
+    # measured exhausted with gains still coming, and the axis list is now dynamic —
+    # groups + fog — so the budget covers more parameters). The cap stays FINITE and
+    # explicit; that property, not the old constant, is what this test locks.
     p = resolve_profile("hero", loop_width=480, loop_height=270,
                         max_iterations=5, sweep_count=8, target_score=82)
-    assert p.polish and p.polish_max_probes == 48 and p.target_score == 99
-    assert p.worst_case_renders == 62
+    assert p.polish and p.polish_max_probes == 160 and p.target_score == 99
+    assert p.worst_case_renders == 8 + 6 + 160
 
 
 def test_deep_is_hero_alias_and_unknown_is_rejected():

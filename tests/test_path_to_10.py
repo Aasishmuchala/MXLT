@@ -172,9 +172,13 @@ def test_polish_low_gain_plateau_is_not_proven(monkeypatch):
         return critic.Verdict(state["v"], {})
 
     monkeypatch.setattr(director.critic, "score", creeping)
+    # polish_round_eps recalibrated for the DYNAMIC axis list (full_state carries a
+    # group, so polish now probes one more axis per round and the per-round creep total
+    # rose past the old 0.2 default) — the plateau semantics under test are unchanged
     st, sc_, probes, converged, proven = run_polish(
         full_state(), 50.0, {"log_key": 0.2}, _FlatWorld().hooks(),
-        MatchConfig(polish_rounds=6, polish_stop_at=99.0, polish_max_probes=500))
+        MatchConfig(polish_rounds=6, polish_stop_at=99.0, polish_max_probes=500,
+                    polish_round_eps=0.45))
     assert converged is True and proven is False          # plateau ≠ proven optimum
 
 
