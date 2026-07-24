@@ -1,0 +1,160 @@
+{
+ "repo": "C:\\Users\\aasis\\MXLT",
+ "vray_active": true,
+ "in_max": true,
+ "results": [
+  {
+   "step": "fog aliases: report_aliases on VRayEnvironmentFog + VRayAerialPerspective (G2/G3)",
+   "ok": true,
+   "detail": {
+    "status": "pass",
+    "fog": {
+     "class": "VRayEnvironmentFog",
+     "rows": {
+      "enabled": null,
+      "distance": "fog_distance",
+      "height": "fog_height",
+      "via": "report_aliases"
+     },
+     "fog_on_toggle_exists": false
+    },
+    "aerial": {
+     "class": "VRayAerialPerspective",
+     "rows": {
+      "enabled": null,
+      "distance": "visibility_range",
+      "height": null,
+      "via": "report_aliases"
+     },
+     "fog_on_toggle_exists": false
+    }
+   }
+  },
+  {
+   "step": "keyframe baking: bake_animation writes 2 keys, intermediate frame interpolates",
+   "ok": true,
+   "detail": {
+    "status": "pass",
+    "v_frame0": 1.0,
+    "v_frame20": 6.0,
+    "v_mid_frame10": 3.5,
+    "interpolating": true,
+    "keyed_prop": "dome.intensity",
+    "bake_warnings": []
+   }
+  },
+  {
+   "step": "multi-light: dome + sun + power-only VRayIES distinct, aliases resolved",
+   "ok": true,
+   "detail": {
+    "status": "pass",
+    "sun_class": "VRaySun",
+    "dome_class": "VRayLight",
+    "dome_type_enum": 1,
+    "dome_tex_bind": "texmap.HDRIMapName",
+    "ies_class": "VRayIES",
+    "distinct_handles": true,
+    "handles": [
+     1905,
+     1955,
+     2018
+    ],
+    "ies_multiplier_alias": null,
+    "ies_report_alias": "power",
+    "ies_on_alias": "enabled",
+    "sun_dome_aliases": {
+     "sun.intensity": "intensity_multiplier",
+     "sun.size": "size_multiplier",
+     "sun.turbidity": "turbidity",
+     "sun.enabled": "enabled",
+     "dome.enabled": "enabled",
+     "dome.intensity": "multiplier",
+     "dome.tex_on": "texmap_on",
+     "dome.tex_rotation": "horizontalRotation",
+     "dome.tex_file": "HDRIMapName",
+     "atmosphere.enabled": null,
+     "atmosphere.distance": null,
+     "atmosphere.height": null
+    },
+    "last_aliases_recorded": true,
+    "classify": {
+     "sun": true,
+     "dome": true,
+     "groups": [
+      "practicals"
+     ]
+    }
+   }
+  },
+  {
+   "step": "render + colorspace: V-Ray frame + probe_colorspace mode/swatch (I1)",
+   "ok": true,
+   "detail": {
+    "status": "pass",
+    "rendered": true,
+    "swatch_mean_rgb": [
+     0.14426906318082788,
+     0.14461192810457515,
+     0.14361437908496733
+    ],
+    "log_key": 0.00033821089231792314,
+    "colorspace": {
+     "available": true,
+     "color_management": "ocio",
+     "mode": "OCIO_Default",
+     "ocio_active": true,
+     "view_transform": null,
+     "display_gamma": 2.200000047683716,
+     "vray_display_correction": null,
+     "risk": "GPU/VFB display transforms (OCIO view, sRGB display correction) are VIEW-only and may NOT bake into saved PNGs \u2014 render_frame's rt.save(bm) writes the raw framebuffer, so a color-managed VFB view is not reflected in the saved loop image the critic scores; when color_management is 'ocio'/'aces' the saved plate can differ from the VFB view."
+    }
+   }
+  },
+  {
+   "step": "vantage probes: probe_entrypoints + vrscene_export_available, non-destructive (H1/H2)",
+   "ok": true,
+   "detail": {
+    "status": "pass",
+    "link_attached": false,
+    "entrypoints": {
+     "link_running_port": null,
+     "link_attached": false,
+     "probe_state": null,
+     "action_present": false,
+     "action_label": null,
+     "globals_present": [],
+     "ports": [
+      20701,
+      20703
+     ],
+     "in_max": true
+    },
+    "export_available": {
+     "available": true,
+     "method": "vrayExportVRScene",
+     "console_exe_present": true,
+     "vantage_exe_present": true,
+     "notes": "vrayExportVRScene(path[, compressed|exportCompressed, startFrame, endFrame]) \u2014 keyword spelling varies by V-Ray build and is keyword-probed at export time; stock Vantage 3.x has no headless CLI render."
+    }
+   }
+  },
+  {
+   "step": "export_vrscene keyword-probe: record accepted compression/frame keywords (H3)",
+   "ok": true,
+   "detail": {
+    "status": "pass",
+    "accepted_keywords": {
+     "bare": "accepted+file",
+     "exportCompressed": "accepted+file",
+     "compressed": "accepted+file",
+     "compression": "accepted+file",
+     "startEndFrame": "accepted+file",
+     "compressed+frames": "accepted+file"
+    },
+    "bridge_export_result": "C:\\Users\\aasis\\AppData\\Local\\Temp\\maxgaffer_effects_6399h0k_\\effects_safe.vrscene"
+   }
+  }
+ ],
+ "passed": 6,
+ "failed": 0
+}

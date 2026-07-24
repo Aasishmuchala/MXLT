@@ -33,6 +33,43 @@ def _paeth(a: int, b: int, c: int) -> int:
     return b if pb <= pc else c
 
 
+def _chunk(ctype: bytes, payload: bytes) -> bytes:
+    return (struct.pack(">I", len(payload)) + ctype + payload
+            + struct.pack(">I", zlib.crc32(ctype + payload) & 0xFFFFFFFF))
+
+
+def write_png_rgb(path: str, rows: List[List[Tuple[int, int, int]]]) -> Optional[str]:
+    """Write rows of (r, g, b) 0-255 tuples as a non-interlaced 8-bit RGB PNG — the exact
+    subset ``read_png_rgb`` decodes, so a read → transform → write round-trip stays inside
+    this zero-dependency codec (Max's Python has no Pillow; the display-encode of OCIO-raw
+    loop plates needs a writer as much as the stats need a reader). Filter 0 everywhere:
+    the loop plates are small and zlib alone compresses them fine. → path, or None."""
+    if not rows or not rows[0]:
+        return None
+    height, width = len(rows), len(rows[0])
+    if width > _MAX_DIM or height > _MAX_DIM:
+        return None
+    raw = bytearray()
+    for row in rows:
+        if len(row) != width:
+            return None                      # ragged input — not an image
+        raw.append(0)                        # filter type 0 (None)
+        for r, g, b in row:
+            raw.append(r & 0xFF)
+            raw.append(g & 0xFF)
+            raw.append(b & 0xFF)
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)   # 8-bit truecolor
+    try:
+        with open(path, "wb") as f:
+            f.write(_SIG)
+            f.write(_chunk(b"IHDR", ihdr))
+            f.write(_chunk(b"IDAT", zlib.compress(bytes(raw), 6)))
+            f.write(_chunk(b"IEND", b""))
+    except OSError:
+        return None
+    return path
+
+
 def read_png_rgb(path: str, max_dim: int = 160) -> Optional[List[List[Tuple[int, int, int]]]]:
     try:
         with open(path, "rb") as f:

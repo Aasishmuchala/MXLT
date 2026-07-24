@@ -624,6 +624,12 @@ class Controller:
         reach the scored (and delivered) pixels, even on renderers whose exposure host
         is display-stage only (V-Ray GPU)."""
         path = rd.render_frame(cam, out_path, w, h)
+        if path and getattr(self, "_plate_linear", False):
+            # OCIO/ACES raw save measured (see _verify_exposure_host): the buffer is
+            # LINEAR, but metrics decodes sRGB→linear and the LLM is shown the file —
+            # encode to display space first so both see what they assume. Failure keeps
+            # the raw frame: degraded scores beat a dead loop.
+            expose.display_encode_png(path, path)
         if not path or not getattr(self.cfg, "software_exposure", False):
             return path
         st = state
@@ -679,6 +685,19 @@ class Controller:
             log(f"⚠ measured: +2 EV moved the render only {moved:.2f} stops — this "
                 "renderer's exposure is display-stage only. Software exposure ON for "
                 "this session (turn it on in Settings to persist).")
+        elif moved > 3.0:    # ~2× over-response = the saved plate is LINEAR (OCIO/ACES
+            # raw save): metrics' sRGB→linear decode then linearizes it TWICE, inflating
+            # every EV/WB correction ~2× → the loop oscillates instead of converging
+            # (measured on-box 2026-07-24: +2 EV read as 3.96 stops under OCIO_Default).
+            self._plate_linear = True
+            cs = ""
+            try:
+                cs = rd.probe_colorspace().get("mode") or ""
+            except Exception:
+                pass
+            log(f"⚠ measured: +2 EV moved the render {moved:.2f} stops (expected ~2) — "
+                f"the saved plate is linear (color management: {cs or 'unknown'}). "
+                "Loop plates will be sRGB-encoded in software before scoring.")
 
     def probe_score(self, camera_name: str, tag: str) -> Optional[float]:
         """One loop-res render of the current scene scored against the camera's reference

@@ -90,6 +90,51 @@ def expose_pixels(
     return out
 
 
+def display_encode_png(src: str, dst: str) -> Optional[str]:
+    """sRGB-encode a LINEAR loop plate, in stdlib (works inside Max — no Pillow).
+
+    Why: with OCIO/ACES color management active, Max's ``rt.save`` writes the RAW linear
+    framebuffer (measured on-box 2026-07-24: bitmap ``.gamma`` and a gamma-bitmap ``copy``
+    both leave the pixels untouched). Every consumer of a loop plate assumes a
+    display-referred image — metrics decodes sRGB→linear for its stats (so a linear input
+    gets linearized TWICE, inflating +2 EV to a measured ~4 stops and making every
+    solver step overshoot ~2×), and the LLM is shown the PNG (a linear plate reads as
+    crushed and murky). Encoding with the exact ``_linear_to_srgb`` OETF that metrics
+    inverts makes the plate what both consumers expect.
+
+    Pure stdlib via png_min read → 256-entry LUT → png_min write, atomic replace. On any
+    failure returns None and the caller keeps the raw frame (degraded, never broken)."""
+    from . import png_min
+
+    rows = png_min.read_png_rgb(src, max_dim=_MAX_ENCODE_DIM)
+    if not rows:
+        return None
+    lut = [max(0, min(255, int(round(_linear_to_srgb(v / 255.0) * 255.0))))
+           for v in range(256)]
+    encoded = [[(lut[r], lut[g], lut[b]) for r, g, b in row] for row in rows]
+    tmp = dst + ".tmp"
+    if png_min.write_png_rgb(tmp, encoded) is None:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return None
+    try:
+        os.replace(tmp, dst)      # atomic even when src == dst (in-place encode)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return None
+    return dst
+
+
+#: Full-res ceiling for the display encode — loop/probe plates are ≤480px; anything larger
+#: hitting this path would make the pure-python pass sluggish on Max's main thread.
+_MAX_ENCODE_DIM = 2048
+
+
 def expose_image_file(src: str, dst: str, ev: float, base_ev: float,
                       wb_kelvin: float, base_wb: float) -> Optional[str]:
     """Load an image, apply software exposure, write it back. Pillow-only (writing an
