@@ -121,6 +121,35 @@ def test_run_polish_climbs_the_fog_axis(monkeypatch):
     assert score > 88.0
 
 
+def test_group_axis_uses_a_full_doubling_initial_step():
+    """A zeroed group seeds from the 0.06 floor; a 0.35 first step (0.06 -> 0.077) is
+    visually invisible and can never clear min_gain from a wide shot (the measured
+    aerial-city failure). The group axis must open with a FULL doubling."""
+    st = LightingState()
+    st.groups["zone"] = 0.0
+    axes = {k: (s, is_log, f) for k, s, is_log, f in polish_axes(st)}
+    step, is_log, _floor = axes[GROUP_PREFIX + "zone"]
+    assert is_log and step == pytest.approx(1.0)
+
+
+def test_run_polish_escapes_a_zeroed_group_in_few_probes(monkeypatch):
+    """From group == 0.0 (log axis seeds at the floor), the doubling step + 1.6x ride
+    must reach ~1.0 within a handful of probes — the fast-escape guarantee."""
+    def score_fn(state):
+        g = state.get(GROUP_PREFIX + "practicals") if state else 0.0
+        import math
+        return 90.0 - 18.0 * abs(math.log2(max(g, 1e-3) / 1.0))
+
+    w = _World(monkeypatch, score_fn)
+    st = LightingState()
+    st.groups["practicals"] = 0.0
+    best, score, probes, _c, _p = run_polish(st, score_fn(st), {"grid": [0] * 9},
+                                             w.hooks, _cfg())
+    assert best.groups["practicals"] == pytest.approx(1.0, rel=0.6)
+    assert score > 80.0
+    assert probes <= 30                       # few probes, not a 7-doubling crawl
+
+
 def test_run_polish_respects_group_locks(monkeypatch):
     def score_fn(state):
         g = state.get(GROUP_PREFIX + "practicals") if state else 0.0

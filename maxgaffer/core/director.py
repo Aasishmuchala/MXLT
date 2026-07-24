@@ -138,7 +138,12 @@ def polish_axes(state: LightingState) -> tuple:
     ordinary measurable axes; polish just needs to know they exist for this rig."""
     axes = list(POLISH_PARAMS)
     for g in sorted(state.groups):
-        axes.append((GROUP_PREFIX + g, 0.35, True, 0.06))
+        # initial step = a FULL doubling: a zeroed group seeds from the 0.06 floor and a
+        # 0.35-step probe (0.06 -> 0.077) is visually invisible, so an off zone could
+        # never clear min_gain from a wide shot (measured: the aerial city's 4 zones
+        # stayed at 0 while the street-level city climbed fine). With 1.0 the ride
+        # reaches unity in ~3 accelerated probes; the fine floor still finishes small.
+        axes.append((GROUP_PREFIX + g, 1.0, True, 0.06))
     if "atmosphere.distance_m" in state.values:
         axes.append(("atmosphere.distance_m", 0.5, True, 0.08))
     return tuple(axes)
@@ -567,6 +572,12 @@ def run_polish(
     hooks._polish_best_components = {}
     probes = 0
     axes = polish_axes(state)               # static params + this rig's groups/fog
+    # dynamic ridge couples: EV can fake ANY dimmer group (measured 2026-07-24 on the
+    # 400-lamp city: one zone ran away to 9.4x compensating exposure while, from an
+    # aerial camera, zeroed zones could never clear min_gain single-axis — the diagonal
+    # fixes both directions of the same valley)
+    pairs = _POLISH_PAIRS + tuple(("exposure.ev", GROUP_PREFIX + g)
+                                  for g in sorted(state.groups))
     steps = {k: s for k, s, _log, _floor in axes}
     # fail-memo: (step, score) at last failure per param — while neither has changed,
     # re-probing would render the exact same comparison again
@@ -665,7 +676,7 @@ def run_polish(
                         return sc
                     return None
 
-                for ka, kb in _POLISH_PAIRS:
+                for ka, kb in pairs:
                     if escaped or hooks.should_cancel() \
                             or probes >= cfg.polish_max_probes:
                         break
