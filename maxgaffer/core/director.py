@@ -103,12 +103,17 @@ POLISH_PARAMS = (
 )
 
 # the compensation couples — probed diagonally when single-axis search stalls (ridge
-# escape): exposure↔WB fake each other, and both fake low-sun warmth/direction
+# escape): exposure↔WB fake each other, and both fake low-sun warmth/direction.
+# ev↔dome is the dome-rig metamer valley: dome × 2^-EV holds the image nearly constant,
+# so single-axis probes see a ridge and the dome pins at its start value while EV
+# compensates (measured on-box 2026-07-24: three consecutive hero self-matches recovered
+# dome.intensity == the scramble value exactly, EV off by the canceling stops).
 _POLISH_PAIRS = (
     ("exposure.ev", "exposure.wb_kelvin"),
     ("exposure.wb_kelvin", "sun.altitude_deg"),
     ("exposure.ev", "sun.altitude_deg"),
     ("sun.azimuth_deg", "sun.altitude_deg"),
+    ("exposure.ev", "dome.intensity"),
 )
 
 
