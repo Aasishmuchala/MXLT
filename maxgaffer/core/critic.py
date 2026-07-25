@@ -94,15 +94,24 @@ def scorecard(score_value: float, components: Dict[str, float], *,
     weakest = [key for key, value in ordered if value < 0.72][:3]
     strengths = [key for key, value in reversed(ordered) if value >= 0.85][:3]
     likely = []
-    if clean.get("direction", 1.0) < 0.65:
+    # HIGHLIGHT leads this diagnosis, not direction. The grid cosine is the component this
+    # module documents as unable to tell a 171-degree miss from a 13.5-degree one, so a
+    # panel that reads only it will tell the artist the light is fine while the reference's
+    # sun is entirely absent from the render.
+    if min(clean.get("direction", 1.0), clean.get("highlight", 1.0)) < 0.65:
         likely.append("light direction/shadow placement")
     if min(clean.get("color", 1.0), clean.get("hue", 1.0)) < 0.65:
         likely.append("white balance or source color")
     if clean.get("key", 1.0) < 0.65:
         likely.append("exposure/key level")
     tonal_shape = min(clean.get("envelope", 1.0), clean.get("histogram", 1.0))
+    # ...and the content-gap verdict must not be reachable while the directional light is
+    # missing. Without highlight here the card announced "the residual is scene
+    # content/albedo, not a lighting control the optimizer can solve" for a render with no
+    # sun patch in it at all — the one case where it IS a lighting control, and a solvable
+    # one. It also set albedo_suspect, sending the artist to fix their materials.
     light_axes = min(clean.get("key", 1.0), clean.get("color", 1.0),
-                     clean.get("direction", 1.0))
+                     clean.get("direction", 1.0), clean.get("highlight", 1.0))
     content_gap = bool((ceiling_proven and (score_value or 0) < 95.0)
                        or (light_axes >= 0.78 and tonal_shape < 0.62))
     if content_gap:

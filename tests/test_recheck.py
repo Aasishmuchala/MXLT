@@ -378,9 +378,14 @@ def test_reverting_to_the_champion_takes_its_plate_with_it():
 
     src = inspect.getsource(run_polish)
     assert "champion_render" in src
-    finish = src[src.index("def _finish("):]
-    assert "hooks._polish_best_render = final_render" in finish[:900], (
+    finish = src[src.index("def _finish("):src.index("def _finish(") + 2000]
+    assert "hooks._polish_best_render = final_render" in finish, (
         "the plate must follow whichever state _finish actually lands on")
+    # _record_best pins BOTH channels, so a revert must restore both — restoring only the
+    # plate left the component breakdown describing the abandoned descent, and that
+    # breakdown drives scorecard's weakest/likely-gap and fairness.assess
+    assert "champion_components" in src
+    assert "hooks._polish_best_components = final_components" in finish
 
 
 def test_the_transfer_blend_can_no_longer_outvote_the_pixels():
@@ -426,3 +431,43 @@ def test_a_globally_brightened_frame_cannot_fake_sun_patches():
     assert flat["hot_frac"] == 0.0, "an evenly lit frame has no directional patch"
     assert patched["hot_frac"] > 0.0
     assert metrics.highlight_similarity(patched, flat) == 0.0
+
+
+def test_every_polish_probe_renders_to_its_own_file():
+    """The probe tag was f"polish{round}_{axis}" — a pure function of round and axis — but a
+    climb probes one axis repeatedly, and render_frame DELETES its target before writing.
+    Each probe therefore destroyed the last one's plate, and a climb only stops when a probe
+    fails, so the recorded winning plate was reliably overwritten by the rejected state one
+    step past the optimum (typically 1.6 stops out once the stride accelerates). Correct
+    path, wrong bytes. sun.intensity and dome.intensity also both reduce to "intensity",
+    colliding two axes on one filename in the same round.
+
+    No existing test could catch it: every fake is render=lambda t: f"/tmp/{t}.png", which
+    models a path as a content-stable token nothing ever writes to. This one asserts
+    uniqueness directly."""
+    seen_paths = []
+
+    st = LightingState()
+    for k, v in {"sun.enabled": 1, "sun.azimuth_deg": 100.0, "sun.intensity": 1.0,
+                 "dome.intensity": 1.0, "exposure.ev": 12.0,
+                 "exposure.wb_kelvin": 6500.0}.items():
+        st.set(k, v)
+
+    def render(tag):
+        path = f"/tmp/{tag}.png"
+        seen_paths.append(path)
+        return path
+
+    # imperfect stats, so the score stays under polish_stop_at and polish actually probes
+    hooks = Hooks(apply=lambda s: None, render=render, stats=lambda p: dark(REF),
+                  llm_deltas=lambda ctx: json.dumps(
+                      {"assessment": "", "changes": [], "stop": False}),
+                  log=lambda m: None)
+    run_match(st, REF, {}, hooks,
+              MatchConfig(max_iterations=2, target_score=101, stall_patience=99,
+                          polish=True, polish_rounds=3, polish_max_probes=40,
+                          analytic=False))
+    polish_paths = [p for p in seen_paths if "polish" in p]
+    assert polish_paths, "test setup should have run polish probes"
+    assert len(polish_paths) == len(set(polish_paths)), (
+        "two polish probes shared a filename — the second destroys the first's plate")

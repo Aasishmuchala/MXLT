@@ -752,6 +752,18 @@ def run_polish(
     memo_components: Dict[tuple, Dict[str, float]] = {}
     stats_of: Dict[tuple, Dict] = {}
     memo_hits = 0
+    # A probe tag was f"polish{round}_{axis}", a pure function of round and axis — but a
+    # climb probes ONE axis many times, and render_frame deletes its target before writing.
+    # So every probe in a climb overwrote the previous one, and the climb only ends when a
+    # probe FAILS: the recorded winning plate was reliably clobbered by the rejected state
+    # one step past the optimum, typically 1.6 stops out after the stride accelerates.
+    # sun.intensity and dome.intensity both reduce to "intensity", so two axes collided on
+    # one filename in the same round as well. Correct path, wrong bytes — which is why
+    # pinning the path (the previous fix) was necessary and not sufficient, and why
+    # best_render measured 88.83 against a reference while its own state rendered 56.20.
+    # No test could see it: every fake is render=lambda t: f"/tmp/{t}.png", modelling a
+    # path as a content-stable token that nothing ever writes to.
+    render_seq = 0
 
     def _memo_key(st: LightingState) -> tuple:
         vals = tuple(sorted((k, round(float(v), 6)) for k, v in st.values.items()))
@@ -759,7 +771,7 @@ def run_polish(
         return (vals, grps)
 
     def measure(cand: LightingState, tag: str) -> Optional[float]:
-        nonlocal probes, memo_hits
+        nonlocal probes, memo_hits, render_seq
         _leash(cand)                    # every probe respects the loop's tonal leash
         key = _memo_key(cand)
         if key in seen:
@@ -775,7 +787,8 @@ def run_polish(
         if probes >= cfg.polish_max_probes:
             return None
         hooks.apply(cand)
-        path = hooks.render(tag)
+        render_seq += 1
+        path = hooks.render(f"{tag}_{render_seq:03d}")
         if path is None:
             return None
         st = hooks.stats(path)
@@ -805,13 +818,20 @@ def run_polish(
     # ...and the plate the champion produced. None here is correct and deliberate: at this
     # point champion IS the loop's best, whose render run_match already holds.
     champion_render = getattr(hooks, "_polish_best_render", None)
+    champion_components = dict(getattr(hooks, "_polish_best_components", {}) or {})
 
     def _finish(conv: bool, proven: bool):
         """Land on the better of the working point and the pre-restart champion."""
         final, final_score = best, best_score
         final_render = getattr(hooks, "_polish_best_render", None)
+        final_components = dict(getattr(hooks, "_polish_best_components", {}) or {})
         if champion_score > final_score + 1e-9:
-            final, final_score, final_render = champion, champion_score, champion_render
+            final, final_score = champion, champion_score
+            # _record_best pins BOTH channels, so reverting must restore both. Restoring
+            # only the plate left the per-component breakdown describing the last
+            # improving probe of the descent that was just abandoned — and that breakdown
+            # drives scorecard's weakest/likely-gap and fairness.assess.
+            final_render, final_components = champion_render, champion_components
             hooks.log(f"polish: restart did not pay — returning the earlier best "
                       f"{final_score:.2f}")
         # the plate must follow the state it depicts. _record_best only fires when `best`
@@ -819,6 +839,8 @@ def run_polish(
         # run had just abandoned — the same class of mismatch as best_render not
         # following polish at all.
         hooks._polish_best_render = final_render
+        if final_components:
+            hooks._polish_best_components = final_components
         hooks.apply(final)
         return final, final_score, probes, conv, proven
 
@@ -1027,6 +1049,7 @@ def run_polish(
                         # pair the computed tonal jump with the ambient/haze partners that
                         # have to move with it, so the whole group travels together
                         jump_best, jump_score = None, None
+                        jump_render, jump_components = None, {}
                         for dome_mult, turb_step in ((1.0, 0.0), (0.5, 1.0), (0.35, 2.0)):
                             if hooks.should_cancel() \
                                     or probes >= cfg.polish_max_probes:
@@ -1047,6 +1070,14 @@ def run_polish(
                             sc = measure(cand, f"polish{rnd}_tonal{int(dome_mult * 100)}")
                             if sc is not None and (jump_score is None or sc > jump_score):
                                 jump_best, jump_score = cand, sc
+                                # This is the ONLY place polish measures several candidates
+                                # and picks afterwards, so it is the only place where the
+                                # side-channels left by the LAST probe are not the winner's.
+                                # The variants differ by ~1.5 stops of ambient and 2 of
+                                # turbidity — routinely tens of points apart.
+                                jump_render = getattr(hooks, "_last_polish_render", None)
+                                jump_components = dict(
+                                    getattr(hooks, "_last_polish_components", {}) or {})
                         resolved_tonally = True   # one coordinated jump per polish run
 
                         # RESTART, not a probe. A coordinated jump lands in the right
@@ -1059,6 +1090,10 @@ def run_polish(
                         # pays the run still returns the better state.
                         if jump_best is not None \
                                 and jump_score > best_score - _RESTART_TOLERANCE:
+                            # restore the WINNING variant's channels — `measure` left
+                            # behind whichever candidate happened to run last
+                            hooks._last_polish_render = jump_render
+                            hooks._last_polish_components = jump_components
                             if best_score > champion_score:
                                 champion, champion_score = best.copy(), best_score
                                 champion_render = getattr(

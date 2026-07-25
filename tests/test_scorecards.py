@@ -45,3 +45,25 @@ def test_artist_feedback_persists_the_human_verdict(tmp_path):
     assert session.save()
     loaded = Session.load(str(path), now_fn=lambda: "later")
     assert loaded.entry("Cam").artist_feedback[-1]["note"] == "wrong mood"
+
+
+def test_the_card_never_blames_content_while_the_sun_is_missing():
+    """scorecard's diagnosis was computed from `direction` alone — the component critic.py
+    itself documents as returning 0.922 for a sun 171 degrees out and 0.917 for one 13.5
+    degrees out. For a render with NO directional light in it (highlight 0.0) but a healthy
+    grid cosine, the card announced the residual was 'scene content/albedo/material
+    distribution—not lighting alone' and set albedo_suspect, sending the artist off to fix
+    materials at the exact moment the reference's sun was absent — which IS a lighting
+    control, and a solvable one."""
+    sunless = {"key": 0.95, "color": 0.90, "direction": 0.92, "highlight": 0.0,
+               "envelope": 0.55, "histogram": 0.50, "hue": 0.90}
+    card = critic.scorecard(70.0, sunless)
+    assert any("direction" in reason for reason in card["likely_gap"]), card["likely_gap"]
+    assert card["content_gap"] is False, (
+        "a missing sun is not a content gap — it is the thing the optimizer exists to fix")
+
+    # a genuine content gap — every LIGHTING axis healthy, tonal shape stubbornly wrong —
+    # must still be reported as one
+    real_gap = {"key": 0.95, "color": 0.90, "direction": 0.92, "highlight": 0.95,
+                "envelope": 0.55, "histogram": 0.50, "hue": 0.90}
+    assert critic.scorecard(70.0, real_gap)["content_gap"] is True
