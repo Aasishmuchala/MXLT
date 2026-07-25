@@ -89,6 +89,18 @@ def score(semantics: Optional[Dict], state: Optional[LightingState],
     has_sun = "sun.azimuth_deg" in state.values
     sun_on = state.get("sun.enabled", 1.0) >= 0.5 if "sun.enabled" in state.values else True
 
+    # Renormalising over the MEASURABLE parts is right when the REFERENCE is silent — there
+    # is genuinely nothing to compare. It is an exploit when the CANDIDATE decides what is
+    # measurable. Measured on-box 2026-07-25: switching the sun off scored 83.33 against
+    # 79.09 for aiming it 64 degrees wrong, because direction, elevation and hardness left
+    # the denominator along with the sun — and the parts that remained were ones the rig
+    # already satisfied. Blended into the match objective at 0.25 that paid the search to go
+    # sunless, and it did: the golden-hour match came back at 80.35 with sun.enabled = 0.
+    #
+    # So: if the reference has a sun and the rig can host one, EVERY sun criterion is scored.
+    # A rig that switches its sun off scores 0.0 on them. Never absent.
+    expects_sun = has_sun and sun_active
+
     # ---- presence: does the rig agree there IS (or is not) a sun
     if has_sun:
         parts["presence"] = 1.0 if sun_on == sun_active else 0.0
@@ -97,24 +109,30 @@ def score(semantics: Optional[Dict], state: Optional[LightingState],
                          % ("ON" if sun_active else "OFF", "ON" if sun_on else "OFF"))
 
     # ---- direction: bearing relative to the camera — what a DP reads first
-    if has_sun and sun_active and sun_on and "sun_bearing_deg" in semantics:
-        want_az = (_num(camera_yaw_deg) + _num(semantics.get("sun_bearing_deg"))) % 360.0
-        got_az = _num(state.get("sun.azimuth_deg")) % 360.0
-        err = _angle_delta(want_az, got_az)
-        # 15° is within a lighting artist's own margin; 90° is a different shot
-        parts["direction"] = max(0.0, 1.0 - max(0.0, err - 15.0) / 75.0)
-        notes.append("sun bearing off by %.0f°" % err)
+    if expects_sun and "sun_bearing_deg" in semantics:
+        if not sun_on:
+            parts["direction"] = 0.0        # no sun points nowhere — that is a total miss
+        else:
+            want_az = (_num(camera_yaw_deg) + _num(semantics.get("sun_bearing_deg"))) % 360.0
+            got_az = _num(state.get("sun.azimuth_deg")) % 360.0
+            err = _angle_delta(want_az, got_az)
+            # 15° is within a lighting artist's own margin; 90° is a different shot
+            parts["direction"] = max(0.0, 1.0 - max(0.0, err - 15.0) / 75.0)
+            notes.append("sun bearing off by %.0f°" % err)
 
     # ---- elevation: against the analysed BAND, not a point value
     band = str(semantics.get("sun_altitude_band", "na") or "na")
-    if has_sun and sun_active and sun_on and band in BAND_CENTRE_DEG:
-        got = _num(state.get("sun.altitude_deg"))
-        slack = BAND_HALF_WIDTH_DEG.get(band, 10.0)
-        err = max(0.0, abs(got - BAND_CENTRE_DEG[band]) - slack)
-        parts["elevation"] = max(0.0, 1.0 - err / 35.0)
-        if err:
-            notes.append("sun elevation %.0f° is %.0f° outside the '%s' band"
-                         % (got, err, band))
+    if expects_sun and band in BAND_CENTRE_DEG:
+        if not sun_on:
+            parts["elevation"] = 0.0
+        else:
+            got = _num(state.get("sun.altitude_deg"))
+            slack = BAND_HALF_WIDTH_DEG.get(band, 10.0)
+            err = max(0.0, abs(got - BAND_CENTRE_DEG[band]) - slack)
+            parts["elevation"] = max(0.0, 1.0 - err / 35.0)
+            if err:
+                notes.append("sun elevation %.0f° is %.0f° outside the '%s' band"
+                             % (got, err, band))
 
     # ---- warmth: in mireds, where equal steps look equal
     if "exposure.wb_kelvin" in state.values and semantics.get("wb_kelvin_estimate"):
@@ -127,12 +145,15 @@ def score(semantics: Optional[Dict], state: Optional[LightingState],
 
     # ---- hardness: sun size against hard / soft / mixed
     quality = str(semantics.get("light_quality", "") or "")
-    if has_sun and sun_on and quality in HARDNESS_SIZE and "sun.size" in state.values:
-        want, got = HARDNESS_SIZE[quality], max(0.5, _num(state.get("sun.size"), 1.0))
-        import math
+    if expects_sun and quality in HARDNESS_SIZE and "sun.size" in state.values:
+        if not sun_on:
+            parts["hardness"] = 0.0     # a sun that is off casts no edge to be hard or soft
+        else:
+            want, got = HARDNESS_SIZE[quality], max(0.5, _num(state.get("sun.size"), 1.0))
+            import math
 
-        octaves = abs(math.log2(got / want))
-        parts["hardness"] = max(0.0, 1.0 - octaves / 3.0)
+            octaves = abs(math.log2(got / want))
+            parts["hardness"] = max(0.0, 1.0 - octaves / 3.0)
 
     # ---- atmosphere: haze density
     atmo = str(semantics.get("atmosphere", "") or "")

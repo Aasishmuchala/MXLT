@@ -136,8 +136,15 @@ _MAX_HOPS = 3
 _RESTART_TOLERANCE = 8.0
 
 
-def _blend_transfer(pixel_score: float, state: LightingState, hooks: "Hooks",
-                    cfg: "MatchConfig") -> float:
+#: Share of the match objective given to the reference's own lighting reading, over the
+#: pixel critic. The basin picker and the loop MUST use the same number: the basin picker
+#: hands the loop its starting state, and if the two judge by different rules the picker
+#: can hand over a state the loop immediately scores worse than what it rejected.
+TRANSFER_WEIGHT = 0.25
+
+
+def blend_transfer(pixel_score: float, state: LightingState, hooks: "Hooks",
+                   cfg: "MatchConfig") -> float:
     """Fold the SEMANTIC transfer reading into the pixel score.
 
     Pixel statistics cannot pin sun direction on an interior: measured on-box 2026-07-25,
@@ -347,7 +354,7 @@ def run_match(
                     / max(1e-5, float(cur_stats.get("log_key", 0.0)))))
             if cur_stats is not None and ref_stats is not None:
                 verdict = critic.score(ref_stats, cur_stats, cfg.weights)
-                verdict.score = _blend_transfer(verdict.score, state, hooks, cfg)
+                verdict.score = blend_transfer(verdict.score, state, hooks, cfg)
                 rec.score, rec.components = verdict.score, verdict.components
                 score_history.append((i, verdict.score))
                 hooks.log(f"iter {i}: score {verdict.summary()}")
@@ -733,7 +740,7 @@ def run_polish(
             return None
         probes += 1
         verdict = critic.score(ref_stats, st, cfg.weights)
-        verdict.score = _blend_transfer(verdict.score, cand, hooks, cfg)
+        verdict.score = blend_transfer(verdict.score, cand, hooks, cfg)
         hooks._last_polish_components = dict(verdict.components)
         seen[key] = verdict.score
         memo_components[key] = dict(verdict.components)

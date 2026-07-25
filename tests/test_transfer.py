@@ -95,7 +95,7 @@ def test_blend_pulls_the_objective_toward_semantic_agreement():
     """Pixels cannot pin sun direction on an interior — measured on-box 2026-07-25, a
     64-degree azimuth error still scored 90.92. Blending the ANALYZE reading in is what
     makes a structurally wrong rig score lower than a right one."""
-    from maxgaffer.core.director import Hooks, MatchConfig, _blend_transfer
+    from maxgaffer.core.director import Hooks, MatchConfig, blend_transfer
     from maxgaffer.core.genome import LightingState
 
     st = LightingState()
@@ -103,24 +103,83 @@ def test_blend_pulls_the_objective_toward_semantic_agreement():
                   llm_deltas=lambda c: "", transfer=lambda s: 0.40)
     cfg = MatchConfig(transfer_weight=0.25)
     # a 90 pixel score with poor semantic agreement is pulled down
-    assert _blend_transfer(90.0, st, hooks, cfg) == pytest.approx(0.75 * 90 + 0.25 * 40)
+    assert blend_transfer(90.0, st, hooks, cfg) == pytest.approx(0.75 * 90 + 0.25 * 40)
     # perfect agreement leaves a good score essentially intact
     hooks.transfer = lambda s: 1.0
-    assert _blend_transfer(90.0, st, hooks, cfg) == pytest.approx(0.75 * 90 + 0.25 * 100)
+    assert blend_transfer(90.0, st, hooks, cfg) == pytest.approx(0.75 * 90 + 0.25 * 100)
 
 
 def test_blend_is_inert_without_a_hook_or_weight():
-    from maxgaffer.core.director import Hooks, MatchConfig, _blend_transfer
+    from maxgaffer.core.director import Hooks, MatchConfig, blend_transfer
     from maxgaffer.core.genome import LightingState
 
     st = LightingState()
     no_hook = Hooks(apply=lambda s: None, render=lambda t: None, stats=lambda p: None,
                     llm_deltas=lambda c: "")
-    assert _blend_transfer(90.0, st, no_hook, MatchConfig(transfer_weight=0.25)) == 90.0
+    assert blend_transfer(90.0, st, no_hook, MatchConfig(transfer_weight=0.25)) == 90.0
     with_hook = Hooks(apply=lambda s: None, render=lambda t: None, stats=lambda p: None,
                       llm_deltas=lambda c: "", transfer=lambda s: 0.0)
-    assert _blend_transfer(90.0, st, with_hook, MatchConfig()) == 90.0   # weight 0
+    assert blend_transfer(90.0, st, with_hook, MatchConfig()) == 90.0   # weight 0
     # a hook that raises or returns None must never break scoring
     boom = Hooks(apply=lambda s: None, render=lambda t: None, stats=lambda p: None,
                  llm_deltas=lambda c: "", transfer=lambda s: 1 / 0)
-    assert _blend_transfer(90.0, st, boom, MatchConfig(transfer_weight=0.25)) == 90.0
+    assert blend_transfer(90.0, st, boom, MatchConfig(transfer_weight=0.25)) == 90.0
+
+
+# ------------------------------------------------ the rig must not delete its own criteria
+def _sunlit_ref():
+    return {"sun_active": True, "sun_bearing_deg": -60.0, "sun_altitude_band": "golden",
+            "wb_kelvin_estimate": 4800.0, "light_quality": "hard",
+            "atmosphere": "light_haze"}
+
+
+def _rig(**kw):
+    st = LightingState()
+    base = {"sun.enabled": 1.0, "sun.azimuth_deg": 105.0, "sun.altitude_deg": 10.0,
+            "sun.size": 1.0, "exposure.wb_kelvin": 4800.0, "atmosphere.distance_m": 250.0}
+    base.update(kw)
+    for k, v in base.items():
+        st.set(k, v)
+    return st
+
+
+def test_switching_the_sun_off_cannot_buy_a_better_transfer_score():
+    """Renormalising over MEASURABLE parts is right when the REFERENCE is silent and an
+    exploit when the CANDIDATE decides what is measurable. Measured on-box 2026-07-25:
+    direction, elevation and hardness are all gated on the rig's sun being on, so switching
+    it off removed the three criteria the search was failing and left only ones it already
+    satisfied — sun-off scored 83.33 against 79.09 for aiming 64 degrees wrong. Blended into
+    the objective at 0.25 that paid the search to go sunless and it did, finishing at 80.35
+    with sun.enabled = 0. Giving up must never score better than trying and missing."""
+    ref = _sunlit_ref()
+    aimed = transfer.score(ref, _rig(), 165.0)["score"]
+    missed = transfer.score(ref, _rig(**{"sun.azimuth_deg": 41.0}), 165.0)["score"]
+    off = transfer.score(ref, _rig(**{"sun.enabled": 0.0}), 165.0)["score"]
+    assert aimed > missed > off, (aimed, missed, off)
+    assert off < 40.0, "a sunless rig for a sunlit reference must score badly, not decently"
+
+
+def test_sun_criteria_are_scored_zero_not_skipped_when_the_sun_is_off():
+    got = transfer.score(_sunlit_ref(), _rig(**{"sun.enabled": 0.0}), 165.0)
+    for part in ("direction", "elevation", "hardness"):
+        assert part in got["measurable"], f"{part} vanished from the denominator"
+        assert got["parts"][part] == 0.0
+
+
+def test_reference_silence_still_renormalises():
+    """The other half of the rule: when the REFERENCE carries no reading there is genuinely
+    nothing to compare, and those parts must stay out of the denominator rather than score
+    zero against a value nobody supplied."""
+    bare = {"sun_active": True}          # no bearing, no band, no quality, no wb, no haze
+    got = transfer.score(bare, _rig(), 165.0)
+    assert got["measurable"] == ["presence"]
+    assert got["score"] == 100.0
+
+
+def test_a_sunless_reference_does_not_demand_sun_criteria():
+    dull = {"sun_active": False, "wb_kelvin_estimate": 6500.0, "atmosphere": "none"}
+    got = transfer.score(dull, _rig(**{"sun.enabled": 0.0, "atmosphere.distance_m": 4000.0,
+                                       "exposure.wb_kelvin": 6500.0}), 165.0)
+    assert "direction" not in got["measurable"]     # no bearing was read to compare against
+    assert got["parts"]["presence"] == 1.0
+    assert got["score"] == 100.0

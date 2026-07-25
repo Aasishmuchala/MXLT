@@ -158,3 +158,24 @@ def test_llm_reproposing_a_measured_state_is_dropped():
     # and the fingerprint helper is stable for equal states
     other = st.copy()
     assert _state_fingerprint(other) == _state_fingerprint(st)
+
+
+# ------------------------------------------------- basin choice uses the loop's objective
+def test_basin_probe_is_judged_on_the_same_objective_as_the_loop():
+    """The basin picker hands the loop its starting state and polish is a basin-finisher, so
+    that one comparison caps the whole run. It was scoring candidates on PIXELS while the
+    loop scored them on pixels blended with the reference's lighting reading. Measured
+    on-box 2026-07-25: it picked a SUNLESS basin for a sunlit golden-hour reference, which
+    then suppressed the sun lock (that lock deliberately leaves a genuinely sunless basin
+    free), and the match finished at 80.35 with the sun switched off. Two judges, one
+    handing work to the other, must apply the same rule."""
+    import inspect
+
+    from maxgaffer.core.director import TRANSFER_WEIGHT
+    from maxgaffer.maxbridge.controller import Controller
+
+    src = inspect.getsource(Controller._pick_start_basin)
+    assert "blend_transfer(" in src, "basin probe fell back to a pixels-only comparison"
+    # and the weight is shared, not re-typed — two literals drift apart
+    assert "TRANSFER_WEIGHT" in src
+    assert TRANSFER_WEIGHT == 0.25

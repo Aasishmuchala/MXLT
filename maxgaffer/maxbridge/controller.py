@@ -24,7 +24,8 @@ from ..core import (animation, consensus, critic, domeseed, expose, fairness, fe
                     transfer,
                     metrics, omega, planner, profiles, prompts, providers, rules,
                     scenedigest, scenarios as scen)
-from ..core.director import Hooks, MatchConfig, MatchResult, run_match, run_sun_sweep
+from ..core.director import (Hooks, MatchConfig, MatchResult, TRANSFER_WEIGHT,
+                             blend_transfer, run_match, run_sun_sweep)
 from ..core.genome import LightingState
 from ..core.parse import ParseError, validate_analysis
 from ..core.session import (Session, preset_dumps, preset_loads, reference_signature,
@@ -1091,7 +1092,7 @@ class Controller:
                 # a quarter of the objective is "does this rig agree with what ANALYZE
                 # read off the reference" — enough to pin direction, not enough to
                 # override the pixels that carry tone and detail
-                transfer_weight=0.25 if semantics else 0.0,
+                transfer_weight=TRANSFER_WEIGHT if semantics else 0.0,
             )
             if profile.polish:
                 log("HERO MATCH: target 99 · bounded coordinate-descent polish "
@@ -1419,6 +1420,8 @@ class Controller:
                   if c.get("key") != "as_analyzed" and c.get("state") is not None]
         if len(cands) < 2:
             return first_guess
+        cfg_probe = MatchConfig(
+            transfer_weight=TRANSFER_WEIGHT if hooks.transfer is not None else 0.0)
         best_key, best_state, best_score = "first_guess", first_guess, None
         for key, st in cands:
             if hooks.should_cancel():
@@ -1430,6 +1433,13 @@ class Controller:
                 if cur is None:
                     continue
                 value = critic.score(ref_stats, cur, self._critic_weights()).score
+                # Judged on the SAME objective the loop will use. On pixels alone this
+                # probe picked a SUNLESS basin for a sunlit golden-hour reference
+                # (measured on-box 2026-07-25) — which then suppressed the sun lock
+                # below, because that lock deliberately leaves a genuinely sunless basin
+                # free. One weak comparison at the top of the run cost the whole match:
+                # the loop finished at 80.35 with the sun switched off.
+                value = blend_transfer(value, st, hooks, cfg_probe)
             except Exception as err:  # noqa: BLE001 one bad candidate ≠ a dead match
                 log(f"multi-start: {key} probe failed ({err})")
                 continue
