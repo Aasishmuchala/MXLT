@@ -780,6 +780,33 @@ def run_polish(
                                     getattr(hooks, "_last_polish_components", {}))
                                 mult *= 1.6
                             break
+                if not escaped:
+                    # DISCRETE escape: the on/off flags are not line-search axes (a 0..1
+                    # switch has no gradient), so once the loop turns the sun OFF nothing
+                    # can turn it back on — polish then perfects a SUNLESS metamer of a
+                    # sunlit reference. Measured on-box 2026-07-25 (A6): recovered
+                    # sun.enabled=0, altitude -2°, WB pinned at 15000, envelope collapsed
+                    # to 0.12 against a golden-hour reference. Flipping a flag is one
+                    # probe; if the flip does not pay, it is reverted immediately.
+                    for flag in ("sun.enabled", "dome.enabled"):
+                        if escaped or flag in locks or flag not in best.values \
+                                or hooks.should_cancel() \
+                                or probes >= cfg.polish_max_probes:
+                            continue
+                        cand = best.copy()
+                        cand.set(flag, 0.0 if best.get(flag) >= 0.5 else 1.0)
+                        if abs(cand.get(flag) - best.get(flag)) < 1e-9:
+                            continue
+                        sc = measure(cand, f"polish{rnd}_flip_{flag.split('.')[0]}")
+                        if sc is not None and sc > best_score + cfg.polish_min_gain:
+                            hooks.log(f"polish: {flag} {best.get(flag):.0f}→"
+                                      f"{cand.get(flag):.0f} · {best_score:.2f}→{sc:.2f} ✓ "
+                                      "(discrete escape)")
+                            best, best_score = cand, sc
+                            hooks._polish_best_components = dict(
+                                getattr(hooks, "_last_polish_components", {}))
+                            improved_any = escaped = True
+
                 if escaped:
                     low_gain_rounds = 0
                     continue

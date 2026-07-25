@@ -842,6 +842,7 @@ class Controller:
         quality_profile: str = "standard",
         start_override: Optional[LightingState] = None,
         director_note: str = "",
+        multi_start: bool = True,
     ) -> MatchResult:
         e = self.camera_entry(camera_name, create=True)
         if not e.reference:
@@ -1002,6 +1003,20 @@ class Controller:
                 log(f"⚠ analyze samples disagreed (agreement {agreement:.0%}) — consensus "
                     "used; consider a cleaner reference if the match fights you")
                 self._last_analyze_agreement = None
+
+            # MULTI-START over the shipped preset rigs. The loop used to commit to ONE
+            # first guess, and polish can only refine WITHIN the basin it is handed
+            # (it is a basin-finisher by design) — measured on-box 2026-07-25: the loop
+            # delivered a 77.6 basin and polish could only reach ~91 from it, while the
+            # same polish reaches 96.6 from a good basin. We already ship six hand-tuned
+            # scenario rigs for the BOARD; probing them at SWEEP resolution costs a
+            # handful of small renders and starts the match from whichever basin
+            # actually measures closest to the reference.
+            if multi_start and start_override is None and ref_stats is not None \
+                    and not should_cancel():
+                start = self._pick_start_basin(start, semantics, rig, cam, e, locks,
+                                               hooks, ref_stats, log)
+                self._sw_state = start
 
             if do_sweep and start_override is None and rig.get("sun") is not None \
                     and "sun.azimuth_deg" not in locks:
@@ -1320,6 +1335,56 @@ class Controller:
         return results
 
     # ------------------------------------------------------------------ scenario board
+    def _pick_start_basin(self, first_guess, semantics, rig, cam, e, locks, hooks,
+                          ref_stats, log):
+        """Score the shipped scenario rigs against the first guess at SWEEP resolution and
+        return whichever measures closest — the match's starting basin.
+
+        Why: polish is a basin-finisher, so the loop's opening state caps the whole run.
+        A single first guess is one sample of a multi-modal landscape; the board's rigs
+        (golden-hour rake, overcast sky-key, backlit rim, cool north, practicals-at-dusk)
+        are the modes worth sampling, and they already exist. Failures degrade to the
+        first guess — a basin probe must never be able to end a match."""
+        try:
+            current = ap.read_state(rig, self._baselines, cam)
+            board = scen.build_scenarios(semantics, current, sc.camera_yaw_deg(cam),
+                                         set(locks or ()),
+                                         overcast_sun_mode=self.cfg.overcast_sun_mode)
+        except Exception as err:  # noqa: BLE001 — never let basin selection kill a match
+            log(f"multi-start: candidates unavailable ({err}) — keeping the first guess")
+            return first_guess
+        # "as_analyzed" IS the first guess; probe it once under its own name
+        cands = [("first_guess", first_guess)]
+        cands += [(c["key"], c["state"]) for c in board
+                  if c.get("key") != "as_analyzed" and c.get("state") is not None]
+        if len(cands) < 2:
+            return first_guess
+        best_key, best_state, best_score = "first_guess", first_guess, None
+        for key, st in cands:
+            if hooks.should_cancel():
+                break
+            try:
+                hooks.apply(st)
+                path = hooks.render(f"sweep_basin_{key}")
+                cur = self.stats_for(path) if path else None
+                if cur is None:
+                    continue
+                value = critic.score(ref_stats, cur, self._critic_weights()).score
+            except Exception as err:  # noqa: BLE001 one bad candidate ≠ a dead match
+                log(f"multi-start: {key} probe failed ({err})")
+                continue
+            log(f"multi-start: {key} → {value:.1f}")
+            if best_score is None or value > best_score:
+                best_key, best_state, best_score = key, st.copy(), value
+        if best_score is not None:
+            log(f"multi-start: best basin '{best_key}' at {best_score:.1f} "
+                f"(of {len(cands)} probed) — the match starts here")
+        try:
+            hooks.apply(best_state)     # leave the scene wearing the chosen basin
+        except Exception:  # noqa: BLE001
+            pass
+        return best_state
+
     def run_scenarios(
         self,
         camera_name: str,

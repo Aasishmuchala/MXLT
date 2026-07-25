@@ -162,3 +162,40 @@ def test_run_polish_respects_group_locks(monkeypatch):
         st, score_fn(st), {"grid": [0] * 9}, w.hooks, _cfg(),
         locks={GROUP_PREFIX + "practicals"})
     assert best.groups["practicals"] == pytest.approx(0.06)
+
+
+# ------------------------------------------------------------------ discrete flag escape
+def test_polish_can_switch_a_disabled_sun_back_on(monkeypatch):
+    """sun.enabled is a 0/1 switch with no gradient, so the line search cannot touch it.
+    Measured on-box (A6, 2026-07-25): the loop turned the sun OFF and polish then
+    perfected a SUNLESS metamer of a sunlit reference — envelope collapsed to 0.12 and
+    the state was unrecoverable. Polish must be able to flip it back."""
+    def score_fn(state):
+        if state is None:
+            return 40.0
+        on = state.get("sun.enabled")
+        # nothing else can compensate for the missing key light
+        return 92.0 if on >= 0.5 else 40.0
+
+    w = _World(monkeypatch, score_fn)
+    st = LightingState()
+    st.set("sun.enabled", 0.0)
+    st.set("sun.altitude_deg", -2.0)
+    st.set("exposure.ev", 10.0)
+    best, score, _probes, _c, _p = run_polish(st, 40.0, {"grid": [0] * 9}, w.hooks, _cfg())
+    assert best.get("sun.enabled") >= 0.5, "polish never re-enabled the sun"
+    assert score > 90.0
+
+
+def test_polish_keeps_an_enabled_sun_when_switching_it_off_hurts(monkeypatch):
+    def score_fn(state):
+        on = state.get("sun.enabled") if state else 1.0
+        return 90.0 if on >= 0.5 else 20.0
+
+    w = _World(monkeypatch, score_fn)
+    st = LightingState()
+    st.set("sun.enabled", 1.0)
+    st.set("exposure.ev", 10.0)
+    best, score, _probes, _c, _p = run_polish(st, 90.0, {"grid": [0] * 9}, w.hooks, _cfg())
+    assert best.get("sun.enabled") >= 0.5      # the losing flip must be discarded
+    assert score >= 90.0
