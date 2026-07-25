@@ -1017,6 +1017,19 @@ class Controller:
                 start = self._pick_start_basin(start, semantics, rig, cam, e, locks,
                                                hooks, ref_stats, log)
                 self._sw_state = start
+                # The basin decides the lighting ARCHETYPE; the loop refines inside it and
+                # does not get to abolish the key light. Without this the search kept
+                # finding a SUNLESS metamer of a sunlit reference — measured 2026-07-25:
+                # sun switched off, then dome 1.75 and WB pinned at 15000 compensating for
+                # the missing key, azimuth left anywhere (no sun = no direction gradient),
+                # scoring ~92 with structurally wrong light. Single-axis escapes cannot
+                # undo it because the compensators have co-adapted, so the sun is pinned
+                # ON for the rest of the match. It can still be DIMMED via sun.intensity,
+                # and a genuinely sunless basin (overcast/cool-north) is left free.
+                if start.get("sun.enabled", 0.0) >= 0.5 and "sun.enabled" not in locks:
+                    locks = set(locks) | {"sun.enabled"}
+                    log("sun locked ON for this match (the chosen basin is sunlit — it may "
+                        "be dimmed, not switched off)")
 
             if do_sweep and start_override is None and rig.get("sun") is not None \
                     and "sun.azimuth_deg" not in locks:
