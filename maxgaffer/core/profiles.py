@@ -24,6 +24,11 @@ class MatchProfile:
     polish: bool
     polish_rounds: int
     polish_max_probes: int
+    #: iterations without progress before the loop gives up. Measured 2026-07-25: with the
+    #: MatchConfig default of 2, hero runs ended after 3 of their 10 iterations on a single
+    #: dip -- 70% of the loop budget went unused, and the loop is where GEOMETRY is solved
+    #: (polish only refines the basin it is handed). A deep profile needs a longer leash.
+    stall_patience: int = 2
 
     @property
     def worst_case_renders(self) -> int:
@@ -59,7 +64,7 @@ def resolve_profile(name: str, *, loop_width: int, loop_height: int,
         sw, sh = _scaled(fw, fh, 0.5, floor_w=128)
         return MatchProfile("fast", "Fast", fw, fh, sw, sh,
                             min(iterations, 3), min(sweeps, 4), min(target, 78.0),
-                            False, 0, 0)
+                            False, 0, 0, stall_patience=2)
     if key == "hero":
         sw, sh = _scaled(width, height, 0.5, floor_w=192)
         # Polish budget 24 rounds / 500 probes. Every raise so far was measured, not
@@ -72,8 +77,8 @@ def resolve_profile(name: str, *, loop_width: int, loop_height: int,
         # is headroom for harder real landscapes, not a licence to grind.
         return MatchProfile("hero", "Hero", width, height, sw, sh,
                             max(iterations, 8), min(sweeps, 6), 99.0,
-                            True, 24, 500)
+                            True, 24, 500, stall_patience=5)
 
     sw, sh = _scaled(width, height, 0.5, floor_w=192)
     return MatchProfile("standard", "Standard", width, height, sw, sh,
-                        iterations, sweeps, target, False, 0, 0)
+                        iterations, sweeps, target, False, 0, 0, stall_patience=3)

@@ -1058,6 +1058,9 @@ class Controller:
                 polish=profile.polish,
                 polish_rounds=profile.polish_rounds,
                 polish_max_probes=profile.polish_max_probes,
+                # the loop solves GEOMETRY; it was quitting after 3 of 10 hero iterations
+                # on one dip because this never came through from the profile
+                stall_patience=profile.stall_patience,
             )
             if profile.polish:
                 log("HERO MATCH: target 99 · bounded coordinate-descent polish "

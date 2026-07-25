@@ -38,3 +38,14 @@ def test_deep_is_hero_alias_and_unknown_is_rejected():
     with pytest.raises(ValueError, match="unknown match profile"):
         resolve_profile("infinite", loop_width=480, loop_height=270,
                         max_iterations=5, sweep_count=8, target_score=82)
+
+
+def test_stall_patience_scales_with_profile_depth():
+    """The loop is where GEOMETRY is solved (polish only refines the basin it is handed).
+    Measured 2026-07-25: MatchConfig's default patience of 2 ended hero runs after 3 of
+    their 10 iterations on a single dip, leaving 70% of the loop budget unused."""
+    kw = dict(loop_width=480, loop_height=270, max_iterations=10, sweep_count=8,
+              target_score=82)
+    assert resolve_profile("fast", **kw).stall_patience == 2
+    assert resolve_profile("standard", **kw).stall_patience == 3
+    assert resolve_profile("hero", **kw).stall_patience == 5
