@@ -229,9 +229,9 @@ def test_transfer_weight_scales_with_bearing_agreement_but_never_to_zero():
 
     src = inspect.getsource(Controller.run_match)
     assert "TRANSFER_WEIGHT * bearing_trust" in src
-    assert "max(0.25," in src, ("the floor must not be zero — pixels are BLIND to sun "
-                               "direction, so a contested reading still beats none")
-    assert TRANSFER_WEIGHT == 0.25
+    assert "max(0.25," in src, ("the floor must not be zero — a contested reading is "
+                               "still evidence, and some scenes give the sweep nothing")
+    assert 0.0 < TRANSFER_WEIGHT <= 0.30
 
 
 def test_the_sweep_measurement_updates_the_belief_the_loop_defends():

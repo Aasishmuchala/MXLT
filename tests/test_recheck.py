@@ -180,7 +180,9 @@ def test_basin_probe_is_judged_on_the_same_objective_as_the_loop():
     assert "blend_transfer(" in src, "basin probe fell back to a pixels-only comparison"
     # and the weight is shared, not re-typed — two literals drift apart
     assert "TRANSFER_WEIGHT" in src
-    assert TRANSFER_WEIGHT == 0.25
+    # the VALUE is tuned (0.25 -> 0.10 once the critic could see direction for itself);
+    # what this locks is that both judges read it from the same constant
+    assert 0.0 < TRANSFER_WEIGHT <= 0.30
 
 
 def test_sun_lock_is_installed_no_matter_how_the_start_state_was_chosen():
@@ -361,3 +363,32 @@ def test_highlight_carries_real_weight_in_every_taste_profile():
         assert w.get("highlight", 0) > 0, name
     assert critic.PREFERENCE_PROFILES["direction"]["highlight"] > \
         critic.PREFERENCE_PROFILES["direction"]["direction"]
+
+
+def test_reverting_to_the_champion_takes_its_plate_with_it():
+    """polish may adopt a restart up to 8 points WORSE as a bet, with the champion fallback
+    making the gamble free. _record_best only fires when `best` improves, so reverting to
+    the champion left best_render on the state the run had just abandoned. Measured on-box
+    2026-07-26: the saved plate scored 88.83 against the reference while a re-render of the
+    state actually applied scored 56.20 — a 32-point lie about which picture the artist
+    got, in a run whose sun was 168 degrees out."""
+    import inspect
+
+    from maxgaffer.core.director import run_polish
+
+    src = inspect.getsource(run_polish)
+    assert "champion_render" in src
+    finish = src[src.index("def _finish("):]
+    assert "hooks._polish_best_render = final_render" in finish[:900], (
+        "the plate must follow whichever state _finish actually lands on")
+
+
+def test_the_transfer_blend_can_no_longer_outvote_the_pixels():
+    """transfer_weight existed because pixels were blind to sun direction. The highlight
+    component ended that blindness (it scored two states 0.912 and 0.546 on exactly that
+    question), and the workaround then turned costly: on-box the sweep put the sun 168
+    degrees wrong, the transfer term defended it, and that overrode a 32-point pixel gap."""
+    from maxgaffer.core.director import TRANSFER_WEIGHT
+
+    assert TRANSFER_WEIGHT <= 0.12, "the reading must not outvote what the render shows"
+    assert TRANSFER_WEIGHT > 0.0, "some weight still breaks a genuine tie"

@@ -140,7 +140,16 @@ _RESTART_TOLERANCE = 8.0
 #: pixel critic. The basin picker and the loop MUST use the same number: the basin picker
 #: hands the loop its starting state, and if the two judge by different rules the picker
 #: can hand over a state the loop immediately scores worse than what it rejected.
-TRANSFER_WEIGHT = 0.25
+#:
+#: Lowered 0.25 -> 0.10 once the critic grew a "highlight" component. This weight was
+#: introduced on the explicit grounds that pixels are BLIND to sun direction, which was
+#: true of a critic whose only spatial descriptor was an averaged luminance grid. It is no
+#: longer true: highlight scored two states 0.912 and 0.546 on exactly that question.
+#: With the blindness fixed the workaround turned costly — measured on-box 2026-07-25, the
+#: sweep put the sun 168 degrees wrong, the transfer term defended that answer, and it
+#: overrode a 32-point pixel difference between the state polish found and the one it
+#: kept. Enough weight left to break a genuine tie, not enough to outvote the pixels.
+TRANSFER_WEIGHT = 0.10
 
 
 def blend_transfer(pixel_score: float, state: LightingState, hooks: "Hooks",
@@ -793,14 +802,23 @@ def run_polish(
     # the run finished on the scrambled tonal values again). champion holds the best state
     # ever seen so a failed restart can never cost the run anything.
     champion, champion_score = best.copy(), best_score
+    # ...and the plate the champion produced. None here is correct and deliberate: at this
+    # point champion IS the loop's best, whose render run_match already holds.
+    champion_render = getattr(hooks, "_polish_best_render", None)
 
     def _finish(conv: bool, proven: bool):
         """Land on the better of the working point and the pre-restart champion."""
         final, final_score = best, best_score
+        final_render = getattr(hooks, "_polish_best_render", None)
         if champion_score > final_score + 1e-9:
-            final, final_score = champion, champion_score
+            final, final_score, final_render = champion, champion_score, champion_render
             hooks.log(f"polish: restart did not pay — returning the earlier best "
                       f"{final_score:.2f}")
+        # the plate must follow the state it depicts. _record_best only fires when `best`
+        # improves, so reverting to the champion left the render behind on a state the
+        # run had just abandoned — the same class of mismatch as best_render not
+        # following polish at all.
+        hooks._polish_best_render = final_render
         hooks.apply(final)
         return final, final_score, probes, conv, proven
 
@@ -1043,6 +1061,8 @@ def run_polish(
                                 and jump_score > best_score - _RESTART_TOLERANCE:
                             if best_score > champion_score:
                                 champion, champion_score = best.copy(), best_score
+                                champion_render = getattr(
+                                    hooks, "_polish_best_render", None)
                             hooks.log(
                                 f"polish: tonal restart (ev→{jump_best.get('exposure.ev'):.2f} "
                                 f"wb→{jump_best.get('exposure.wb_kelvin'):.0f}) · "
