@@ -551,7 +551,8 @@ def run_match(
             and stop_reason not in ("cancelled", "render_failed")):
         try:
             p_state, p_score, probes, converged, proven = run_polish(
-                best_state, best_score, ref_stats, hooks, cfg, locks)
+                best_state, best_score, ref_stats, hooks, cfg, locks,
+                leash_ref=start_state)
         except Exception:
             # polish probes are exploratory too — a dead hook mid-climb must leave the
             # loop's best state live, not the last probe
@@ -588,6 +589,7 @@ def run_polish(
     hooks: Hooks,
     cfg: MatchConfig,
     locks: Optional[Set[str]] = None,
+    leash_ref: Optional[LightingState] = None,
 ) -> Tuple[LightingState, float, int, bool, bool]:
     """LLM-free ADAPTIVE coordinate line search. Per parameter: nudge, keep climbing in a
     direction while each rendered probe measurably improves the score; when neither
@@ -638,6 +640,7 @@ def run_polish(
 
     def measure(cand: LightingState, tag: str) -> Optional[float]:
         nonlocal probes, memo_hits
+        _leash(cand)                    # every probe respects the loop's tonal leash
         key = _memo_key(cand)
         if key in seen:
             memo_hits += 1
@@ -665,6 +668,33 @@ def run_polish(
 
     seen[_memo_key(state)] = score_now      # the seed state is already measured
     hops_used = 0                           # azimuth basin hops taken (bounded)
+
+    # The ANALYTIC LEASH also binds polish. The loop clamps its EV/WB solve to a window
+    # around the run's start state, because matching histograms of DIFFERENT scenes biases
+    # the tonal solve systematically — but polish had no such bound and walked white
+    # balance to the genome wall. Measured 2026-07-25 on the realistic golden-hour room:
+    # once the sun was pinned on, azimuth converged correctly (315°→123° against a 105°
+    # target) yet the score stalled at 91.47 with exposure.wb_kelvin at 14,643 of a 15,000
+    # bound and turbidity DOWN at 2.5 — the search making the image warm with the CAMERA
+    # instead of the SUN. Bounding polish the same way as the loop forces the physically
+    # correct route (turbidity/altitude carry the warmth).
+    leash_bounds: Dict[str, Tuple[float, float]] = {}
+    if leash_ref is not None:
+        for key, span in (("exposure.ev", cfg.ev_leash),
+                          ("exposure.wb_kelvin", cfg.wb_leash)):
+            if key in state.values and key in leash_ref.values and span and span > 0:
+                anchor = leash_ref.get(key)
+                leash_bounds[key] = (anchor - span, anchor + span)
+
+    def _leash(cand: LightingState) -> LightingState:
+        """Clamp the leashed tonal axes back into the loop's window (in place)."""
+        for key, (lo, hi) in leash_bounds.items():
+            v = cand.get(key)
+            if v < lo:
+                cand.set(key, lo)
+            elif v > hi:
+                cand.set(key, hi)
+        return cand
 
     try:
         low_gain_rounds = 0

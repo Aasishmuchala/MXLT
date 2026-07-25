@@ -263,7 +263,7 @@ def test_polish_result_is_not_applied_twice(monkeypatch):
     world = World(stats_seq=[near(0.1)])
     marks = []
 
-    def fake_polish(state, score, ref, hooks, cfg, locks):
+    def fake_polish(state, score, ref, hooks, cfg, locks, **kw):
         hooks.apply(landed)                                # polish's contract: land it
         marks.append(len(world.applied))
         return landed, score + 1.0, 3, False, False
@@ -281,7 +281,7 @@ def test_polish_hook_exception_restores_loop_best(monkeypatch):
     rogue = start_state()
     rogue.set("sun.altitude_deg", 60.0)
 
-    def fake_polish(state, score, ref, hooks, cfg, locks):
+    def fake_polish(state, score, ref, hooks, cfg, locks, **kw):
         hooks.apply(rogue)                                 # exploratory probe live…
         raise RuntimeError("render hook died")
 

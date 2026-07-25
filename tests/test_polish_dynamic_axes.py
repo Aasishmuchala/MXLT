@@ -230,3 +230,37 @@ def test_polish_hops_to_a_distant_azimuth_basin(monkeypatch):
 
 def test_azimuth_hops_are_bounded():
     assert director._MAX_HOPS <= 4          # a global assist, not a random walk
+
+
+# ------------------------------------------------------------------ tonal leash in polish
+def test_polish_respects_the_wb_and_ev_leash(monkeypatch):
+    """The loop clamps its EV/WB solve to a window around the run's start state, because
+    matching histograms of DIFFERENT scenes biases the tonal solve. Polish had no such
+    bound and walked white balance to the genome wall: measured on-box 2026-07-25,
+    wb_kelvin 14,643 of a 15,000 bound while turbidity went DOWN — warming the image with
+    the camera instead of the sun. Polish must obey the same leash."""
+    def score_fn(state):
+        # a landscape that rewards cranking WB as high as it can go
+        return 50.0 + state.get("exposure.wb_kelvin") / 1000.0 if state else 50.0
+
+    w = _World(monkeypatch, score_fn)
+    start = LightingState()
+    start.set("exposure.wb_kelvin", 6500.0)
+    start.set("exposure.ev", 10.0)
+    st = start.copy()
+    best, _score, _p, _c, _pr = run_polish(st, score_fn(st), {"grid": [0] * 9}, w.hooks,
+                                           _cfg(), leash_ref=start)
+    # wb_leash defaults to 3000 => the window is [3500, 9500]
+    assert best.get("exposure.wb_kelvin") <= 9500.0 + 1e-6, best.get("exposure.wb_kelvin")
+
+
+def test_polish_without_a_leash_ref_is_unbounded_as_before(monkeypatch):
+    """Back-compat: callers that pass no leash_ref keep the old unclamped behaviour."""
+    def score_fn(state):
+        return 50.0 + state.get("exposure.wb_kelvin") / 1000.0 if state else 50.0
+
+    w = _World(monkeypatch, score_fn)
+    st = LightingState()
+    st.set("exposure.wb_kelvin", 6500.0)
+    best, _s, _p, _c, _pr = run_polish(st, score_fn(st), {"grid": [0] * 9}, w.hooks, _cfg())
+    assert best.get("exposure.wb_kelvin") > 9500.0
