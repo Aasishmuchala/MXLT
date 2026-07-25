@@ -1045,19 +1045,25 @@ class Controller:
                 start = self._pick_start_basin(start, semantics, rig, cam, e, locks,
                                                hooks, ref_stats, log)
                 self._sw_state = start
-                # The basin decides the lighting ARCHETYPE; the loop refines inside it and
-                # does not get to abolish the key light. Without this the search kept
-                # finding a SUNLESS metamer of a sunlit reference — measured 2026-07-25:
-                # sun switched off, then dome 1.75 and WB pinned at 15000 compensating for
-                # the missing key, azimuth left anywhere (no sun = no direction gradient),
-                # scoring ~92 with structurally wrong light. Single-axis escapes cannot
-                # undo it because the compensators have co-adapted, so the sun is pinned
-                # ON for the rest of the match. It can still be DIMMED via sun.intensity,
-                # and a genuinely sunless basin (overcast/cool-north) is left free.
-                if start.get("sun.enabled", 0.0) >= 0.5 and "sun.enabled" not in locks:
-                    locks = set(locks) | {"sun.enabled"}
-                    log("sun locked ON for this match (the chosen basin is sunlit — it may "
-                        "be dimmed, not switched off)")
+
+            # The start state decides the lighting ARCHETYPE; the loop refines inside it and
+            # does not get to abolish the key light. Without this the search kept finding a
+            # SUNLESS metamer of a sunlit reference — measured 2026-07-25: sun switched off,
+            # then dome 1.75 and WB pinned at 15000 compensating for the missing key,
+            # azimuth left anywhere (no sun = no direction gradient), scoring ~92 with
+            # structurally wrong light. Single-axis escapes cannot undo it because the
+            # compensators have co-adapted, so the sun is pinned ON for the rest of the
+            # match. It can still be DIMMED via sun.intensity, and a genuinely sunless start
+            # (overcast/cool-north) is left free.
+            #
+            # This guard belongs to the STATE, not to how the state was chosen. It used to
+            # sit inside the multi-start branch above, so `refine` — which supplies a
+            # start_override and therefore skips that branch — was the one path that could
+            # hand the loop a sun-off start with nothing pinning the sun back on.
+            if start.get("sun.enabled", 0.0) >= 0.5 and "sun.enabled" not in locks:
+                locks = set(locks) | {"sun.enabled"}
+                log("sun locked ON for this match (the starting rig is sunlit — it may "
+                    "be dimmed, not switched off)")
 
             if do_sweep and start_override is None and rig.get("sun") is not None \
                     and "sun.azimuth_deg" not in locks:
@@ -1310,6 +1316,21 @@ class Controller:
         if e.pre_match is None:
             e.pre_match = ap.read_state(rig, self._baselines, cam)
 
+        # the reference's own lighting reading, on the same terms the loop will use it
+        probe_yaw = sc.camera_yaw_deg(cam)
+
+        def _probe_transfer(st):
+            try:
+                return transfer.score(semantics, st, probe_yaw)["score"] / 100.0
+            except Exception:  # noqa: BLE001
+                return None
+
+        probe_hooks = Hooks(apply=lambda s: None, render=lambda t: "",
+                            stats=lambda p: None, llm_deltas=lambda c: "",
+                            transfer=_probe_transfer if semantics else None)
+        probe_cfg = MatchConfig(
+            transfer_weight=TRANSFER_WEIGHT if semantics else 0.0)
+
         def probe(st: LightingState, tag: str):
             self._apply_logged(rig, st, cam, log)
             path = self._render_exposed(cam, os.path.join(run_dir, f"{tag}.png"),
@@ -1318,7 +1339,12 @@ class Controller:
             stats = self.stats_for(path) if path else None
             if stats is None or ref_stats is None:
                 return None, path
-            return critic.score(ref_stats, stats, self._critic_weights()).score, path
+            value = critic.score(ref_stats, stats, self._critic_weights()).score
+            # The winning branch becomes run_match's start_override, so this comparison
+            # decides the whole refine round — and it must apply the same rule the loop and
+            # polish will. On pixels alone it could crown a structurally wrong branch that
+            # the loop then scores WORSE than the branch it rejected.
+            return blend_transfer(value, st, probe_hooks, probe_cfg), path
 
         score0, path0 = probe(state0, "refine_note")
         log(f"branch note-only: {score0:.1f}" if score0 is not None

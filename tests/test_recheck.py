@@ -179,3 +179,36 @@ def test_basin_probe_is_judged_on_the_same_objective_as_the_loop():
     # and the weight is shared, not re-typed — two literals drift apart
     assert "TRANSFER_WEIGHT" in src
     assert TRANSFER_WEIGHT == 0.25
+
+
+def test_sun_lock_is_installed_no_matter_how_the_start_state_was_chosen():
+    """The lock that stops the loop abolishing a sunlit reference's key light used to live
+    INSIDE the multi-start branch, which is skipped whenever a start_override is supplied.
+    `refine` always supplies one — so a refine round was the single path that could hand the
+    loop a sun-off start with nothing pinning the sun back on. The guard belongs to the
+    STATE, not to how the state was picked."""
+    import inspect
+
+    from maxgaffer.maxbridge.controller import Controller
+
+    src = inspect.getsource(Controller.run_match)
+    lock_at = src.index('locks = set(locks) | {"sun.enabled"}')
+    branch_at = src.index("if multi_start and start_override is None")
+    # the lock must not be nested under the multi-start guard: compare indentation
+    lock_indent = len(src[:lock_at].rsplit("\n", 1)[-1])
+    branch_indent = len(src[:branch_at].rsplit("\n", 1)[-1])
+    assert lock_indent <= branch_indent + 4, (
+        "sun lock is nested inside the multi-start branch again — refine skips it")
+
+
+def test_refine_picks_its_branch_on_the_same_objective_as_the_loop():
+    """refine's winning branch becomes run_match's start_override, so this comparison
+    decides the whole round. On pixels alone it can crown a structurally wrong branch that
+    the loop then scores worse than the one it rejected."""
+    import inspect
+
+    from maxgaffer.maxbridge.controller import Controller
+
+    src = inspect.getsource(Controller.refine)
+    assert "blend_transfer(" in src, "refine's branch probe is pixels-only again"
+    assert "TRANSFER_WEIGHT" in src
