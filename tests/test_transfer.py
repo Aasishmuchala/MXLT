@@ -232,3 +232,38 @@ def test_transfer_weight_scales_with_bearing_agreement_but_never_to_zero():
     assert "max(0.25," in src, ("the floor must not be zero — pixels are BLIND to sun "
                                "direction, so a contested reading still beats none")
     assert TRANSFER_WEIGHT == 0.25
+
+
+def test_the_sweep_measurement_updates_the_belief_the_loop_defends():
+    """ANALYZE estimates the bearing from ONE image — a hard absolute judgement, and
+    measurably unreliable (four reads of one reference: 45.0, -52.5, 77.6, 64.9; on A2 the
+    sign came out backwards and put the sun 19.4 degrees off, exactly twice the 9.7 it
+    reported). The sweep renders candidate directions in the real scene and picks
+    comparatively, which is a far easier judgement. Reading is the prior, sweep is the
+    measurement, transfer defends the result — otherwise the objective spends the match
+    pulling the sun back off the swept direction and onto the noisy estimate."""
+    import inspect
+
+    from maxgaffer.maxbridge.controller import Controller
+
+    src = inspect.getsource(Controller.run_match)
+    sweep_at = src.index('start.set("sun.azimuth_deg", az)')
+    tail = src[sweep_at:sweep_at + 1800]
+    assert 'sem_live["sun_bearing_deg"]' in tail, "sweep result never reaches the objective"
+    assert 'sem_live["sun_bearing_agreement"] = 1.0' in tail
+
+
+def test_the_sweep_never_writes_its_answer_into_the_cached_reading():
+    """e.semantics is the record of what ANALYZE actually read. Laundering a sweep-derived
+    bearing into it would corrupt every later run of the camera — and would make a cached
+    read look unanimous when it never was."""
+    import inspect
+
+    from maxgaffer.maxbridge.controller import Controller
+
+    src = inspect.getsource(Controller.run_match)
+    assert "sem_live = dict(semantics)" in src, "the sweep must mutate a COPY"
+    sweep_at = src.index('start.set("sun.azimuth_deg", az)')
+    tail = src[sweep_at:sweep_at + 1800]
+    assert 'semantics["sun_bearing_deg"]' not in tail
+    assert "e.semantics[" not in tail

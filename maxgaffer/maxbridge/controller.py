@@ -1022,6 +1022,7 @@ class Controller:
             # direction evidence available. Full trust when the samples agree, a quarter of
             # it when they do not.
             bearing_trust = 1.0
+            cfg_kw = {"transfer_weight": 0.0}
             if semantics:
                 bearing_trust = max(0.25, min(1.0, float(
                     semantics.get("sun_bearing_agreement", 1.0) or 0.0)))
@@ -1030,10 +1031,17 @@ class Controller:
                     log(f"⚠ ANALYZE disagreed with itself on the sun's direction "
                         f"(±{spread:.0f}° across samples) — leaning harder on the render "
                         f"and less on the reading (trust {bearing_trust:.0%})")
+                cfg_kw["transfer_weight"] = TRANSFER_WEIGHT * bearing_trust
+
+            # A COPY: the sun sweep updates the bearing below, and e.semantics is the
+            # cached record of what ANALYZE actually read. Writing a sweep-derived bearing
+            # back into the cache would launder a measurement into the reading and poison
+            # every later run of this camera.
+            sem_live = dict(semantics) if semantics else None
 
             def transfer_hook(st):
                 try:
-                    return transfer.score(semantics, st, cam_yaw)["score"] / 100.0
+                    return transfer.score(sem_live, st, cam_yaw)["score"] / 100.0
                 except Exception:  # noqa: BLE001
                     return None
 
@@ -1096,6 +1104,31 @@ class Controller:
                     ref_stats=ref_stats)
                 if az is not None:
                     start.set("sun.azimuth_deg", az)
+                    # ANALYZE estimates the bearing from ONE image, which is a hard
+                    # absolute judgement and measurably unreliable: four reads of one
+                    # golden-hour reference gave 45.0, -52.5, 77.6 and 64.9 degrees, and on
+                    # A2 the sign came out backwards, putting the sun 19.4 degrees off —
+                    # exactly twice the 9.7 it reported. The sweep is a different and better
+                    # kind of evidence: it renders candidate directions in THIS scene and
+                    # picks comparatively, which is a far easier judgement than naming an
+                    # angle. So the reading is the PRIOR, the sweep is the measurement that
+                    # updates it, and the transfer objective then defends that answer
+                    # against metamer drift for the rest of the loop. Without this the
+                    # objective spent the whole match pulling the sun back off the swept
+                    # direction and onto the noisy estimate.
+                    if sem_live is not None:
+                        swept_bearing = (az - cam_yaw + 180.0) % 360.0 - 180.0
+                        prior = sem_live.get("sun_bearing_deg")
+                        sem_live["sun_bearing_deg"] = round(swept_bearing, 1)
+                        # measured, not guessed — and the transfer weight keys off this
+                        sem_live["sun_bearing_agreement"] = 1.0
+                        bearing_trust = 1.0
+                        cfg_kw["transfer_weight"] = TRANSFER_WEIGHT
+                        if prior is not None and abs(
+                                (float(prior) - swept_bearing + 180.0) % 360.0 - 180.0) > 20.0:
+                            log(f"sweep measured the sun at {swept_bearing:+.0f}° from the "
+                                f"camera; ANALYZE had estimated {float(prior):+.0f}° — "
+                                f"going with the render")
                     # the hint was judged against real renders of THIS scene — trust it over
                     # the ANALYZE band when the altitude isn't locked
                     if alt_hint != "na" and "sun.altitude_deg" not in locks \
@@ -1119,8 +1152,7 @@ class Controller:
                 # a quarter of the objective is "does this rig agree with what ANALYZE
                 # read off the reference" — enough to pin direction, not enough to
                 # override the pixels that carry tone and detail
-                transfer_weight=(TRANSFER_WEIGHT * bearing_trust
-                                 if semantics else 0.0),
+                transfer_weight=cfg_kw["transfer_weight"],
             )
             if profile.polish:
                 log("HERO MATCH: target 99 · bounded coordinate-descent polish "
