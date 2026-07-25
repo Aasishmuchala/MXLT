@@ -4,6 +4,7 @@ stall/slump decoupling, plateau-vs-proven ceiling, clip-aware highlight WB read,
 png_min subsampling, orphan/disabled-group warnings, session generation bust,
 software exposure at every render site (via the shared helper), auto-detect."""
 import json
+import math
 
 import pytest
 from PIL import Image
@@ -164,22 +165,37 @@ def test_polish_flat_world_is_proven_ceiling(monkeypatch):
     assert converged is True and proven is True           # floor-exhausted = STRONG claim
 
 
-def test_polish_low_gain_plateau_is_not_proven(monkeypatch):
-    state = {"v": 50.0}
+def test_polish_refines_steps_before_declaring_a_plateau(monkeypatch):
+    """A low-gain round at COARSE steps means the step size is wrong, not that the climb
+    is over. This world's optimum sits +0.07 EV away — invisible to the 0.4 initial step
+    and to one halving (0.2), reachable only at 0.1. The pre-fix code returned
+    converged-plateau after two low-gain rounds WITHOUT refining, abandoning the peak
+    (measured on-box: three archetypes quit at ~91 whose self-match optimum was 100)."""
+    base_ev = full_state().get("exposure.ev")
+    peak = base_ev + 0.07
 
-    def creeping(ref, cur, w=None):
-        state["v"] += 0.011                               # keeps improving, barely
-        return critic.Verdict(state["v"], {})
+    def narrow_peak(ref, cur, w=None):
+        # cur carries no state, so score the LAST applied candidate the world recorded
+        ev = applied.get("ev", base_ev)
+        return critic.Verdict(50.0 + 10.0 * math.exp(-((ev - peak) / 0.06) ** 2), {})
 
-    monkeypatch.setattr(director.critic, "score", creeping)
-    # polish_round_eps recalibrated for the DYNAMIC axis list (full_state carries a
-    # group, so polish now probes one more axis per round and the per-round creep total
-    # rose past the old 0.2 default) — the plateau semantics under test are unchanged
+    applied = {}
+
+    class _World:
+        def hooks(self):
+            def _apply(s):
+                applied["ev"] = s.get("exposure.ev")
+            return Hooks(apply=_apply, render=lambda t: f"/x/{t}.png",
+                         stats=lambda p: {"log_key": 0.2},
+                         llm_deltas=lambda ctx: NOOP_LLM, log=lambda m: None)
+
+    monkeypatch.setattr(director.critic, "score", narrow_peak)
     st, sc_, probes, converged, proven = run_polish(
-        full_state(), 50.0, {"log_key": 0.2}, _FlatWorld().hooks(),
-        MatchConfig(polish_rounds=6, polish_stop_at=99.0, polish_max_probes=500,
-                    polish_round_eps=0.45))
-    assert converged is True and proven is False          # plateau ≠ proven optimum
+        full_state(), 52.5, {"log_key": 0.2}, _World().hooks(),
+        MatchConfig(polish_rounds=8, polish_stop_at=99.0, polish_max_probes=400))
+    # the peak (60.0) is only reachable by refining past the initial step
+    assert sc_ > 56.0, f"polish quit before refining steps (score {sc_})"
+    assert st.get("exposure.ev") == pytest.approx(peak, abs=0.12)
 
 
 # ------------------------------------------------------------------ clip-aware WB read

@@ -724,19 +724,27 @@ def run_polish(
                 if escaped:
                     low_gain_rounds = 0
                     continue
-                if low_gain_rounds >= 2:
-                    hooks.apply(best)                 # two diminishing rounds AND the diagonal
-                    return best, best_score, probes, True, False   # escape failed — plateau
                 all_floored = all(steps[k] <= floor + 1e-9
                                   for k, _s, _l, floor in axes)
                 if all_floored:
                     hooks.apply(best)
                     return best, best_score, probes, True, True   # proven local optimum
+                # A no-improve round at COARSE steps means the step size is wrong, not
+                # that the climb is over — refine and keep going. Exiting here was
+                # measured to abandon ~9 points of real headroom (2026-07-24: three
+                # archetypes quit at 91 with converged=True while their self-match
+                # optimum was 100 by construction).
                 for k, _s, _l, floor in axes:
                     steps[k] = max(floor, steps[k] / 2.0)
             elif low_gain_rounds >= 2:
-                hooks.apply(best)
-                return best, best_score, probes, True, False   # plateau — NOT proven
+                if all(steps[k] <= floor + 1e-9 for k, _s, _l, floor in axes):
+                    hooks.apply(best)
+                    # diminishing returns at the FINEST steps — a real plateau, but the
+                    # last round still gained, so it is not a proven local optimum
+                    return best, best_score, probes, True, False
+                for k, _s, _l, floor in axes:   # still coarse — refine before concluding
+                    steps[k] = max(floor, steps[k] / 2.0)
+                low_gain_rounds = 0
         hooks.apply(best)
         return best, best_score, probes, False, False
     except Exception:
