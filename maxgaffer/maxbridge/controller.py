@@ -1003,6 +1003,18 @@ class Controller:
                 self._sw_state = st        # the frame render_hook is about to expose
                 self._apply_logged(rig, st, cam, log)
 
+            # SEMANTIC transfer hook: ANALYZE already read the reference's sun bearing,
+            # altitude band, colour temperature, hardness and haze. Pixel statistics
+            # cannot pin sun direction on an interior (measured: 64 degrees out still
+            # scored 90.92), so the search is also judged on agreeing with that reading.
+            cam_yaw = sc.camera_yaw_deg(cam)
+
+            def transfer_hook(st):
+                try:
+                    return transfer.score(semantics, st, cam_yaw)["score"] / 100.0
+                except Exception:  # noqa: BLE001
+                    return None
+
             hooks = Hooks(
                 apply=apply_hook,
                 render=render_hook,
@@ -1010,6 +1022,7 @@ class Controller:
                 llm_deltas=self._llm_deltas_hook(ref_block),
                 log=log,
                 should_cancel=should_cancel,
+                transfer=transfer_hook if semantics else None,
             )
 
             agreement = getattr(self, "_last_analyze_agreement", None)
@@ -1075,6 +1088,10 @@ class Controller:
                 # the loop solves GEOMETRY; it was quitting after 3 of 10 hero iterations
                 # on one dip because this never came through from the profile
                 stall_patience=profile.stall_patience,
+                # a quarter of the objective is "does this rig agree with what ANALYZE
+                # read off the reference" — enough to pin direction, not enough to
+                # override the pixels that carry tone and detail
+                transfer_weight=0.25 if semantics else 0.0,
             )
             if profile.polish:
                 log("HERO MATCH: target 99 · bounded coordinate-descent polish "

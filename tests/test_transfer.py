@@ -88,3 +88,39 @@ def test_degrades_on_junk_rather_than_raising():
     assert transfer.score(None, None)["score"] == 0.0
     assert transfer.score({}, rig())["score"] == 0.0
     assert transfer.score({"sun_bearing_deg": float("nan")}, rig())["score"] == 0.0
+
+
+# ------------------------------------------------------------------ objective blending
+def test_blend_pulls_the_objective_toward_semantic_agreement():
+    """Pixels cannot pin sun direction on an interior — measured on-box 2026-07-25, a
+    64-degree azimuth error still scored 90.92. Blending the ANALYZE reading in is what
+    makes a structurally wrong rig score lower than a right one."""
+    from maxgaffer.core.director import Hooks, MatchConfig, _blend_transfer
+    from maxgaffer.core.genome import LightingState
+
+    st = LightingState()
+    hooks = Hooks(apply=lambda s: None, render=lambda t: None, stats=lambda p: None,
+                  llm_deltas=lambda c: "", transfer=lambda s: 0.40)
+    cfg = MatchConfig(transfer_weight=0.25)
+    # a 90 pixel score with poor semantic agreement is pulled down
+    assert _blend_transfer(90.0, st, hooks, cfg) == pytest.approx(0.75 * 90 + 0.25 * 40)
+    # perfect agreement leaves a good score essentially intact
+    hooks.transfer = lambda s: 1.0
+    assert _blend_transfer(90.0, st, hooks, cfg) == pytest.approx(0.75 * 90 + 0.25 * 100)
+
+
+def test_blend_is_inert_without_a_hook_or_weight():
+    from maxgaffer.core.director import Hooks, MatchConfig, _blend_transfer
+    from maxgaffer.core.genome import LightingState
+
+    st = LightingState()
+    no_hook = Hooks(apply=lambda s: None, render=lambda t: None, stats=lambda p: None,
+                    llm_deltas=lambda c: "")
+    assert _blend_transfer(90.0, st, no_hook, MatchConfig(transfer_weight=0.25)) == 90.0
+    with_hook = Hooks(apply=lambda s: None, render=lambda t: None, stats=lambda p: None,
+                      llm_deltas=lambda c: "", transfer=lambda s: 0.0)
+    assert _blend_transfer(90.0, st, with_hook, MatchConfig()) == 90.0   # weight 0
+    # a hook that raises or returns None must never break scoring
+    boom = Hooks(apply=lambda s: None, render=lambda t: None, stats=lambda p: None,
+                 llm_deltas=lambda c: "", transfer=lambda s: 1 / 0)
+    assert _blend_transfer(90.0, st, boom, MatchConfig(transfer_weight=0.25)) == 90.0

@@ -64,6 +64,11 @@ class MatchConfig:
     # a full convergence PROOF costs ~2 probes × 9 params × 5 step levels + the climbs;
     # stop_at usually exits far earlier — the cap is the overnight safety rail
     polish_max_probes: int = 120
+    #: How much of the objective is the SEMANTIC transfer reading rather than pixel
+    #: statistics. 0 keeps the historical pixels-only behaviour. Measured need: with
+    #: pixels alone the search settled on uniformly-decent but structurally WRONG rigs
+    #: (sun 64 degrees out) because no pixel component punishes it enough.
+    transfer_weight: float = 0.0
 
 
 def _anneal(best_score: Optional[float]) -> float:
@@ -131,6 +136,29 @@ _MAX_HOPS = 3
 _RESTART_TOLERANCE = 8.0
 
 
+def _blend_transfer(pixel_score: float, state: LightingState, hooks: "Hooks",
+                    cfg: "MatchConfig") -> float:
+    """Fold the SEMANTIC transfer reading into the pixel score.
+
+    Pixel statistics cannot pin sun direction on an interior: measured on-box 2026-07-25,
+    a 64-degree azimuth error still scored 90.92 because the 3x3 luminance grid barely
+    moves when a sun patch stays roughly in frame, and no other component notices at all.
+    ANALYZE, meanwhile, reads the sun's bearing straight off the reference — a DIRECT
+    measurement of where the light is, independent of the render. Weighting it into the
+    objective is what stops the search settling on a uniformly-decent but structurally
+    wrong rig. Absent hook or zero weight → the historical pixels-only score."""
+    w = float(getattr(cfg, "transfer_weight", 0.0) or 0.0)
+    if w <= 0.0 or hooks.transfer is None:
+        return pixel_score
+    try:
+        agreement = hooks.transfer(state)
+    except Exception:  # noqa: BLE001 — a diagnostic must never break scoring
+        return pixel_score
+    if agreement is None:
+        return pixel_score
+    return (1.0 - w) * pixel_score + w * (100.0 * max(0.0, min(1.0, float(agreement))))
+
+
 def _state_fingerprint(state: LightingState) -> tuple:
     """A state's identity for repeat detection, rounded so float noise does not make two
     identical rigs look different."""
@@ -175,6 +203,11 @@ class Hooks:
     render: Callable[[str], Optional[str]]            # tag → image path (None = failed)
     stats: Callable[[str], Optional[Dict]]            # image path → stats dict
     llm_deltas: Callable[[Dict], str]                 # context → raw reply text
+    #: state → 0..1 lighting-TRANSFER agreement with the reference's ANALYZE reading.
+    #: Pixel statistics cannot pin sun direction on an interior — a 64-degree swing barely
+    #: moves the 3x3 luminance grid (measured 2026-07-25) — but ANALYZE reads the bearing
+    #: straight off the reference, which is a DIRECT measurement of where the light is.
+    transfer: Optional[Callable[[LightingState], Optional[float]]] = None
     log: Callable[[str], None] = lambda msg: None
     should_cancel: Callable[[], bool] = lambda: False
 
@@ -314,6 +347,7 @@ def run_match(
                     / max(1e-5, float(cur_stats.get("log_key", 0.0)))))
             if cur_stats is not None and ref_stats is not None:
                 verdict = critic.score(ref_stats, cur_stats, cfg.weights)
+                verdict.score = _blend_transfer(verdict.score, state, hooks, cfg)
                 rec.score, rec.components = verdict.score, verdict.components
                 score_history.append((i, verdict.score))
                 hooks.log(f"iter {i}: score {verdict.summary()}")
@@ -699,6 +733,7 @@ def run_polish(
             return None
         probes += 1
         verdict = critic.score(ref_stats, st, cfg.weights)
+        verdict.score = _blend_transfer(verdict.score, cand, hooks, cfg)
         hooks._last_polish_components = dict(verdict.components)
         seen[key] = verdict.score
         memo_components[key] = dict(verdict.components)
