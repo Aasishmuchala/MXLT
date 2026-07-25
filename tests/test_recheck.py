@@ -471,3 +471,23 @@ def test_every_polish_probe_renders_to_its_own_file():
     assert polish_paths, "test setup should have run polish probes"
     assert len(polish_paths) == len(set(polish_paths)), (
         "two polish probes shared a filename — the second destroys the first's plate")
+
+
+def test_the_diagonal_escape_adopts_the_state_it_actually_measured():
+    """`measure` applies the tonal leash IN PLACE, so the object it renders may be clamped.
+    The ridge escape discarded that candidate and rebuilt the move from scratch, bypassing
+    the leash, then adopted the rebuilt one. exposure.ev or exposure.wb_kelvin appear in six
+    of the seven polish pairs, so this was the hot path: a ridden diagonal could adopt an EV
+    two stops away from the render its score and plate came from, and it silently defeated
+    the leash the block is supposed to respect."""
+    import inspect
+
+    from maxgaffer.core.director import run_polish
+
+    src = inspect.getsource(run_polish)
+    diag = src[src.index("def _diag_probe("):src.index("if not escaped:")]
+    assert "return sc, cand" in diag, "the probe must hand back what it measured"
+    # and no caller may reconstruct the move itself
+    after = diag[diag.index("for ka, kb in pairs:"):]
+    assert "cand.set(ka," not in after, "a caller rebuilt the diagonal instead of adopting it"
+    assert "sc, cand = got" in after and "sc2, cand2 = got2" in after

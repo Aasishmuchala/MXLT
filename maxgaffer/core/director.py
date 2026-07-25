@@ -931,7 +931,17 @@ def run_polish(
                 is_log = {k: l for k, _s, l, _f in axes}
 
                 def _diag_probe(ka: str, kb: str, sa: float, sb: float,
-                                mult: float) -> Optional[float]:
+                                mult: float) -> Optional[Tuple[float, LightingState]]:
+                    """→ (score, THE STATE THAT WAS MEASURED), or None.
+
+                    Returning the candidate matters. `measure` applies the tonal leash in
+                    place, so the object it renders may be clamped; the caller used to
+                    discard this candidate and REBUILD the move from scratch, bypassing the
+                    leash, and adopt that instead. With exposure.ev or exposure.wb_kelvin in
+                    six of the seven polish pairs, the adopted state routinely differed from
+                    the scored one — a ridden diagonal could adopt an EV two stops from the
+                    render its score and plate came from, and it silently defeated the very
+                    leash this block is bounded by."""
                     cand = best.copy()
                     va, vb = cand.get(ka), cand.get(kb)
                     da, db = sa * steps[ka] * mult, sb * steps[kb] * mult
@@ -941,7 +951,7 @@ def run_polish(
                         return None             # both clamped — no move at all
                     sc = measure(cand, f"polish{rnd}_diag")
                     if sc is not None and sc > best_score + cfg.polish_min_gain:
-                        return sc
+                        return sc, cand
                     return None
 
                 for ka, kb in pairs:
@@ -955,16 +965,12 @@ def run_polish(
                         if escaped:
                             break
                         for sb in (1.0, -1.0):
-                            sc = _diag_probe(ka, kb, sa, sb, 1.0)
-                            if sc is None:
+                            got = _diag_probe(ka, kb, sa, sb, 1.0)
+                            if got is None:
                                 continue
+                            sc, cand = got
                             hooks.log(f"polish: {ka}&{kb} diagonal · "
                                       f"{best_score:.2f}→{sc:.2f} ✓ (ridge escape)")
-                            va, vb = best.get(ka), best.get(kb)
-                            cand = best.copy()
-                            da, db = sa * steps[ka], sb * steps[kb]
-                            cand.set(ka, va * (2.0 ** da) if is_log[ka] else va + da)
-                            cand.set(kb, vb * (2.0 ** db) if is_log[kb] else vb + db)
                             best, best_score = cand, sc
                             _record_best()
                             improved_any = escaped = True
@@ -973,17 +979,13 @@ def run_polish(
                             mult = 1.6
                             while best_score < cfg.polish_stop_at \
                                     and probes < cfg.polish_max_probes:
-                                sc2 = _diag_probe(ka, kb, sa, sb, mult)
-                                if sc2 is None:
+                                got2 = _diag_probe(ka, kb, sa, sb, mult)
+                                if got2 is None:
                                     break
+                                sc2, cand2 = got2
                                 hooks.log(f"polish: {ka}&{kb} diagonal ×{mult:.1f} · "
                                           f"{best_score:.2f}→{sc2:.2f} ✓")
-                                va, vb = best.get(ka), best.get(kb)
-                                cand = best.copy()
-                                da, db = sa * steps[ka] * mult, sb * steps[kb] * mult
-                                cand.set(ka, va * (2.0 ** da) if is_log[ka] else va + da)
-                                cand.set(kb, vb * (2.0 ** db) if is_log[kb] else vb + db)
-                                best, best_score = cand, sc2
+                                best, best_score = cand2, sc2
                                 _record_best()
                                 mult *= 1.6
                             break
