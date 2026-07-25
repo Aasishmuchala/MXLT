@@ -125,6 +125,11 @@ _POLISH_PAIRS = (
 #: the step sizes, so this is a global-search assist, not a licence to wander.
 _MAX_HOPS = 3
 
+#: How far BELOW the incumbent a coordinated tonal restart may land and still be adopted.
+#: A jump into the right region routinely lands a few points under a finely-tuned wrong
+#: answer and only wins after it descends; the champion fallback makes the gamble free.
+_RESTART_TOLERANCE = 8.0
+
 
 def _has_axis(state: LightingState, key: str) -> bool:
     """Group-aware membership: ``group.<name>`` lives in state.groups, not state.values
@@ -671,6 +676,23 @@ def run_polish(
     seen[_memo_key(state)] = score_now      # the seed state is already measured
     hops_used = 0                           # azimuth basin hops taken (bounded)
     resolved_tonally = False                # the coordinated tonal jump, once
+    # A RESTART needs somewhere safe to fall back to. The tonal jump is allowed to land
+    # slightly WORSE than the incumbent and then descend — a coordinated move into the
+    # right region rarely beats a well-tuned wrong one on its first raw probe (measured
+    # 2026-07-25: the jump fired, missed the gain gate by a hair, and was discarded, so
+    # the run finished on the scrambled tonal values again). champion holds the best state
+    # ever seen so a failed restart can never cost the run anything.
+    champion, champion_score = best.copy(), best_score
+
+    def _finish(conv: bool, proven: bool):
+        """Land on the better of the working point and the pre-restart champion."""
+        final, final_score = best, best_score
+        if champion_score > final_score + 1e-9:
+            final, final_score = champion, champion_score
+            hooks.log(f"polish: restart did not pay — returning the earlier best "
+                      f"{final_score:.2f}")
+        hooks.apply(final)
+        return final, final_score, probes, conv, proven
 
     # The ANALYTIC LEASH also binds polish. The loop clamps its EV/WB solve to a window
     # around the run's start state, because matching histograms of DIFFERENT scenes biases
@@ -707,8 +729,7 @@ def run_polish(
             for key, _init, is_log, floor in axes:
                 if hooks.should_cancel() or best_score >= cfg.polish_stop_at \
                         or probes >= cfg.polish_max_probes:
-                    hooks.apply(best)
-                    return best, best_score, probes, False, False
+                    return _finish(False, False)
                 if key in locks or not _has_axis(best, key):
                     continue
                 step = steps[key]
@@ -861,6 +882,17 @@ def run_polish(
                     # search cannot make, and pairing it with a dome/turbidity step makes it
                     # the 4-way move the landscape demands.
                     best_stats_here = stats_of.get(_memo_key(best))
+                    if best_stats_here is None and not resolved_tonally \
+                            and probes < cfg.polish_max_probes:
+                        # The seed state arrives with a SCORE but no STATS (the caller
+                        # measured it), and it is pre-registered in the memo — so measure()
+                        # would serve the cached score and still leave us without a frame
+                        # to re-solve from. Drop the memo entry so this one goes through a
+                        # real render; a run that never improves past its seed would
+                        # otherwise never be able to fire the jump at all.
+                        seen.pop(_memo_key(best), None)
+                        measure(best.copy(), f"polish{rnd}_tonal_seed")
+                        best_stats_here = stats_of.get(_memo_key(best))
                     if (best_stats_here is not None and not resolved_tonally
                             and "exposure.ev" in best.values
                             and probes < cfg.polish_max_probes):
@@ -870,8 +902,9 @@ def run_polish(
                         wb_new = solver.solve_wb(ref_stats, best_stats_here, wb_now)
                         # pair the computed tonal jump with the ambient/haze partners that
                         # have to move with it, so the whole group travels together
+                        jump_best, jump_score = None, None
                         for dome_mult, turb_step in ((1.0, 0.0), (0.5, 1.0), (0.35, 2.0)):
-                            if escaped or hooks.should_cancel() \
+                            if hooks.should_cancel() \
                                     or probes >= cfg.polish_max_probes:
                                 break
                             cand = best.copy()
@@ -888,19 +921,32 @@ def run_polish(
                                 cand.set("sun.turbidity",
                                          cand.get("sun.turbidity") + turb_step)
                             sc = measure(cand, f"polish{rnd}_tonal{int(dome_mult * 100)}")
-                            if sc is not None and sc > best_score + cfg.polish_min_gain:
-                                hooks.log(
-                                    f"polish: tonal re-solve (ev→{cand.get('exposure.ev'):.2f} "
-                                    f"wb→{cand.get('exposure.wb_kelvin'):.0f} "
-                                    f"dome×{dome_mult:g} turb+{turb_step:g}) · "
-                                    f"{best_score:.2f}→{sc:.2f} ✓")
-                                best, best_score = cand, sc
-                                hooks._polish_best_components = dict(
-                                    getattr(hooks, "_last_polish_components", {}))
-                                improved_any = escaped = True
-                                for k, s0, _l, _f in axes:   # fresh descent from the jump
-                                    steps[k] = s0
+                            if sc is not None and (jump_score is None or sc > jump_score):
+                                jump_best, jump_score = cand, sc
                         resolved_tonally = True   # one coordinated jump per polish run
+
+                        # RESTART, not a probe. A coordinated jump lands in the right
+                        # REGION; it rarely out-scores a finely-tuned wrong answer on the
+                        # raw landing. Judging it by the usual gain gate threw it away
+                        # (measured 2026-07-25: fired once, missed, run finished on the
+                        # scrambled tonal values). So adopt it whenever it lands within
+                        # _RESTART_TOLERANCE of the incumbent, re-open every step, and let
+                        # it DESCEND — champion holds the old peak, so if the descent never
+                        # pays the run still returns the better state.
+                        if jump_best is not None \
+                                and jump_score > best_score - _RESTART_TOLERANCE:
+                            if best_score > champion_score:
+                                champion, champion_score = best.copy(), best_score
+                            hooks.log(
+                                f"polish: tonal restart (ev→{jump_best.get('exposure.ev'):.2f} "
+                                f"wb→{jump_best.get('exposure.wb_kelvin'):.0f}) · "
+                                f"{best_score:.2f}→{jump_score:.2f}, descending from here")
+                            best, best_score = jump_best, jump_score
+                            hooks._polish_best_components = dict(
+                                getattr(hooks, "_last_polish_components", {}))
+                            improved_any = escaped = True
+                            for k, s0, _l, _f in axes:   # fresh descent from the jump
+                                steps[k] = s0
 
                 if not escaped:
                     # AZIMUTH BASIN HOP. Sun azimuth is the one genuinely MULTI-MODAL
@@ -943,9 +989,8 @@ def run_polish(
                 all_floored = all(steps[k] <= floor + 1e-9
                                   for k, _s, _l, floor in axes)
                 if all_floored:
-                    hooks.apply(best)
                     hooks.log(f"polish: converged at {best_score:.2f}{_memo_note()}")
-                    return best, best_score, probes, True, True   # proven local optimum
+                    return _finish(True, True)          # proven local optimum
                 # A no-improve round at COARSE steps means the step size is wrong, not
                 # that the climb is over — refine and keep going. Exiting here was
                 # measured to abandon ~9 points of real headroom (2026-07-24: three
@@ -955,15 +1000,13 @@ def run_polish(
                     steps[k] = max(floor, steps[k] / 2.0)
             elif low_gain_rounds >= 2:
                 if all(steps[k] <= floor + 1e-9 for k, _s, _l, floor in axes):
-                    hooks.apply(best)
                     hooks.log(f"polish: plateau at {best_score:.2f}{_memo_note()}")
-                    return best, best_score, probes, True, False
+                    return _finish(True, False)
                 for k, _s, _l, floor in axes:   # still coarse — refine before concluding
                     steps[k] = max(floor, steps[k] / 2.0)
                 low_gain_rounds = 0
-        hooks.apply(best)
         hooks.log(f"polish: budget spent at {best_score:.2f}{_memo_note()}")
-        return best, best_score, probes, False, False
+        return _finish(False, False)
     except Exception:
         # polish is exploratory too — a dead hook mid-climb must leave the best state
         # live, not the last probe (the caller re-applies and logs as well; this is the

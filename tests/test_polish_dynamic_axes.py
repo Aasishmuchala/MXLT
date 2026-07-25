@@ -310,3 +310,53 @@ def test_tonal_resolve_runs_at_most_once_per_polish(monkeypatch):
     st.set("dome.intensity", 1.0)
     run_polish(st, 50.0, {"grid": [0] * 9}, w.hooks, _cfg(polish_rounds=12))
     assert len(calls) <= 1, f"tonal re-solve fired {len(calls)} times"
+
+
+# ------------------------------------------------------------------ restart semantics
+def test_tonal_restart_is_adopted_even_when_it_lands_worse(monkeypatch):
+    """A coordinated jump lands in the right REGION but rarely out-scores a finely-tuned
+    wrong answer on its raw landing. Judging it with the ordinary gain gate discarded it
+    (measured on-box 2026-07-25). It must be adopted and allowed to DESCEND."""
+    peak = {"ev": -4.0}
+
+    def score_fn(state):
+        if state is None:
+            return 50.0
+        ev = state.get("exposure.ev")
+        # incumbent at -2.87 scores 90; the jump to -4.0 lands at 86 then climbs to 99
+        # once dome follows, so only a descent from the jump reveals the win
+        dome = state.get("dome.intensity")
+        near = 99.0 - 30.0 * abs(ev - peak["ev"]) - 20.0 * abs(dome - 0.55)
+        incumbent = 90.0 - 2.0 * abs(ev - (-2.87)) - 2.0 * abs(dome - 1.71)
+        return max(near, incumbent)
+
+    w = _World(monkeypatch, score_fn)
+    monkeypatch.setattr(director.solver, "solve_ev", lambda ref, cur, now, **kw: peak["ev"])
+    monkeypatch.setattr(director.solver, "solve_wb", lambda ref, cur, now, **kw: None)
+    st = LightingState()
+    st.set("exposure.ev", -2.87)
+    st.set("dome.intensity", 1.71)
+    best, score, _p, _c, _pr = run_polish(st, score_fn(st), {"grid": [0] * 9}, w.hooks,
+                                          _cfg(polish_rounds=12))
+    assert score > 92.0, f"restart never paid off (score {score})"
+    assert best.get("exposure.ev") == pytest.approx(peak["ev"], abs=0.6)
+
+
+def test_failed_restart_never_costs_the_run(monkeypatch):
+    """champion holds the pre-restart peak, so a jump that never recovers is free."""
+    def score_fn(state):
+        if state is None:
+            return 50.0
+        # the incumbent is the global best; anywhere the jump lands is strictly worse
+        return 93.0 - 5.0 * abs(state.get("exposure.ev") - (-2.87))
+
+    w = _World(monkeypatch, score_fn)
+    monkeypatch.setattr(director.solver, "solve_ev", lambda ref, cur, now, **kw: -4.0)
+    monkeypatch.setattr(director.solver, "solve_wb", lambda ref, cur, now, **kw: None)
+    st = LightingState()
+    st.set("exposure.ev", -2.87)
+    st.set("dome.intensity", 1.0)
+    start_score = score_fn(st)
+    _best, score, _p, _c, _pr = run_polish(st, start_score, {"grid": [0] * 9}, w.hooks,
+                                           _cfg(polish_rounds=10))
+    assert score >= start_score - 1e-6, "a failed restart lost ground"
