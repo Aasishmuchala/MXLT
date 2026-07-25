@@ -1218,6 +1218,28 @@ class Controller:
                     % (tr["score"], ", ".join(tr.get("notes") or ["faithful"])[:160]))
             except Exception:  # noqa: BLE001 — a diagnostic must never sink a match
                 pass
+            # REPORT the pixel similarity, not the search objective. Blending the
+            # reference's lighting reading into the objective is what breaks the ties
+            # pixels cannot see, and it stays — but it must not be the headline number,
+            # because after the sweep the objective aims at the sweep's OWN answer. The
+            # search then scores itself as agreeing with a target it chose, and the bonus
+            # is self-congratulation. Measured on-box 2026-07-25: a match whose sun was
+            # 171 degrees from the reference reported 86.27 while its best plate scored
+            # 77.21 against that reference. The artist is owed the 77.
+            try:
+                honest = self.stats_for(result.best_render) if result.best_render else None
+                if honest is not None and ref_stats is not None:
+                    verdict = critic.score(ref_stats, honest, self._critic_weights())
+                    if result.best_score is not None and abs(
+                            verdict.score - result.best_score) > 0.05:
+                        log(f"score {verdict.score:.1f} (the search steered on "
+                            f"{result.best_score:.1f}, which counts agreement with the "
+                            f"reference's lighting reading)")
+                    result.objective_score = result.best_score
+                    result.best_score = verdict.score
+                    result.best_components = verdict.components
+            except Exception:  # noqa: BLE001 — never sink a match over the readout
+                pass
             self._record_match(camera_name, result.best_state, result.best_score)
         if result.best_score is not None:
             # A preliminary card yields the authoritative critic content_gap + metric

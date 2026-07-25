@@ -241,6 +241,13 @@ class MatchResult:
     stop_reason: str
     iterations: List[IterationRecord] = field(default_factory=list)
     transfer: Optional[Dict] = None     # lighting-TRANSFER reading (see core.transfer)
+    objective_score: Optional[float] = None   # what the SEARCH steered on: the pixel score
+                                        # blended with agreement to the reference's lighting
+                                        # reading. Kept for diagnosis, never the headline —
+                                        # after the sweep the objective aims at the sweep's
+                                        # own answer, so part of that agreement is the
+                                        # search congratulating itself. best_score is the
+                                        # plain pixel similarity the artist can verify.
     polish_gain: float = 0.0            # score added by the coordinate-descent finisher
     polish_probes: int = 0
     ceiling_converged: bool = False     # polish ended in a converged condition (either kind)

@@ -212,3 +212,22 @@ def test_refine_picks_its_branch_on_the_same_objective_as_the_loop():
     src = inspect.getsource(Controller.refine)
     assert "blend_transfer(" in src, "refine's branch probe is pixels-only again"
     assert "TRANSFER_WEIGHT" in src
+
+
+def test_the_reported_score_is_pixel_similarity_not_the_search_objective():
+    """The objective blends pixel similarity with agreement to the reference's lighting
+    reading, and after the sweep it aims at the SWEEP's own answer — so the search scores
+    itself as agreeing with a target it picked. Measured on-box 2026-07-25: a match whose
+    sun ended 171 degrees from the reference reported 86.27 while its own best plate scored
+    77.21 against that reference. Steering on the blend is right; reporting it is not."""
+    import inspect
+
+    from maxgaffer.core.director import MatchResult
+    from maxgaffer.maxbridge.controller import Controller
+
+    assert hasattr(MatchResult(best_state=None, best_score=None, best_render=None,
+                               stop_reason="x"), "objective_score")
+    src = inspect.getsource(Controller.run_match)
+    assert "result.objective_score = result.best_score" in src
+    assert "result.best_score = verdict.score" in src, (
+        "the headline number must be the plain pixel similarity the artist can verify")
