@@ -22,7 +22,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List
 
-from .metrics import cosine, hist_emd, illuminant_similarity
+from .metrics import (cosine, highlight_similarity, hist_emd,
+                      illuminant_similarity)
 
 #: How hard the aggregate is pulled toward its WORST component. 0 = the old plain
 #: weighted mean; 1 = the score IS the worst component. 0.35 leaves the mean in charge of
@@ -31,13 +32,20 @@ from .metrics import cosine, hist_emd, illuminant_similarity
 #: still scored 79.
 _WEAKEST_LINK = 0.35
 
+# Weight moved from "direction" to "highlight" (2026-07-25). Both ask where the light is;
+# only one of them can answer. Measured on-box on a golden-hour interior, "direction"
+# returned 0.922 for a sun 171 degrees out and 0.917 for one 13.5 degrees out — the same
+# number for a match that works and one that does not. It keeps a reduced share because it
+# still discriminates on scenes with broad tonal gradients (0.998 on a 5-degree miss in the
+# sun+sky archetype); it just cannot see a patch.
 DEFAULT_WEIGHTS: Dict[str, float] = {
-    "key": 0.19,
-    "envelope": 0.15,
-    "histogram": 0.17,
-    "color": 0.21,
-    "hue": 0.13,
-    "direction": 0.15,   # 3×3 luminance-grid cosine — WHERE the light lives
+    "key": 0.18,
+    "envelope": 0.14,
+    "histogram": 0.16,
+    "color": 0.20,
+    "hue": 0.12,
+    "direction": 0.08,   # 3×3/5×5 luminance-grid cosine — broad gradients only
+    "highlight": 0.12,   # sun-patch presence and placement — the directional light itself
 }
 
 # Report-only note the scorecard fairness fallback carries when a content gap is suspected.
@@ -48,12 +56,15 @@ _ALBEDO_NOTE = ("reference and scene may differ in albedo/material distribution,
 
 PREFERENCE_PROFILES: Dict[str, Dict[str, float]] = {
     "balanced": dict(DEFAULT_WEIGHTS),
-    "direction": {"key": 0.14, "envelope": 0.14, "histogram": 0.13,
-                  "color": 0.16, "hue": 0.10, "direction": 0.33},
-    "color_mood": {"key": 0.13, "envelope": 0.10, "histogram": 0.11,
-                   "color": 0.34, "hue": 0.22, "direction": 0.10},
-    "tonal": {"key": 0.29, "envelope": 0.24, "histogram": 0.24,
-              "color": 0.10, "hue": 0.05, "direction": 0.08},
+    # "direction" the PROFILE means "I care where the light is" — so most of its emphasis
+    # belongs on the component that can actually tell, not the one that reported the same
+    # number for a 13-degree and a 171-degree miss
+    "direction": {"key": 0.12, "envelope": 0.12, "histogram": 0.11,
+                  "color": 0.14, "hue": 0.09, "direction": 0.14, "highlight": 0.28},
+    "color_mood": {"key": 0.12, "envelope": 0.09, "histogram": 0.10,
+                   "color": 0.32, "hue": 0.21, "direction": 0.07, "highlight": 0.09},
+    "tonal": {"key": 0.28, "envelope": 0.23, "histogram": 0.23,
+              "color": 0.09, "hue": 0.05, "direction": 0.05, "highlight": 0.07},
 }
 
 
@@ -253,6 +264,22 @@ def score(ref: Dict, cur: Dict, weights: Dict[str, float] = None) -> Verdict:
         g_ref, g_cur = _seq(ref.get("grid")), _seq(cur.get("grid"))
     if g_ref and g_cur and len(g_ref) == len(g_cur) and any(abs(v) > 1e-6 for v in g_ref):
         comps["direction"] = max(0.0, (cosine(g_ref, g_cur) + 1.0) / 2.0)
+    # SUN PATCHES — is the reference's bright directional light present, and in the same
+    # places? "direction" above cannot answer this: its grids are AVERAGED cell luminances,
+    # and averaging is exactly what erases a patch, which is small and very bright.
+    # Measured on-box 2026-07-25 on one golden-hour interior it returned 0.922 for a sun
+    # 171 degrees out and 0.917 for one 13.5 degrees out — the same number for a match that
+    # works and one that does not, i.e. no information at all. The pair it called 0.92 was
+    # a reference covered in golden floor patches against a match with no directional light
+    # anywhere in the room.
+    #
+    # Absent only when the STATS lack the map (older engine versions) — never because of
+    # anything the search can change. A rig with no patches against a reference full of
+    # them scores 0.0 here, and the weakest-link term below turns that into a 43-point
+    # penalty on an otherwise tonally perfect answer.
+    hi = highlight_similarity(ref, cur)
+    if hi is not None:
+        comps["highlight"] = hi
     # diagnostic ONLY — the illuminant estimate is absent from DEFAULT_WEIGHTS and from
     # comps, so it NEVER enters the weighted score; None on legacy stats without illum_*
     fairness_diag = {"illuminant_match": illuminant_similarity(ref, cur)}

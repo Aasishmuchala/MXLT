@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from maxgaffer.core.director import Hooks, MatchConfig, run_match
 from maxgaffer.core.genome import LightingState
 from maxgaffer.core.solver import analytic_pass
@@ -321,3 +323,41 @@ def test_polish_updates_best_render_not_just_best_state():
         # whatever polish landed on, the saved plate must come from polish — never be left
         # behind on a loop iteration once polish has moved the state
         assert "polish" in res.best_render, res.best_render
+
+
+def test_the_critic_now_punishes_a_tonally_perfect_but_sunless_match():
+    """The whole point of the highlight component. A match that nails exposure, histogram,
+    colour and hue while carrying NONE of the reference's directional light used to score
+    100 — every component the critic had was satisfied. Measured on-box 2026-07-25, that is
+    not hypothetical: the failing golden-hour run scored 0.922 on direction with its sun
+    171 degrees out and no sun patch anywhere in the room."""
+    from maxgaffer.core import critic
+
+    perfect = {"key": 1.0, "envelope": 1.0, "histogram": 1.0, "color": 1.0,
+               "hue": 1.0, "direction": 1.0}
+    w = critic.DEFAULT_WEIGHTS
+
+    def agg(comps):
+        tw = sum(w[k] for k in comps if k in w) or 1.0
+        tot = sum(w[k] * v for k, v in comps.items() if k in w) / tw
+        if len(comps) >= 3:
+            tot -= 0.35 * max(0.0, tot - min(comps.values()))
+        return 100.0 * tot
+
+    assert agg(dict(perfect, highlight=1.0)) == pytest.approx(100.0)
+    assert agg(dict(perfect, highlight=0.554)) < 85.0    # the measured failure
+    assert agg(dict(perfect, highlight=0.0)) < 60.0      # no directional light at all
+
+
+def test_highlight_carries_real_weight_in_every_taste_profile():
+    """Including 'direction' — that profile means "I care where the light is", so its
+    emphasis belongs on the component that can actually tell. The old direction profile
+    weighted the grid cosine at 0.33, which on a golden-hour interior meant weighting a
+    number that read 0.92 for a 171-degree miss and 0.917 for a 13.5-degree one."""
+    from maxgaffer.core import critic
+
+    for name, w in critic.PREFERENCE_PROFILES.items():
+        assert abs(sum(w.values()) - 1.0) < 1e-9, (name, sum(w.values()))
+        assert w.get("highlight", 0) > 0, name
+    assert critic.PREFERENCE_PROFILES["direction"]["highlight"] > \
+        critic.PREFERENCE_PROFILES["direction"]["direction"]

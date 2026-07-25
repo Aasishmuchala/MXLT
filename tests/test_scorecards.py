@@ -12,14 +12,25 @@ def test_artist_preference_profiles_materially_change_the_judge():
 
 
 def test_scorecard_exposes_proxy_limits_and_content_gap():
-    card = critic.scorecard(84.0, {
-        "key": 0.92, "color": 0.88, "direction": 0.86,
-        "envelope": 0.45, "histogram": 0.40, "hue": 0.85,
-    }, ceiling_proven=True)
+    full = {"key": 0.92, "color": 0.88, "direction": 0.86, "highlight": 0.90,
+            "envelope": 0.45, "histogram": 0.40, "hue": 0.85}
+    card = critic.scorecard(84.0, full, ceiling_proven=True)
     assert card["content_gap"] is True
     assert "histogram" in card["weakest"]
     assert "not a guarantee" in card["disclaimer"]
     assert card["confidence"] == "high"
+
+
+def test_an_unmeasured_component_honestly_lowers_confidence():
+    """Coverage is the share of weighted dimensions actually measured, so a reading that
+    is missing one cannot claim the same confidence as a complete one. This fired for real
+    when `highlight` joined the weights: stats produced before the sun-patch map exists
+    carry six of seven components, and saying "high" about them would be a lie."""
+    full = {"key": 0.92, "color": 0.88, "direction": 0.86, "highlight": 0.90,
+            "envelope": 0.45, "histogram": 0.40, "hue": 0.85}
+    partial = {k: v for k, v in full.items() if k != "highlight"}
+    assert critic.scorecard(84.0, full)["confidence"] == "high"
+    assert critic.scorecard(84.0, partial)["confidence"] == "medium"
 
 
 def test_artist_feedback_persists_the_human_verdict(tmp_path):
