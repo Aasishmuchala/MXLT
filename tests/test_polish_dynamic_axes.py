@@ -199,3 +199,34 @@ def test_polish_keeps_an_enabled_sun_when_switching_it_off_hurts(monkeypatch):
     best, score, _probes, _c, _p = run_polish(st, 90.0, {"grid": [0] * 9}, w.hooks, _cfg())
     assert best.get("sun.enabled") >= 0.5      # the losing flip must be discarded
     assert score >= 90.0
+
+
+# ------------------------------------------------------------------ azimuth basin hop
+def test_polish_hops_to_a_distant_azimuth_basin(monkeypatch):
+    """Sun azimuth is multi-modal: a 12-degree line search cannot walk from one lobe to
+    another. Measured on-box (A6, 2026-07-25): polish returned proven=True at 84.76 with
+    azimuth 179 degrees from target. The hop must find the far lobe."""
+    import math
+
+    def score_fn(state):
+        if state is None:
+            return 50.0
+        az = state.get("sun.azimuth_deg")
+        # true peak at 115; a decoy local optimum near 295 that a local search settles in
+        d_true = min(abs(az - 115.0), 360.0 - abs(az - 115.0))
+        d_decoy = min(abs(az - 295.0), 360.0 - abs(az - 295.0))
+        return max(98.0 - 0.30 * d_true, 84.0 - 0.30 * d_decoy)
+
+    w = _World(monkeypatch, score_fn)
+    st = LightingState()
+    st.set("sun.azimuth_deg", 295.0)          # parked in the decoy basin
+    st.set("exposure.ev", 10.0)
+    best, score, _probes, _c, _p = run_polish(st, score_fn(st), {"grid": [0] * 9},
+                                              w.hooks, _cfg(polish_rounds=14))
+    got = best.get("sun.azimuth_deg")
+    assert min(abs(got - 115.0), 360.0 - abs(got - 115.0)) < 25.0, f"stuck at {got}"
+    assert score > 90.0
+
+
+def test_azimuth_hops_are_bounded():
+    assert director._MAX_HOPS <= 4          # a global assist, not a random walk

@@ -121,6 +121,11 @@ _POLISH_PAIRS = (
 )
 
 
+#: Bounded azimuth basin hops per polish run. Each hop costs a few probes and re-opens
+#: the step sizes, so this is a global-search assist, not a licence to wander.
+_MAX_HOPS = 3
+
+
 def _has_axis(state: LightingState, key: str) -> bool:
     """Group-aware membership: ``group.<name>`` lives in state.groups, not state.values
     (state.get/set already route the prefix — only membership tests need this)."""
@@ -659,6 +664,7 @@ def run_polish(
         return verdict.score
 
     seen[_memo_key(state)] = score_now      # the seed state is already measured
+    hops_used = 0                           # azimuth basin hops taken (bounded)
 
     try:
         low_gain_rounds = 0
@@ -806,6 +812,41 @@ def run_polish(
                             hooks._polish_best_components = dict(
                                 getattr(hooks, "_last_polish_components", {}))
                             improved_any = escaped = True
+
+                if not escaped:
+                    # AZIMUTH BASIN HOP. Sun azimuth is the one genuinely MULTI-MODAL
+                    # axis: a rig lit from 294° and one lit from 115° are different
+                    # basins, and a 12°-step line search can never walk between them
+                    # downhill. Measured on-box 2026-07-25 (A6): polish returned
+                    # proven=True — a real local optimum — at 84.76 with azimuth 179° from
+                    # target and direction the weakest component at 0.74. So when the
+                    # local search is otherwise exhausted, sample the OTHER lobes: jump a
+                    # long way round the compass, keep a jump only if it measurably wins,
+                    # and re-open the step sizes so the new basin gets a real descent.
+                    if "sun.azimuth_deg" in best.values \
+                            and "sun.azimuth_deg" not in locks and hops_used < _MAX_HOPS:
+                        base_az = best.get("sun.azimuth_deg")
+                        for offset in (180.0, 90.0, -90.0, 135.0, -135.0):
+                            if hooks.should_cancel() or probes >= cfg.polish_max_probes:
+                                break
+                            cand = best.copy()
+                            cand.set("sun.azimuth_deg", (base_az + offset) % 360.0)
+                            sc = measure(cand, f"polish{rnd}_hop{int(offset)}")
+                            if sc is not None and sc > best_score + cfg.polish_min_gain:
+                                hooks.log(
+                                    f"polish: azimuth basin hop {base_az:.0f}°→"
+                                    f"{cand.get('sun.azimuth_deg'):.0f}° · "
+                                    f"{best_score:.2f}→{sc:.2f} ✓")
+                                best, best_score = cand, sc
+                                hooks._polish_best_components = dict(
+                                    getattr(hooks, "_last_polish_components", {}))
+                                improved_any = escaped = True
+                                hops_used += 1
+                                # a new basin deserves a fresh descent, not the fine
+                                # steps the previous basin had annealed down to
+                                for k, s0, _l, _f in axes:
+                                    steps[k] = s0
+                                break
 
                 if escaped:
                     low_gain_rounds = 0
