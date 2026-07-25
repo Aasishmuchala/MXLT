@@ -133,6 +133,7 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
     # hot fraction by construction and measure nothing.
     hot_cells = [0] * 25
     hot_total = 0
+    lum_flat: List[float] = []          # for the local-contrast pass below
 
     grid_sum = [0.0] * 9
     grid_n = [0] * 9
@@ -166,14 +167,12 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
             n_center += 1
         lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
         lums.append(lum)
+        lum_flat.append(lum)
         cell = min(2, x * 3 // max(1, w)) + 3 * min(2, y * 3 // max(1, h))
         grid_sum[cell] += lum
         grid_n[cell] += 1
         grid_log_sum[cell] += log_l          # same cell, log-luminance (spatial descriptor)
         c5 = min(4, x * 5 // max(1, w)) + 5 * min(4, y * 5 // max(1, h))
-        if lum > HOT_THRESHOLD:
-            hot_cells[c5] += 1
-            hot_total += 1
         g5_sum[c5] += lum
         g5_n[c5] += 1
         g5_log_sum[c5] += log_l
@@ -228,6 +227,32 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
     lab_std = [math.sqrt(max(0.0, lab_sq[i] / n - lab_mean[i] ** 2)) for i in range(3)]
     key_full = log_sum / n
     key_center = log_sum_center / n_center if n_center else key_full
+    # ---- sun-patch map: pixels bright relative to their own neighbourhood.
+    # A summed-area table keeps this O(n) — compute_stats runs on every polish probe, and
+    # a naive per-pixel window would add seconds to each of hundreds of renders.
+    if w > 0 and h > 0 and len(lum_flat) >= w * h:
+        sat = [0.0] * ((w + 1) * (h + 1))
+        for yy in range(h):
+            row_run = 0.0
+            base, above, here = yy * w, yy * (w + 1), (yy + 1) * (w + 1)
+            for xx in range(w):
+                row_run += lum_flat[base + xx]
+                sat[here + xx + 1] = sat[above + xx + 1] + row_run
+        rad = HOT_LOCAL_RADIUS
+        for yy in range(h):
+            for xx in range(w):
+                x0, x1 = max(0, xx - rad), min(w, xx + rad + 1)
+                y0, y1 = max(0, yy - rad), min(h, yy + rad + 1)
+                area = (x1 - x0) * (y1 - y0)
+                if area <= 0:
+                    continue
+                total_win = (sat[y1 * (w + 1) + x1] - sat[y0 * (w + 1) + x1]
+                             - sat[y1 * (w + 1) + x0] + sat[y0 * (w + 1) + x0])
+                lv = lum_flat[yy * w + xx]
+                if lv > HOT_THRESHOLD and lv > total_win / area + HOT_LOCAL_LIFT:
+                    hot_cells[min(4, yy * 5 // h) * 5 + min(4, xx * 5 // w)] += 1
+                    hot_total += 1
+
     grid_mean = sum(grid_sum) / max(1, sum(grid_n)) or 1e-6
     grid = [(grid_sum[i] / grid_n[i] - grid_mean) if grid_n[i] else 0.0 for i in range(9)]
     g5_mean = sum(g5_sum) / max(1, sum(g5_n)) or 1e-6
@@ -296,9 +321,21 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
     }
 
 
-#: Display luminance above which a pixel counts as a bright directional highlight. Sun
-#: patches, specular hits and blown windows sit here; lit walls and floors do not.
-HOT_THRESHOLD = 0.72
+#: A sun patch is bright RELATIVE TO ITS SURROUNDINGS — that is what makes it a patch and
+#: not just a bright room. An absolute threshold alone is satisfied by any globally
+#: brightened frame, which is precisely the metamer this codebase keeps meeting: measured
+#: on-box 2026-07-26, a match that cranked the dome to 2.29 (target 0.55) and white balance
+#: to 10400 K (target 4800) carried MORE absolutely-bright pixels than the reference and
+#: scored 0.891 on absolute-threshold agreement, with its sun 78 degrees out. Judged on
+#: local contrast the same pair scores 0.514: the reference has 4.1% of frame in genuine
+#: patches, the match 1.4%.
+#:
+#: So a pixel is a highlight when it clears BOTH: bright enough to read as light rather
+#: than shade, and this far above its own neighbourhood's mean.
+HOT_THRESHOLD = 0.35
+HOT_LOCAL_LIFT = 0.18
+#: Neighbourhood radius in pixels at the stats working resolution (max_dim 256).
+HOT_LOCAL_RADIUS = 6
 
 
 def highlight_similarity(ref: Dict, cur: Dict) -> Optional[float]:

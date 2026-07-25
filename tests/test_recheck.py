@@ -392,3 +392,37 @@ def test_the_transfer_blend_can_no_longer_outvote_the_pixels():
 
     assert TRANSFER_WEIGHT <= 0.12, "the reading must not outvote what the render shows"
     assert TRANSFER_WEIGHT > 0.0, "some weight still breaks a genuine tie"
+
+
+def test_a_globally_brightened_frame_cannot_fake_sun_patches():
+    """The metamer this codebase keeps meeting: crank the dome and open the exposure, and
+    the frame fills with absolutely-bright pixels that satisfy a plain threshold. Measured
+    on-box 2026-07-26 — a match with dome 2.29 against a 0.55 target and white balance
+    10400 K against 4800 K carried MORE absolutely-bright pixels than the reference (0.195
+    vs 0.173) and scored 0.891 on absolute-threshold agreement, with its sun 78 degrees
+    out. A patch is bright RELATIVE TO ITS SURROUNDINGS; on local contrast the same pair
+    reads 0.514, because the reference has 4.1% of frame in genuine patches and the match
+    1.4%."""
+    from maxgaffer.core import metrics
+
+    assert metrics.HOT_LOCAL_LIFT > 0, "a highlight must clear its own neighbourhood"
+    assert metrics.HOT_THRESHOLD < 0.5, (
+        "with a local-contrast test the absolute floor only rejects shadow detail")
+
+    # a flat bright field has no patches at any brightness; a field with a bright blob does
+    import tempfile
+
+    from maxgaffer.core.png_min import write_png_rgb
+
+    def frame(blob):
+        rows = [[(200, 200, 200) if (blob and 20 <= x < 32 and 20 <= y < 32)
+                 else (120, 120, 120) for x in range(64)] for y in range(64)]
+        fh = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        fh.close()
+        write_png_rgb(fh.name, rows)
+        return metrics.compute_stats(fh.name)
+
+    flat, patched = frame(False), frame(True)
+    assert flat["hot_frac"] == 0.0, "an evenly lit frame has no directional patch"
+    assert patched["hot_frac"] > 0.0
+    assert metrics.highlight_similarity(patched, flat) == 0.0
