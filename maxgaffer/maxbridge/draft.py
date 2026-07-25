@@ -20,14 +20,28 @@ from typing import Dict, List, Tuple
 from . import config as cfgmod
 from .scene import get_prop, set_prop
 
-# (candidates, draft_value) — conservative: quicker convergence, identical lighting
+# (candidates, draft_value) — conservative: quicker convergence, identical lighting.
+#
+# The V-Ray 7.30 names were MEASURED on-box 2026-07-25 (rt.getPropNames over the live
+# renderer, 401 properties) after a benchmark showed only ONE of the original four rows
+# matching anything: a 1-minute-per-frame cap on frames that take ~6s, so it never bound
+# and the draft sampler was very nearly inert. The real levers are the progressive AND
+# bucket noise thresholds (V-Ray uses one or the other depending on imageSampler_type),
+# the fine-subdiv count, and the shading rate.
 DRAFT_PROPS: Tuple[Tuple[Tuple[str, ...], float], ...] = (
-    (("options_progressiveNoiseThreshold", "progressive_noiseThreshold",
-      "noise_threshold", "options_dmc_threshold"), 0.05),
+    # progressive image sampler noise threshold (default 0.01)
+    (("progressive_noise_threshold", "options_progressiveNoiseThreshold",
+      "progressive_noiseThreshold", "noise_threshold", "options_dmc_threshold"), 0.05),
+    # bucket ("two level") image sampler noise threshold (default 0.01) — the sibling
+    # setting for scenes not using the progressive sampler
+    (("twoLevel_threshold", "options_dmc_threshold"), 0.05),
+    # bucket fine subdivs (default 25)
+    (("twoLevel_fineSubdivs", "options_maxSubdivs", "twoLevel_maxSubdivs"), 8),
+    # samples per pixel budget (default 6) — the single biggest cost knob
+    (("imageSampler_shadingRate",), 2.0),
     (("options_progressiveMaxSubdivs", "progressive_maxSubdivs"), 12),
-    (("options_progressiveTimeLimit", "progressive_max_render_time",
+    (("progressive_max_render_time", "options_progressiveTimeLimit",
       "progressive_timeLimit"), 1.0),          # minutes per frame cap
-    (("options_maxSubdivs", "twoLevel_maxSubdivs"), 8),
 )
 
 SNAPSHOT_PATH = os.path.join(os.path.dirname(cfgmod.CONFIG_PATH), "draft_snapshot.json")
