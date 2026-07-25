@@ -200,6 +200,7 @@ class MatchResult:
     best_render: Optional[str]
     stop_reason: str
     iterations: List[IterationRecord] = field(default_factory=list)
+    transfer: Optional[Dict] = None     # lighting-TRANSFER reading (see core.transfer)
     polish_gain: float = 0.0            # score added by the coordinate-descent finisher
     polish_probes: int = 0
     ceiling_converged: bool = False     # polish ended in a converged condition (either kind)

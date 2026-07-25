@@ -21,6 +21,7 @@ import time
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from ..core import (animation, consensus, critic, domeseed, expose, fairness, feedback,
+                    transfer,
                     metrics, omega, planner, profiles, prompts, providers, rules,
                     scenedigest, scenarios as scen)
 from ..core.director import Hooks, MatchConfig, MatchResult, run_match, run_sun_sweep
@@ -1097,6 +1098,19 @@ class Controller:
             log(f"match {result.stop_reason} before any successful render — "
                 "no measurement, kept previous lighting")
         else:
+            # LIGHTING TRANSFER, reported alongside the pixel score. The critic answers
+            # "do these frames match", which is unanswerable when the reference is a photo
+            # of a different building; this answers "is the sun where that photo's sun is,
+            # at that colour temperature, hardness and haze" — the question the artist
+            # actually asked, and the only one with a fair answer cross-domain.
+            try:
+                tr = transfer.score(semantics, result.best_state,
+                                    sc.camera_yaw_deg(cam))
+                result.transfer = tr
+                log("lighting transfer: %.1f/100 (%s)"
+                    % (tr["score"], ", ".join(tr.get("notes") or ["faithful"])[:160]))
+            except Exception:  # noqa: BLE001 — a diagnostic must never sink a match
+                pass
             self._record_match(camera_name, result.best_state, result.best_score)
         if result.best_score is not None:
             # A preliminary card yields the authoritative critic content_gap + metric
