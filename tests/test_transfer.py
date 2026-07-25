@@ -248,9 +248,13 @@ def test_the_sweep_measurement_updates_the_belief_the_loop_defends():
 
     src = inspect.getsource(Controller.run_match)
     sweep_at = src.index('start.set("sun.azimuth_deg", az)')
-    tail = src[sweep_at:sweep_at + 1800]
+    tail = src[sweep_at:sweep_at + 4000]
     assert 'sem_live["sun_bearing_deg"]' in tail, "sweep result never reaches the objective"
-    assert 'sem_live["sun_bearing_agreement"] = 1.0' in tail
+    # ...and the objective's confidence in it comes from the sweep's own margin. Asserting
+    # a flat 1.0 here was the first version of this fix and it cost a match: a sweep that
+    # was guessing got defended as if it had measured.
+    assert 'sem_live["sun_bearing_agreement"] = max(' in tail
+    assert 'sweep_out.get("confidence"' in tail
 
 
 def test_the_sweep_never_writes_its_answer_into_the_cached_reading():
@@ -264,6 +268,36 @@ def test_the_sweep_never_writes_its_answer_into_the_cached_reading():
     src = inspect.getsource(Controller.run_match)
     assert "sem_live = dict(semantics)" in src, "the sweep must mutate a COPY"
     sweep_at = src.index('start.set("sun.azimuth_deg", az)')
-    tail = src[sweep_at:sweep_at + 1800]
+    tail = src[sweep_at:sweep_at + 4000]
     assert 'semantics["sun_bearing_deg"]' not in tail
     assert "e.semantics[" not in tail
+
+
+def test_the_sweep_reports_how_sure_it_is_not_just_what_it_picked():
+    """Measured on-box 2026-07-25: on an interior where every direction lit the room about
+    equally, the sweep landed ~195 degrees from the true sun. The caller was told only the
+    answer, trusted it completely, and the objective spent the match defending a sun on the
+    far side of the building — 84.95, azimuth 180 degrees wrong. The margin between the
+    winner and the runner-up was already computed; nobody looked at it."""
+    from maxgaffer.core.director import _report_sweep
+
+    decisive, tie, unmeasured = {}, {}, {}
+    _report_sweep(decisive, [0.95, 0.60, 0.55], 0, "llm+metric")
+    _report_sweep(tie, [0.95, 0.94, 0.93], 0, "llm+metric")
+    _report_sweep(unmeasured, [], None, "llm-only")
+
+    assert decisive["confidence"] == 1.0
+    assert tie["confidence"] < 0.2, "a near-tie must not report as a confident answer"
+    assert unmeasured["confidence"] == 0.5, ("an unverified LLM pick is real evidence but "
+                                             "never certainty")
+
+
+def test_a_coin_flip_sweep_does_not_get_defended_at_full_strength():
+    import inspect
+
+    from maxgaffer.maxbridge.controller import Controller
+
+    src = inspect.getsource(Controller.run_match)
+    assert 'sweep_out.get("confidence"' in src
+    assert 'sem_live["sun_bearing_agreement"] = 1.0' not in src, (
+        "the sweep must not assert certainty it has not earned")

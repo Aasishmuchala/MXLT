@@ -1092,12 +1092,44 @@ def run_polish(
         raise
 
 
+#: Contrast margin at which the sweep's winner is considered decisively ahead. The same
+#: 0.15 already gates the metric overriding the LLM's pick, so a winner clearing it is one
+#: the code elsewhere already trusts enough to overrule a judgement on.
+_SWEEP_DECISIVE_MARGIN = 0.15
+
+
+def _report_sweep(out: Optional[Dict], contrast: List[float], idx: Optional[int],
+                  basis: str) -> None:
+    """Record HOW SURE the sweep is, not just what it picked.
+
+    The winner's lead over the runner-up is the whole signal. Measured on-box 2026-07-25:
+    on one interior the sweep landed ~195 degrees from the true sun, and because the caller
+    was told only the answer and not the margin, it trusted that answer completely and the
+    match defended a sun on the wrong side of the building. A near-tie between probes and a
+    decisive win must not be reported the same way."""
+    if out is None:
+        return
+    out["basis"] = basis
+    out["contrast"] = list(contrast)
+    if idx is None or len(contrast) < 2:
+        # no measurable table: the pick rests on the LLM's comparison alone. That is real
+        # evidence, but unverified — never full confidence.
+        out["margin"] = None
+        out["confidence"] = 0.5
+        return
+    rest = [c for i, c in enumerate(contrast) if i != idx]
+    margin = contrast[idx] - max(rest)
+    out["margin"] = round(margin, 4)
+    out["confidence"] = round(max(0.0, min(1.0, margin / _SWEEP_DECISIVE_MARGIN)), 3)
+
+
 def run_sun_sweep(
     state: LightingState,
     azimuths: List[float],
     hooks: Hooks,
     llm_pick: Callable[[List[str], List[float]], str],
     ref_stats: Optional[Dict] = None,
+    out: Optional[Dict] = None,
 ) -> Tuple[Optional[float], str, str]:
     """Grid-solve the sun direction: render one low-res frame per azimuth, let the LLM do
     multiple-choice (estimation is hard, comparison is easy) — CROSS-CHECKED by the
@@ -1170,6 +1202,7 @@ def run_sun_sweep(
                 hooks.log(f"sweep: LLM pick unusable ({e}) — metric-only winner "
                           f"{az:.0f}° (contrast {contrast[metric_idx]:.2f})")
                 completed = True
+                _report_sweep(out, contrast, metric_idx, "metric-only")
                 return az, "na", "metric-only pick (LLM unavailable)"
             return None, "na", f"sweep reply unusable: {e}"
         idx = picked["best_index"]
@@ -1182,7 +1215,10 @@ def run_sun_sweep(
         elif measured_all:
             hooks.log("sweep: direction residue too small to cross-check — LLM pick stands")
         az = kept[idx]
-        hooks.log(f"sweep: azimuth {az:.0f}° — {picked['why']}")
+        _report_sweep(out, contrast, idx, "llm+metric" if contrast else "llm-only")
+        conf = (out or {}).get("confidence")
+        hooks.log(f"sweep: azimuth {az:.0f}° — {picked['why']}"
+                  + (f" (confidence {conf:.0%})" if conf is not None else ""))
         completed = True
         return az, picked["altitude_hint"], picked["why"]
     finally:

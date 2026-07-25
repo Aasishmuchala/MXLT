@@ -1098,10 +1098,11 @@ class Controller:
                     and "sun.azimuth_deg" not in locks:
                 log(f"sun sweep: {profile.sweep_count} directions at "
                     f"{profile.sweep_width}×{profile.sweep_height}…")
+                sweep_out: Dict = {}
                 az, alt_hint, _why = run_sun_sweep(
                     start, rules.sweep_azimuths(profile.sweep_count), hooks,
                     llm_pick=lambda paths, azs: self._sweep_call(ref_block, paths, azs),
-                    ref_stats=ref_stats)
+                    ref_stats=ref_stats, out=sweep_out)
                 if az is not None:
                     start.set("sun.azimuth_deg", az)
                     # ANALYZE estimates the bearing from ONE image, which is a hard
@@ -1119,16 +1120,38 @@ class Controller:
                     if sem_live is not None:
                         swept_bearing = (az - cam_yaw + 180.0) % 360.0 - 180.0
                         prior = sem_live.get("sun_bearing_deg")
+                        # Point the objective at where the sweep put the sun, so it neither
+                        # defends nor fights the measurement — the WEIGHT decides how hard
+                        # it resists polish moving away from it.
                         sem_live["sun_bearing_deg"] = round(swept_bearing, 1)
-                        # measured, not guessed — and the transfer weight keys off this
-                        sem_live["sun_bearing_agreement"] = 1.0
-                        bearing_trust = 1.0
-                        cfg_kw["transfer_weight"] = TRANSFER_WEIGHT
-                        if prior is not None and abs(
+                        # How hard, from how DECISIVE the sweep actually was. Asserting
+                        # certainty here was a mistake and it cost a match: on an interior
+                        # where every direction lit the room about equally the sweep landed
+                        # ~195 degrees out, full trust made the objective defend a sun on
+                        # the far side of the building, and the run finished at 84.95 with
+                        # the azimuth 180 degrees wrong. The sweep already knew it was
+                        # guessing — the margin between its winner and the runner-up was
+                        # right there and nobody looked at it.
+                        sweep_conf = float(sweep_out.get("confidence", 0.5) or 0.0)
+                        # the best direction evidence available, never worse than the
+                        # reading it replaces
+                        sem_live["sun_bearing_agreement"] = max(
+                            sweep_conf, float(semantics.get("sun_bearing_agreement", 0.0)
+                                              or 0.0))
+                        bearing_trust = max(0.25, min(
+                            1.0, sem_live["sun_bearing_agreement"]))
+                        cfg_kw["transfer_weight"] = TRANSFER_WEIGHT * bearing_trust
+                        if sweep_conf < 0.5:
+                            log(f"⚠ the sweep could not separate the sun's direction "
+                                f"(winner led by {sweep_out.get('margin')}) — every "
+                                f"direction lights this scene about equally. Holding the "
+                                f"answer loosely (trust {bearing_trust:.0%}); lock "
+                                f"sun.azimuth_deg if you know where the light is.")
+                        elif prior is not None and abs(
                                 (float(prior) - swept_bearing + 180.0) % 360.0 - 180.0) > 20.0:
                             log(f"sweep measured the sun at {swept_bearing:+.0f}° from the "
                                 f"camera; ANALYZE had estimated {float(prior):+.0f}° — "
-                                f"going with the render")
+                                f"going with the render (confidence {sweep_conf:.0%})")
                     # the hint was judged against real renders of THIS scene — trust it over
                     # the ANALYZE band when the altitude isn't locked
                     if alt_hint != "na" and "sun.altitude_deg" not in locks \
