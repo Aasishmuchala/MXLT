@@ -80,5 +80,9 @@ def resolve_profile(name: str, *, loop_width: int, loop_height: int,
                             True, 24, 500, stall_patience=5)
 
     sw, sh = _scaled(width, height, 0.5, floor_w=192)
+    # Standard used to have NO polish at all, so the default match handed back whatever
+    # the loop happened to land on. A modest finisher (8 rounds / 120 probes) costs a few
+    # minutes and is the difference between a rough guess and a usable match; Hero keeps
+    # the deep 24/500 budget and Fast keeps none.
     return MatchProfile("standard", "Standard", width, height, sw, sh,
-                        iterations, sweeps, target, False, 0, 0, stall_patience=3)
+                        iterations, sweeps, target, True, 8, 120, stall_patience=3)

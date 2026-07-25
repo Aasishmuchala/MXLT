@@ -898,7 +898,7 @@ def test_config_load_hostile_payloads_never_raise(tmp_path, monkeypatch, raw):
     assert cfg.api_key == ""
     assert cfg.critic_weights == {}
     assert cfg.auto_exposure_control is True
-    assert cfg.target_score == 82.0              # the untouched default
+    assert cfg.target_score == 95.0              # the untouched default
 
 
 def test_config_load_wrong_typed_fields_fall_back_per_field(tmp_path, monkeypatch):

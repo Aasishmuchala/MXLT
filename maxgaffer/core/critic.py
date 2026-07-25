@@ -24,6 +24,13 @@ from typing import Dict, List
 
 from .metrics import cosine, hist_emd, illuminant_similarity
 
+#: How hard the aggregate is pulled toward its WORST component. 0 = the old plain
+#: weighted mean; 1 = the score IS the worst component. 0.35 leaves the mean in charge of
+#: ordinary trade-offs while making a single collapsed dimension impossible to average
+#: away — measured need: a sunless impersonation scored ~92, and a hue collapse to 0.06
+#: still scored 79.
+_WEAKEST_LINK = 0.35
+
 DEFAULT_WEIGHTS: Dict[str, float] = {
     "key": 0.19,
     "envelope": 0.15,
@@ -255,4 +262,19 @@ def score(ref: Dict, cur: Dict, weights: Dict[str, float] = None) -> Verdict:
         return Verdict(score=0.0, components={}, fairness=fairness_diag)
     total_w = sum(w[k] for k in comps) or 1.0
     total = sum(w[k] * comps[k] for k in comps) / total_w
-    return Verdict(score=round(100.0 * total, 2), components=comps, fairness=fairness_diag)
+    # WEAKEST-LINK PENALTY. A weighted mean lets one catastrophically wrong dimension hide
+    # behind five good ones, and the search exploits exactly that: measured on-box
+    # 2026-07-25, a SUNLESS room impersonating a golden-hour reference scored ~92 because
+    # a 150-degree sun error costs "direction" alone, and a 400-lamp city scored 79 with
+    # hue collapsed to 0.06. Both are structurally wrong answers wearing a good average.
+    #
+    # So the aggregate is pulled toward its worst measured component. A CORRECT match is
+    # unaffected — every component sits near 1.0, so the gap term vanishes and a perfect
+    # answer still scores 100 — but a lopsided one can no longer average its failure away.
+    # This makes the score mean "no dimension is badly wrong", which is what a lighting
+    # match has to guarantee.
+    if len(comps) >= 3:
+        worst = min(comps.values())
+        total -= _WEAKEST_LINK * max(0.0, total - worst)
+    return Verdict(score=round(100.0 * max(0.0, total), 2), components=comps,
+                   fairness=fairness_diag)

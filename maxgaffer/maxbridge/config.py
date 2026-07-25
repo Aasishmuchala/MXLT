@@ -67,12 +67,19 @@ class Config:
     final_width: int = 1920
     final_height: int = 1080
     max_iterations: int = 5
-    target_score: float = 82.0
+    # 82 meant a Standard match declared victory well below a usable match and
+    # stopped; the bar people actually want is 95. Fast still caps itself lower.
+    target_score: float = 95.0
     analyze_samples: int = 3                 # ANALYZE self-consistency (1 = single-shot)
     sweep_count: int = 8
     seed_blur_passes: int = 0                # 0 sharp reflections; 1-2 diffuse-light blur
     keep_runs: int = 10                      # run folders kept per camera (0 = keep all)
-    draft_sampler: bool = False              # opt-in: draft render settings during matches
+    # STAYS OPT-IN — render setups belong to the artist (draft.py's house rule), so this
+    # is never switched on behind their back even though it is snapshot-protected.
+    # It is, however, the single biggest speed lever: a match's cost IS its render cost
+    # (measured on-box 2026-07-25 at ~10 s/frame with up to 500 polish probes). Turn it on
+    # in Settings for heavy scenes; V-Ray GPU was the fastest renderer measured.
+    draft_sampler: bool = False
     # apply-only mode: MaxGaffer never fires a render. MATCH = analyze → first guess →
     # apply as ONE undoable change → read-back verification → change report. The loop,
     # sun sweep, board probes, plan effect measurement and V-Ray finals are all off.

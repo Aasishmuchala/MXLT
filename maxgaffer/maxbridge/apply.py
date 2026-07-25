@@ -309,9 +309,12 @@ def _apply_inner(rig, baselines, state: LightingState, camera, warnings: List[st
     if atmosphere is not None:
         if "atmosphere.enabled" in atmosphere_keys:
             enabled = _state_float(state, "atmosphere.enabled", warnings)
-            if enabled is not None and sc.set_prop(
-                    atmosphere, sc.FOG_ON, bool(enabled >= 0.5)) is None:
-                warnings.append("atmosphere.enabled: no writable on/off property")
+            if enabled is not None and sc.set_atmosphere_enabled(
+                    atmosphere, bool(enabled >= 0.5)) is None:
+                # only a real failure now — the stack fallback covers builds with no
+                # writable on/off property (measured: V-Ray 7.30 fog has none)
+                warnings.append("atmosphere.enabled: no property and the atmosphere "
+                                "stack refused the toggle")
         for key, props in (("atmosphere.distance_m", sc.FOG_DISTANCE),
                            ("atmosphere.height_m", sc.FOG_HEIGHT)):
             if key in atmosphere_keys:

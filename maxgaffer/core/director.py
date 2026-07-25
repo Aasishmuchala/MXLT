@@ -131,6 +131,14 @@ _MAX_HOPS = 3
 _RESTART_TOLERANCE = 8.0
 
 
+def _state_fingerprint(state: LightingState) -> tuple:
+    """A state's identity for repeat detection, rounded so float noise does not make two
+    identical rigs look different."""
+    vals = tuple(sorted((k, round(float(v), 4)) for k, v in state.values.items()))
+    grps = tuple(sorted((k, round(float(v), 4)) for k, v in state.groups.items()))
+    return (vals, grps)
+
+
 def _has_axis(state: LightingState, key: str) -> bool:
     """Group-aware membership: ``group.<name>`` lives in state.groups, not state.values
     (state.get/set already route the prefix — only membership tests need this)."""
@@ -248,6 +256,7 @@ def run_match(
     best_render: Optional[str] = None
     best_components: Dict[str, float] = {}
     best_stats: Optional[Dict] = None      # stats of best_state, reused on revert
+    measured_states: Set[tuple] = set()    # every rig already rendered — repeat guard
     live: Optional[LightingState] = None   # what the scene is actually wearing right now
     records: List[IterationRecord] = []
     score_history: List[Tuple[int, float]] = []
@@ -291,6 +300,7 @@ def run_match(
                 records.append(rec)
                 break
 
+            measured_states.add(_state_fingerprint(state))
             cur_stats = hooks.stats(path) if metrics_ok else None
             # MEASURED mis-exposure of the frame the LLM is about to judge — drives the
             # contamination guard directly (the capped/annealed applied delta understates it)
@@ -462,6 +472,27 @@ def run_match(
                 from .parse import validate_deltas
 
                 proposal = validate_deltas(hooks.llm_deltas(ctx), cfg.max_changes)
+                # REPEAT GUARD. The prompt already carries the parameter and score
+                # history, and the model is told to hold a ping-ponged value — but it
+                # re-proposed an identical failing move anyway. Measured on-box
+                # 2026-07-25 (A3): nine iterations produced three visits to the SAME
+                # ~77.6 state and two identical ev=-4.0 proposals three iterations
+                # apart, so five of nine renders re-measured something already known.
+                # Drop deltas that would rebuild a state we have already scored; the
+                # loop then spends the iteration somewhere new instead.
+                if proposal.get("changes"):
+                    would_be = state.copy()
+                    for param, value in dict(proposal["changes"]).items():
+                        try:
+                            would_be.set(str(param), float(value))
+                        except (TypeError, ValueError):
+                            pass
+                    if _state_fingerprint(would_be) in measured_states:
+                        hooks.log(f"iter {i}: LLM re-proposed an already-measured state "
+                                  "— dropped, keeping the analytic step")
+                        proposal = dict(proposal)
+                        proposal["changes"] = {}
+                        proposal["reasons"] = {}
             except ParseError as e:
                 hooks.log(f"iter {i}: LLM reply unusable ({e}) — keeping analytic-only step")
                 proposal = {"assessment": "", "changes": {}, "reasons": {}, "stop": False}

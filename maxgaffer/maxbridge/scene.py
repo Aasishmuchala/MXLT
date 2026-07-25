@@ -91,6 +91,13 @@ LIGHT_MULT = ("multiplier", "intensity")
 DOME_TEX_ROT = ("horizontalRotation", "horizontal_rotation", "hRot", "tex_hrotation")
 DOME_TEX_FILE = ("HDRIMapName", "fileName", "filename", "bitmap_filename")
 DOME_TEX_ON = ("texmap_on", "useTexmap", "use_texture")
+#: Max's Sun Positioner (Sun_Positioner, superclass light) exposes the sun's direction as
+#: PLAIN PROPERTIES instead of a transform — measured on-box 2026-07-25: azimuth_deg and
+#: altitude_deg are directly writable in every one of its position modes. Using them is
+#: both simpler and more robust than the pivot/transform math a VRaySun needs.
+SUNPOS_AZIMUTH = ("azimuth_deg",)
+SUNPOS_ALTITUDE = ("altitude_deg",)
+
 FOG_ON = ("enabled", "on", "active")
 # visibility_range: VRayAerialPerspective's far-visibility distance — CONFIRMED on-box
 # (Max 2026.2 + V-Ray 7.30) as the aerial distance property, and it is a world-unit
@@ -378,6 +385,15 @@ def classify_rig() -> Dict[str, Any]:
         cname = _class_name(lt).lower()
         if cname == "targetobject":
             continue    # the lights collection yields light TARGETS too — same gotcha as cameras
+        if cname in ("sun_positioner", "sunpositioner"):
+            # Max's modern sun rig, and what a Daylight-style setup uses. Without this it
+            # fell through to the dimmer groups and the classifier reported "no VRaySun
+            # found - sun.* parameters disabled", so the whole scene was unmatchable.
+            rig["suns"].append(lt)
+            rig["notes"].append(
+                f"sun '{_node_name(lt)}' is a Sun Positioner — azimuth/altitude are "
+                "driven directly (its date/time/location fields are left untouched)")
+            continue
         if cname == "vraysun":
             rig["suns"].append(lt)
             if len(rig["suns"]) == 1:
@@ -479,7 +495,17 @@ def sun_readable(sun) -> bool:
 
 
 def read_sun_angles(sun) -> Tuple[float, float, float]:
-    """→ (azimuth_deg, altitude_deg, distance). Direction FROM pivot TO sun position."""
+    """→ (azimuth_deg, altitude_deg, distance). Direction FROM pivot TO sun position.
+
+    A Sun Positioner carries its own azimuth/altitude properties, so read those rather
+    than inferring direction from a transform that its internal solver owns."""
+    direct_az = get_prop(sun, SUNPOS_AZIMUTH)
+    direct_alt = get_prop(sun, SUNPOS_ALTITUDE)
+    if direct_az is not None and direct_alt is not None:
+        try:
+            return float(direct_az) % 360.0, float(direct_alt), 0.0
+        except (TypeError, ValueError):
+            pass
     pivot = _sun_pivot(sun)
     try:
         d = sun.pos - pivot
@@ -498,6 +524,14 @@ def read_sun_angles(sun) -> Tuple[float, float, float]:
 
 
 def write_sun_angles(sun, azimuth_deg: float, altitude_deg: float) -> bool:
+    # Sun Positioner: set the angles it publishes. Moving its transform would be fought by
+    # its own position solver, which is exactly the "Daylight assembly may fight MaxGaffer"
+    # failure the classifier used to only warn about.
+    if get_prop(sun, SUNPOS_AZIMUTH) is not None:
+        wrote_az = set_prop(sun, SUNPOS_AZIMUTH, float(azimuth_deg) % 360.0)
+        wrote_alt = set_prop(sun, SUNPOS_ALTITUDE, float(altitude_deg))
+        if wrote_az is not None and wrote_alt is not None:
+            return True
     rt = _rt()
     if not sun_readable(sun):
         # a stale handle would silently orbit the WORLD ORIGIN at 10000 units off the
@@ -644,6 +678,45 @@ def report_aliases(rig: Dict, record: bool = False) -> Dict[str, Optional[str]]:
         global LAST_ALIASES
         LAST_ALIASES = aliases
     return aliases
+
+
+def set_atmosphere_enabled(atmo, on: bool) -> Optional[str]:
+    """Turn a V-Ray atmospheric on/off, falling back to the ATMOSPHERE STACK.
+
+    Measured on-box (Max 2026.2 + V-Ray 7.30): VRayEnvironmentFog and
+    VRayAerialPerspective expose NO writable on/off property at all — report_aliases
+    returns None for atmosphere.enabled — so `atmosphere.enabled` was a silent no-op and
+    the loop could never actually clear or restore haze. The real toggle is membership of
+    the atmospherics stack, so removing the effect disables it and re-adding restores it.
+    The object itself is kept alive by the rig dict, so an off/on round-trip preserves the
+    fog's settings. → how it was toggled, or None if nothing worked."""
+    used = set_prop(atmo, FOG_ON, bool(on))
+    if used is not None:
+        return used                      # a build that DOES expose a property: use it
+    if atmo is None:
+        return None
+    try:
+        rt = _rt()
+    except Exception:
+        return None
+    try:
+        present = [rt.getAtmospheric(i)
+                   for i in range(1, int(rt.numAtmospherics) + 1)]
+    except Exception:
+        return None
+    try:
+        if on:
+            if not any(a is atmo for a in present):
+                rt.addAtmospheric(atmo)
+                return "atmosphere_stack:add"
+            return "atmosphere_stack:already_on"
+        for i, a in enumerate(present, start=1):
+            if a is atmo:
+                rt.deleteAtmospheric(i)
+                return "atmosphere_stack:remove"
+        return "atmosphere_stack:already_off"
+    except Exception:
+        return None
 
 
 # ------------------------------------------------------------------ Max Scene States

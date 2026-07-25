@@ -4,12 +4,18 @@ from maxgaffer.core.profiles import resolve_profile
 
 
 def test_standard_profile_preserves_user_baseline():
+    """Standard still honours the user's resolution, iterations and target verbatim — but
+    it now carries a MODEST finisher. It used to have none, so a default match handed back
+    whatever the loop happened to land on; Fast remains the no-polish option."""
     p = resolve_profile("standard", loop_width=480, loop_height=270,
                         max_iterations=5, sweep_count=8, target_score=82)
     assert (p.loop_width, p.loop_height, p.max_iterations, p.target_score) == (
         480, 270, 5, 82)
     assert (p.sweep_width, p.sweep_height) == (240, 135)
-    assert not p.polish
+    assert p.polish and (p.polish_rounds, p.polish_max_probes) == (8, 120)
+    assert not resolve_profile("fast", loop_width=480, loop_height=270,
+                               max_iterations=5, sweep_count=8,
+                               target_score=82).polish
 
 
 def test_fast_profile_only_reduces_cost():

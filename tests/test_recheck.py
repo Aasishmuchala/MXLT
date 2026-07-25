@@ -123,3 +123,38 @@ def test_controller_session_and_prune_work_off_max(tmp_path):
     assert ctrl.session is not None            # unsaved-scene in-memory session
     assert ctrl.cameras() == []                # graceful, no raise
     assert ctrl.save_session() is False        # nothing to persist → honest False
+
+
+# ------------------------------------------------- LLM repeat guard (#8)
+def test_llm_reproposing_a_measured_state_is_dropped():
+    """The prompt already carries parameter and score history and tells the model to hold
+    a ping-ponged value, and it re-proposed an identical failing move anyway. Measured
+    on-box 2026-07-25 (A3): 9 iterations, three visits to the same ~77.6 state and two
+    identical ev=-4.0 proposals three apart — five of nine renders re-measured something
+    already known. A rebuilt state we have already scored must be refused."""
+    from maxgaffer.core.director import _state_fingerprint
+
+    st = LightingState()
+    st.set("sun.azimuth_deg", 100.0)
+    st.set("sun.intensity", 1.0)
+
+    # the model keeps proposing the SAME move back to azimuth 100 (a no-op repeat)
+    same = json.dumps({"assessment": "", "changes": [
+        {"param": "sun.azimuth_deg", "value": 100.0, "why": "again"}], "stop": False})
+    seen_ctx = []
+
+    def llm(ctx):
+        seen_ctx.append(ctx["iteration"])
+        return same
+
+    hooks = Hooks(apply=lambda s: None, render=lambda t: f"/tmp/{t}.png",
+                  stats=lambda p: dict(REF), llm_deltas=llm, log=lambda m: None)
+    res = run_match(st, REF, {}, hooks,
+                    MatchConfig(max_iterations=4, target_score=101, stall_patience=99,
+                                analytic=False))
+    # every iteration after the first must have had its repeat proposal dropped
+    for rec in res.iterations[1:]:
+        assert rec.llm_accepted == {}, f"iter {rec.index} accepted a repeat"
+    # and the fingerprint helper is stable for equal states
+    other = st.copy()
+    assert _state_fingerprint(other) == _state_fingerprint(st)
