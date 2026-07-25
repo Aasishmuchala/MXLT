@@ -183,3 +183,52 @@ def test_a_sunless_reference_does_not_demand_sun_criteria():
     assert "direction" not in got["measurable"]     # no bearing was read to compare against
     assert got["parts"]["presence"] == 1.0
     assert got["score"] == 100.0
+
+
+# ------------------------------------------------ trust the reading as far as it agrees
+def test_circular_median_survives_one_wild_sample():
+    """ANALYZE's bearing was consolidated with a circular MEAN, and a mean has no outlier
+    rejection: [60, 70, -50] averages to 35 degrees when two of three samples agree within
+    ten. That injected error is the size of the sun-placement misses measured on-box, and
+    it matters far more now the bearing carries a quarter of the objective."""
+    from maxgaffer.core import consensus
+
+    assert consensus._circular_mean_deg([60.0, 70.0, -50.0]) == pytest.approx(35.0, abs=1)
+    assert consensus._circular_median_deg([60.0, 70.0, -50.0]) == pytest.approx(60.0, abs=1)
+    # and the wrap the original docstring rightly worried about still behaves
+    assert abs(consensus._circular_median_deg([-170.0, 170.0, 0.0])) > 150.0
+
+
+def test_consensus_reports_bearing_scatter_and_is_not_masked_by_the_clock():
+    """Agreement was measured on time_of_day ALONE, so the bearing could scatter 130 degrees
+    across reads of one image while every sample said 'morning' — agreement 1.0, no warning,
+    and nothing downstream knew the direction was a coin flip."""
+    from maxgaffer.core import consensus
+
+    def sample(bearing):
+        return {"time_of_day": "morning", "sky": "clear", "sun_active": True,
+                "sun_bearing_deg": bearing, "wb_kelvin_estimate": 5500.0,
+                "confidence": 0.8}
+
+    scattered = consensus.consolidate_analyses([sample(45.0), sample(-52.5), sample(77.6)])
+    assert scattered["sun_bearing_spread_deg"] > 40.0
+    assert scattered["sun_bearing_agreement"] < 0.3
+    assert scattered["consensus_agreement"] < 0.3, "unanimous clock masked a contested sun"
+
+    agreed = consensus.consolidate_analyses([sample(64.0), sample(65.0), sample(64.5)])
+    assert agreed["sun_bearing_spread_deg"] < 5.0
+    assert agreed["sun_bearing_agreement"] > 0.9
+    assert agreed["consensus_agreement"] > 0.9
+
+
+def test_transfer_weight_scales_with_bearing_agreement_but_never_to_zero():
+    import inspect
+
+    from maxgaffer.core.director import TRANSFER_WEIGHT
+    from maxgaffer.maxbridge.controller import Controller
+
+    src = inspect.getsource(Controller.run_match)
+    assert "TRANSFER_WEIGHT * bearing_trust" in src
+    assert "max(0.25," in src, ("the floor must not be zero — pixels are BLIND to sun "
+                               "direction, so a contested reading still beats none")
+    assert TRANSFER_WEIGHT == 0.25

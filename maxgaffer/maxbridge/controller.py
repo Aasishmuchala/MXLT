@@ -1009,6 +1009,27 @@ class Controller:
             # cannot pin sun direction on an interior (measured: 64 degrees out still
             # scored 90.92), so the search is also judged on agreeing with that reading.
             cam_yaw = sc.camera_yaw_deg(cam)
+            # How far to trust that reading, from how well it agreed with ITSELF. Measured
+            # on-box 2026-07-25, four runs against one golden-hour reference read the sun
+            # bearing as 45.0, -52.5, 77.6 and 64.9 degrees. Weighting a coin flip at a
+            # flat 0.25 makes the match faithfully chase a wrong sun; the run that scored
+            # 94.75 was partly luck in the draw. Trust now scales with the samples'
+            # agreement.
+            #
+            # The floor is deliberate and is NOT zero: pixels are not merely noisy about
+            # sun direction, they are blind to it (a 64-degree error still scored 0.957 on
+            # the critic's direction component), so even a contested reading is the best
+            # direction evidence available. Full trust when the samples agree, a quarter of
+            # it when they do not.
+            bearing_trust = 1.0
+            if semantics:
+                bearing_trust = max(0.25, min(1.0, float(
+                    semantics.get("sun_bearing_agreement", 1.0) or 0.0)))
+                spread = semantics.get("sun_bearing_spread_deg")
+                if spread is not None and bearing_trust < 1.0:
+                    log(f"⚠ ANALYZE disagreed with itself on the sun's direction "
+                        f"(±{spread:.0f}° across samples) — leaning harder on the render "
+                        f"and less on the reading (trust {bearing_trust:.0%})")
 
             def transfer_hook(st):
                 try:
@@ -1098,7 +1119,8 @@ class Controller:
                 # a quarter of the objective is "does this rig agree with what ANALYZE
                 # read off the reference" — enough to pin direction, not enough to
                 # override the pixels that carry tone and detail
-                transfer_weight=TRANSFER_WEIGHT if semantics else 0.0,
+                transfer_weight=(TRANSFER_WEIGHT * bearing_trust
+                                 if semantics else 0.0),
             )
             if profile.polish:
                 log("HERO MATCH: target 99 · bounded coordinate-descent polish "
