@@ -56,6 +56,10 @@ class Config:
     # fully scriptable tonight. "vantage_cli" only works with a Dev Edition console exe.
     final_render_backend: str = "vray"       # "vray" | "vantage_cli"
     vantage_console: str = r"C:\Program Files\Chaos\Vantage\vantage_console.exe"
+    # after a match, also capture the lighting as a native Max Scene State
+    # (Light Properties + Light Transforms + Environment) so each camera's look
+    # lives in the .max file and restores from Tools > Manage Scene States
+    capture_scene_states: bool = True
     auto_exposure_control: bool = True       # create a V-Ray exposure control if none exists
     system_python: str = ""                  # optional Pillow-equipped python for the sidecar
     loop_width: int = 480                    # iteration-render size (speed over beauty)

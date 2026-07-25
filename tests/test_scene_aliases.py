@@ -312,3 +312,31 @@ def test_matched_prop_reports_the_write_target_get_prop_skips(rt):
     obj.arm_get("multiplier")                                        # isProperty True, getattr raises
     assert sc.matched_prop(obj, sc.LIGHT_MULT) == "multiplier"       # tracks the write target
     assert sc.get_prop(obj, sc.LIGHT_MULT) == 2.0                    # skips armed, reads next
+
+
+# ===================================================================== Max Scene States
+def test_scene_state_name_is_namespaced_and_filesystem_safe():
+    from maxgaffer.maxbridge import scene as s
+    assert s.scene_state_name("PhysCam_Hero") == "MG_PhysCam_Hero"
+    assert s.scene_state_name("Cam 01/A") == "MG_Cam_01_A"      # spaces and slashes
+    assert s.scene_state_name("").startswith("MG_")              # never a bare prefix
+
+
+def test_scene_state_parts_exclude_geometry_and_materials():
+    """A LIGHTING tool must never capture a state whose restore reverts the artist's
+    models or shaders — only light properties, light transforms and the environment
+    (which carries the exposure control)."""
+    from maxgaffer.maxbridge import scene as s
+    assert set(s.SCENE_STATE_PARTS) == {"Light Properties", "Light Transforms",
+                                        "Environment"}
+    for banned in ("Object Properties", "Materials", "Layer Properties",
+                   "Camera Transforms"):
+        assert banned not in s.SCENE_STATE_PARTS
+
+
+def test_scene_state_helpers_degrade_off_max():
+    """No pymxs: report nothing, capture nothing, restore False — never raise."""
+    from maxgaffer.maxbridge import scene as s
+    assert s.list_scene_states() == []
+    assert s.capture_scene_state("AnyCam") is None
+    assert s.restore_scene_state("AnyCam") is False

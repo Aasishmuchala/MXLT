@@ -184,6 +184,19 @@ class Controller:
     def _record_match(self, camera_name: str, state: LightingState,
                       score: Optional[float]) -> None:
         self.session.record_match(camera_name, state, score, self._camera_id(camera_name))
+        # Also leave a NATIVE Max Scene State. The rig is global — one sun, one dome, one
+        # exposure control — so only one camera's look can be live at a time, and the
+        # sidecar that remembers the rest is the PLUGIN's memory. A Scene State is Max's:
+        # it saves inside the .max file, restores from Tools > Manage Scene States without
+        # MaxGaffer installed, and travels to whoever opens the scene. Captures Light
+        # Properties + Light Transforms + Environment only, so restoring a lighting state
+        # can never revert the artist's geometry or shaders. Best-effort by design: an
+        # older Max without the interface must not fail a finished match.
+        if getattr(self.cfg, "capture_scene_states", True):
+            try:
+                sc.capture_scene_state(camera_name)
+            except Exception:  # noqa: BLE001 — bookkeeping must never sink a good match
+                pass
 
     def camera_fingerprint(self) -> Tuple:
         return tuple((c.get("id", ""), c.get("name", ""), c.get("class", ""))

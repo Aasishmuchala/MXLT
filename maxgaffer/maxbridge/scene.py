@@ -644,3 +644,84 @@ def report_aliases(rig: Dict, record: bool = False) -> Dict[str, Optional[str]]:
         global LAST_ALIASES
         LAST_ALIASES = aliases
     return aliases
+
+
+# ------------------------------------------------------------------ Max Scene States
+#: The Scene-State parts a lighting match owns. "Light Properties" carries intensity,
+#: colour, turbidity and the on/off flags; "Light Transforms" carries where the sun and
+#: dome actually point; "Environment" carries the exposure control and the environment
+#: map. Deliberately NOT object/material/layer parts — a lighting tool must never restore
+#: a state that also reverts the artist's geometry or shaders.
+SCENE_STATE_PARTS = ("Light Properties", "Light Transforms", "Environment")
+
+#: Namespaced so a MaxGaffer state can never be confused with the artist's own.
+SCENE_STATE_PREFIX = "MG_"
+
+
+def scene_state_name(camera_name: str) -> str:
+    """The Scene-State name a camera's match is captured under."""
+    safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in str(camera_name))
+    return f"{SCENE_STATE_PREFIX}{safe or 'camera'}"
+
+
+def list_scene_states() -> List[str]:
+    """Every Scene State in the file (MaxGaffer's and the artist's). [] off-Max."""
+    try:
+        rt = _rt()
+        mgr = rt.sceneStateMgr
+        return [str(mgr.GetSceneState(i)) for i in range(int(mgr.GetCount()))]
+    except Exception:
+        return []
+
+
+def capture_scene_state(camera_name: str) -> Optional[str]:
+    """Capture this camera's matched lighting as a NATIVE Max Scene State.
+
+    The plugin's sidecar already remembers a state per camera, but that memory is the
+    plugin's. A Scene State lives in the .max file: it survives without MaxGaffer, it is
+    restorable from Tools > Manage Scene States, and it travels to whoever opens the
+    scene — which is what a multi-camera archviz project actually needs, because the rig
+    itself is global (one sun, one dome, one exposure control) and only one camera's look
+    can be live at a time.
+
+    Re-capturing replaces the previous state of the same name. → the name, or None when
+    the interface is unavailable (older Max, or off-Max)."""
+    name = scene_state_name(camera_name)
+    try:
+        rt = _rt()
+        mgr = rt.sceneStateMgr
+    except Exception:
+        return None
+    parts = None
+    try:                                   # the parts array the interface expects
+        parts = rt.execute("#(\"" + "\", \"".join(SCENE_STATE_PARTS) + "\")")
+    except Exception:
+        parts = None
+    try:
+        for existing in list_scene_states():   # replace, never accumulate duplicates
+            if existing == name:
+                try:
+                    mgr.Delete(name)
+                except Exception:
+                    pass
+                break
+        if parts is not None:
+            mgr.Capture(name, parts)
+        else:
+            mgr.CaptureAllParts(name)
+        return name if name in list_scene_states() else None
+    except Exception:
+        return None
+
+
+def restore_scene_state(camera_name: str) -> bool:
+    """Restore a camera's captured lighting Scene State. False when it does not exist."""
+    name = scene_state_name(camera_name)
+    try:
+        rt = _rt()
+        if name not in list_scene_states():
+            return False
+        rt.sceneStateMgr.Restore(name)
+        return True
+    except Exception:
+        return False
