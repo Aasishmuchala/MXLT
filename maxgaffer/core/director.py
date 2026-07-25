@@ -631,6 +631,7 @@ def run_polish(
     # a whole frame.
     seen: Dict[tuple, Optional[float]] = {}
     memo_components: Dict[tuple, Dict[str, float]] = {}
+    stats_of: Dict[tuple, Dict] = {}
     memo_hits = 0
 
     def _memo_key(st: LightingState) -> tuple:
@@ -664,10 +665,12 @@ def run_polish(
         hooks._last_polish_components = dict(verdict.components)
         seen[key] = verdict.score
         memo_components[key] = dict(verdict.components)
+        stats_of[key] = st            # the frame's measurements, for the tonal re-solve
         return verdict.score
 
     seen[_memo_key(state)] = score_now      # the seed state is already measured
     hops_used = 0                           # azimuth basin hops taken (bounded)
+    resolved_tonally = False                # the coordinated tonal jump, once
 
     # The ANALYTIC LEASH also binds polish. The loop clamps its EV/WB solve to a window
     # around the run's start state, because matching histograms of DIFFERENT scenes biases
@@ -842,6 +845,62 @@ def run_polish(
                             hooks._polish_best_components = dict(
                                 getattr(hooks, "_last_polish_components", {}))
                             improved_any = escaped = True
+
+                if not escaped:
+                    # TONAL RE-SOLVE. The tonal group (ev / wb / dome / turbidity) can sit
+                    # in a COUPLED local optimum where reaching the truth needs all four to
+                    # move at once — dome down, turbidity up, WB down, EV down — while any
+                    # single one alone goes downhill first. Measured on-box 2026-07-25 once
+                    # geometry was exact (azimuth 105.0 against a 105 target): polish probed
+                    # turbidity 7x, EV 6x and WB 5x across 8 rounds and kept the SCRAMBLED
+                    # values, gaining +1.02, because no one-axis move pays.
+                    #
+                    # The analytic solver does not walk — it COMPUTES ev/wb straight from
+                    # the histogram and highlight chromaticity. Re-solving them together
+                    # against the current frame is exactly the coordinated jump the line
+                    # search cannot make, and pairing it with a dome/turbidity step makes it
+                    # the 4-way move the landscape demands.
+                    best_stats_here = stats_of.get(_memo_key(best))
+                    if (best_stats_here is not None and not resolved_tonally
+                            and "exposure.ev" in best.values
+                            and probes < cfg.polish_max_probes):
+                        ev_now = best.get("exposure.ev")
+                        wb_now = best.get("exposure.wb_kelvin", 6500.0)
+                        ev_new = solver.solve_ev(ref_stats, best_stats_here, ev_now)
+                        wb_new = solver.solve_wb(ref_stats, best_stats_here, wb_now)
+                        # pair the computed tonal jump with the ambient/haze partners that
+                        # have to move with it, so the whole group travels together
+                        for dome_mult, turb_step in ((1.0, 0.0), (0.5, 1.0), (0.35, 2.0)):
+                            if escaped or hooks.should_cancel() \
+                                    or probes >= cfg.polish_max_probes:
+                                break
+                            cand = best.copy()
+                            if ev_new is not None and "exposure.ev" not in locks:
+                                cand.set("exposure.ev", ev_new)
+                            if wb_new is not None and "exposure.wb_kelvin" not in locks:
+                                cand.set("exposure.wb_kelvin", wb_new)
+                            if dome_mult != 1.0 and "dome.intensity" in cand.values \
+                                    and "dome.intensity" not in locks:
+                                cand.set("dome.intensity",
+                                         cand.get("dome.intensity") * dome_mult)
+                            if turb_step and "sun.turbidity" in cand.values \
+                                    and "sun.turbidity" not in locks:
+                                cand.set("sun.turbidity",
+                                         cand.get("sun.turbidity") + turb_step)
+                            sc = measure(cand, f"polish{rnd}_tonal{int(dome_mult * 100)}")
+                            if sc is not None and sc > best_score + cfg.polish_min_gain:
+                                hooks.log(
+                                    f"polish: tonal re-solve (ev→{cand.get('exposure.ev'):.2f} "
+                                    f"wb→{cand.get('exposure.wb_kelvin'):.0f} "
+                                    f"dome×{dome_mult:g} turb+{turb_step:g}) · "
+                                    f"{best_score:.2f}→{sc:.2f} ✓")
+                                best, best_score = cand, sc
+                                hooks._polish_best_components = dict(
+                                    getattr(hooks, "_last_polish_components", {}))
+                                improved_any = escaped = True
+                                for k, s0, _l, _f in axes:   # fresh descent from the jump
+                                    steps[k] = s0
+                        resolved_tonally = True   # one coordinated jump per polish run
 
                 if not escaped:
                     # AZIMUTH BASIN HOP. Sun azimuth is the one genuinely MULTI-MODAL

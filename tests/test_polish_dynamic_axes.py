@@ -264,3 +264,49 @@ def test_polish_without_a_leash_ref_is_unbounded_as_before(monkeypatch):
     st.set("exposure.wb_kelvin", 6500.0)
     best, _s, _p, _c, _pr = run_polish(st, score_fn(st), {"grid": [0] * 9}, w.hooks, _cfg())
     assert best.get("exposure.wb_kelvin") > 9500.0
+
+
+# ------------------------------------------------------------------ tonal re-solve
+def test_polish_tonal_resolve_escapes_a_coupled_optimum(monkeypatch):
+    """The tonal group (ev/wb/dome/turbidity) can sit in a COUPLED local optimum where the
+    truth needs all of them to move at once and any one alone goes downhill. Measured
+    on-box 2026-07-25 with geometry already exact: polish probed turbidity 7x, EV 6x and
+    WB 5x over 8 rounds and kept the scrambled values, gaining +1.02. The analytic solver
+    COMPUTES ev/wb rather than walking to them, so re-solving is the coordinated jump."""
+    target = {"ev": -4.0, "dome": 0.55}
+
+    def score_fn(state):
+        if state is None:
+            return 50.0
+        ev, dome = state.get("exposure.ev"), state.get("dome.intensity")
+        de, dd = abs(ev - target["ev"]), abs(dome - target["dome"])
+        # a ridge: only moving BOTH together pays; either alone is worse than staying
+        return 95.0 - 12.0 * max(de, dd) - 8.0 * abs(de - dd)
+
+    w = _World(monkeypatch, score_fn)
+    # solve_ev returns the computed EV straight away — the jump the line search can't make
+    monkeypatch.setattr(director.solver, "solve_ev",
+                        lambda ref, cur, now, **kw: target["ev"])
+    monkeypatch.setattr(director.solver, "solve_wb", lambda ref, cur, now, **kw: None)
+    st = LightingState()
+    st.set("exposure.ev", -2.87)          # the measured stuck values
+    st.set("dome.intensity", 1.71)
+    best, score, _p, _c, _pr = run_polish(st, score_fn(st), {"grid": [0] * 9}, w.hooks,
+                                          _cfg(polish_rounds=10))
+    assert best.get("exposure.ev") == pytest.approx(target["ev"], abs=0.5)
+    assert best.get("dome.intensity") < 1.2, best.get("dome.intensity")
+    assert score > score_fn(st) + 5.0
+
+
+def test_tonal_resolve_runs_at_most_once_per_polish(monkeypatch):
+    """One coordinated jump per run — it must not become a per-round reset loop."""
+    calls = []
+    monkeypatch.setattr(director.solver, "solve_ev",
+                        lambda ref, cur, now, **kw: calls.append(1) or None)
+    monkeypatch.setattr(director.solver, "solve_wb", lambda ref, cur, now, **kw: None)
+    w = _World(monkeypatch, lambda s: 50.0)          # flat: never improves, always stalls
+    st = LightingState()
+    st.set("exposure.ev", 10.0)
+    st.set("dome.intensity", 1.0)
+    run_polish(st, 50.0, {"grid": [0] * 9}, w.hooks, _cfg(polish_rounds=12))
+    assert len(calls) <= 1, f"tonal re-solve fired {len(calls)} times"
