@@ -989,7 +989,12 @@ class Controller:
                     "(renderer-independent; V-Ray GPU's exposure is display-stage only)")
 
             def render_hook(tag: str):
-                is_sweep = tag.startswith("sweep")
+                # DIRECTION-solving stages render small. They are comparing where the light
+                # falls, not judging tone, and there are dozens of them: the global sun
+                # solve alone probes up to 56. Measured — it was rendering at full loop
+                # size because its tags start with "sunsolve" rather than "sweep", which
+                # turned a two-minute stage into most of a fifty-minute match.
+                is_sweep = tag.startswith(("sweep", "sunsolve"))
                 width = profile.sweep_width if is_sweep else profile.loop_width
                 height = profile.sweep_height if is_sweep else profile.loop_height
                 path = self._render_exposed(

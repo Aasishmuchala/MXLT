@@ -148,3 +148,18 @@ def test_a_weak_solve_does_not_get_defended_at_full_strength():
     seg = src[src.index("sunsolve.solve_sun_angles("):]
     assert 'TRANSFER_WEIGHT * max(' in seg[:2200]
     assert 'sem_live["sun_bearing_agreement"] = solved["confidence"]' in seg[:2200]
+
+
+def test_the_solve_renders_at_sweep_size_not_loop_size():
+    """It probes up to 56 directions and is comparing WHERE the light falls, not judging
+    tone. Measured: because its tags start with "sunsolve" rather than "sweep" it was
+    rendering at full loop resolution, turning a two-minute stage into most of a
+    fifty-minute match."""
+    import inspect
+
+    from maxgaffer.maxbridge.controller import Controller
+
+    src = inspect.getsource(Controller.run_match)
+    hook = src[src.index("def render_hook("):src.index("def apply_hook(")]
+    assert 'tag.startswith(("sweep", "sunsolve"))' in hook
+    assert "profile.sweep_width" in hook
