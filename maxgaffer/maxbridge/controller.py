@@ -23,7 +23,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from ..core import (animation, consensus, critic, domeseed, expose, fairness, feedback,
                     transfer,
                     metrics, omega, planner, profiles, prompts, providers, rules,
-                    scenedigest, scenarios as scen)
+                    scenedigest, sunsolve, scenarios as scen)
 from ..core.director import (Hooks, MatchConfig, MatchResult, TRANSFER_WEIGHT,
                              blend_transfer, run_match, run_sun_sweep)
 from ..core.genome import LightingState
@@ -1093,6 +1093,44 @@ class Controller:
                 locks = set(locks) | {"sun.enabled"}
                 log("sun locked ON for this match (the starting rig is sunlit — it may "
                     "be dimmed, not switched off)")
+
+            # GLOBAL SUN SOLVE, before the sweep and usually instead of it. Sun direction
+            # was this plugin's worst failure and it was being attacked with local search:
+            # measured across four runs of ONE golden-hour interior, azimuth came back 2.8,
+            # 171, 168 and 78 degrees out. The strategy was never the problem — nothing
+            # could TELL. The critic's only spatial descriptor was an averaged luminance
+            # grid, which scored a 171-degree error 0.922 and a 13.5-degree error 0.917.
+            # Patch agreement separates those same states 0.912 against 0.546, and with a
+            # measure that discriminates, two bounded angles are cheaper to SOLVE on a grid
+            # than to hill-climb. A grid cannot land in a local optimum.
+            solved: Optional[Dict] = None
+            if start_override is None and rig.get("sun") is not None \
+                    and ref_stats is not None and not should_cancel():
+                solved = sunsolve.solve_sun_angles(
+                    start, ref_stats, hooks.apply, hooks.render, self.stats_for,
+                    log=log, should_cancel=should_cancel, locks=locks)
+            if solved is not None and solved.get("confidence", 0.0) >= 0.5:
+                start.set("sun.azimuth_deg", solved["azimuth_deg"])
+                if solved.get("altitude_deg") is not None \
+                        and "sun.altitude_deg" not in locks \
+                        and "sun.altitude_deg" in start.values:
+                    start.set("sun.altitude_deg", solved["altitude_deg"])
+                hooks.apply(start)
+                self._sw_state = start
+                # the objective is aimed at what was MEASURED here, at this solve's own
+                # resolution, so it neither fights the answer nor defends it more precisely
+                # than the grid can justify
+                if sem_live is not None:
+                    sem_live["sun_bearing_deg"] = round(
+                        (solved["azimuth_deg"] - cam_yaw + 180.0) % 360.0 - 180.0, 1)
+                    sem_live["sun_bearing_slack_deg"] = 15.0
+                    sem_live["sun_bearing_agreement"] = solved["confidence"]
+                    cfg_kw["transfer_weight"] = TRANSFER_WEIGHT * max(
+                        0.25, min(1.0, solved["confidence"]))
+                do_sweep = False          # the better instrument already answered
+            elif solved is not None:
+                log("sun solve was not decisive — falling back to the sweep, and the "
+                    "answer will be held loosely either way")
 
             if do_sweep and start_override is None and rig.get("sun") is not None \
                     and "sun.azimuth_deg" not in locks:
