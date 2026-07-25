@@ -241,6 +241,10 @@ class MatchResult:
     stop_reason: str
     iterations: List[IterationRecord] = field(default_factory=list)
     transfer: Optional[Dict] = None     # lighting-TRANSFER reading (see core.transfer)
+    highlight: Optional[float] = None   # sun-patch agreement 0..1 (metrics.highlight_
+                                        # similarity) — reported beside the score because
+                                        # the weighted critic's averaged grids cannot see
+                                        # a bright directional patch at all
     objective_score: Optional[float] = None   # what the SEARCH steered on: the pixel score
                                         # blended with agreement to the reference's lighting
                                         # reading. Kept for diagnosis, never the headline —

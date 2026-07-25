@@ -231,3 +231,53 @@ def test_the_reported_score_is_pixel_similarity_not_the_search_objective():
     assert "result.objective_score = result.best_score" in src
     assert "result.best_score = verdict.score" in src, (
         "the headline number must be the plain pixel similarity the artist can verify")
+
+
+# ------------------------------------------------- the critic cannot see a sun patch
+def test_highlight_similarity_sees_what_the_direction_component_cannot():
+    """Measured on-box 2026-07-25 on a golden-hour interior: the reference carried sun
+    patches in 15 of 25 cells at 17.3% of the frame, the match carried hot pixels in 3 —
+    all of them the blown window itself, no floor patch, no wall patch, no directional
+    light anywhere. Unmistakable side by side. The critic's direction component scored the
+    pair 0.92, because averaging a grid cell is exactly what erases a small very bright
+    patch. This reads 0.56."""
+    from maxgaffer.core.metrics import highlight_similarity
+
+    def stats(frac, grid):
+        return {"hot_frac": frac, "hot_grid": grid}
+
+    patches = [0.0] * 25
+    for c in (5, 6, 10, 11, 15, 16):        # sun raking across the lower-left floor
+        patches[c] = 1.0 / 6
+    window = [0.0] * 25
+    for c in (3, 8, 13):                     # only the blown window, no cast light
+        window[c] = 1.0 / 3
+
+    assert highlight_similarity(stats(0.17, patches), stats(0.17, patches)) == 1.0
+    wrong = highlight_similarity(stats(0.17, patches), stats(0.058, window))
+    assert wrong < 0.7, wrong
+
+
+def test_a_rig_with_no_sun_patch_scores_zero_not_unmeasurable():
+    """Same rule as the transfer metric: the candidate must not be able to delete a
+    criterion by giving up on it. No directional light against a reference full of it is a
+    total miss, not an absent measurement."""
+    from maxgaffer.core.metrics import highlight_similarity
+
+    lit = {"hot_frac": 0.17, "hot_grid": [0.04] * 25}
+    dark = {"hot_frac": 0.0, "hot_grid": [0.0] * 25}
+    assert highlight_similarity(lit, dark) == 0.0
+    assert highlight_similarity(dark, dark) == 1.0      # both overcast: they agree
+    assert highlight_similarity({}, lit) is None        # stats predating the map
+
+
+def test_the_match_reports_sun_patch_agreement_beside_the_score():
+    import inspect
+
+    from maxgaffer.core.director import MatchResult
+    from maxgaffer.maxbridge.controller import Controller
+
+    assert hasattr(MatchResult(best_state=None, best_score=None, best_render=None,
+                               stop_reason="x"), "highlight")
+    assert "highlight_similarity(ref_stats, honest)" in inspect.getsource(
+        Controller.run_match)

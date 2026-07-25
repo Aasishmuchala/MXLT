@@ -1238,6 +1238,21 @@ class Controller:
                     result.objective_score = result.best_score
                     result.best_score = verdict.score
                     result.best_components = verdict.components
+                    # SUN-PATCH agreement, reported beside the score because the score
+                    # cannot see it. The weighted critic averages its grid cells, which is
+                    # what erases a sun patch: measured on-box 2026-07-25, a match with no
+                    # directional light anywhere scored 0.92 on the direction component
+                    # against a reference covered in golden floor patches. This reads 0.56
+                    # on that same pair. Diagnostic ONLY for now — folding it into the
+                    # weighted score changes every number in the archetype matrix and has
+                    # to be validated across all of them first.
+                    hi = metrics.highlight_similarity(ref_stats, honest)
+                    if hi is not None:
+                        result.highlight = hi
+                        if hi < 0.75:
+                            log(f"⚠ sun-patch agreement {hi:.0%} — the reference's bright "
+                                f"directional light is not landing the same way in this "
+                                f"match. The score above cannot see this; your eyes can.")
             except Exception:  # noqa: BLE001 — never sink a match over the readout
                 pass
             self._record_match(camera_name, result.best_state, result.best_score)

@@ -124,6 +124,16 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
     # 3×3 luminance grid — WHERE the light lives. Unlike content-bound structure metrics,
     # the bright-third pattern transfers across different scenes lit the same way (sun
     # camera-left brightens the left cells of ref AND render) — the critic's direction eye.
+    # SUN-PATCH map: how much of the frame is a bright directional highlight, and WHERE.
+    # The luminance grids average their cells, which is exactly what erases a sun patch —
+    # a patch is small and very bright, and a cell mean cannot tell it from the whole cell
+    # being slightly brighter. Measured on-box 2026-07-25: a match with NO sun patches at
+    # all scored 0.92 on the direction component against a reference covered in them.
+    # Absolute threshold, not a percentile: a percentile would give every image the same
+    # hot fraction by construction and measure nothing.
+    hot_cells = [0] * 25
+    hot_total = 0
+
     grid_sum = [0.0] * 9
     grid_n = [0] * 9
     g5_sum = [0.0] * 25
@@ -161,6 +171,9 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
         grid_n[cell] += 1
         grid_log_sum[cell] += log_l          # same cell, log-luminance (spatial descriptor)
         c5 = min(4, x * 5 // max(1, w)) + 5 * min(4, y * 5 // max(1, h))
+        if lum > HOT_THRESHOLD:
+            hot_cells[c5] += 1
+            hot_total += 1
         g5_sum[c5] += lum
         g5_n[c5] += 1
         g5_log_sum[c5] += log_l
@@ -252,6 +265,9 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
         "mean_rgb": [v / n / 255.0 for v in mean_rgb],
         "grid": [round(g, 5) for g in grid],   # mean-centered 3×3 luminance pattern
         "grid5": [round(g, 5) for g in grid5],  # 5×5 — finer directional acuity
+        # sun-patch presence and placement (see HOT_THRESHOLD)
+        "hot_frac": round(hot_total / n, 5),
+        "hot_grid": [round(c / hot_total, 5) for c in hot_cells] if hot_total else [0.0] * 25,
         # illuminant ESTIMATES (unit RGB, linear) under the gray-world / gray-edge
         # assumption — advisory WB cues, deliberately OUTSIDE the weighted critic score;
         # [0,0,0] means "unavailable" (degenerate/flat frame)
@@ -278,6 +294,41 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
         "hue_hist": [v / hue_total for v in hue_hist] if hue_total > 0 else [0.0] * HUE_BINS,
         "saturation": hue_total / n,
     }
+
+
+#: Display luminance above which a pixel counts as a bright directional highlight. Sun
+#: patches, specular hits and blown windows sit here; lit walls and floors do not.
+HOT_THRESHOLD = 0.72
+
+
+def highlight_similarity(ref: Dict, cur: Dict) -> Optional[float]:
+    """Do both frames carry the same amount of bright directional light, in the same
+    places? → 0..1, or None when neither side reports the map.
+
+    This is the signal the weighted critic is missing. Measured on-box 2026-07-25 on a
+    golden-hour interior: the reference carried sun patches in 15 of 25 cells at 17.3% of
+    the frame; the match carried hot pixels in 3 cells at 5.8%, and all three were the
+    blown window itself — no floor patch, no wall patch, no directional light anywhere.
+    The two are unmistakable side by side. The critic's direction component scored them
+    0.92.
+
+    A rig that switches its sun off scores ZERO here, never "unmeasurable" — the candidate
+    must not be able to delete a criterion by giving up on it."""
+    if not isinstance(ref, dict) or not isinstance(cur, dict):
+        return None
+    if "hot_frac" not in ref or "hot_frac" not in cur:
+        return None                       # stats predate the map — nothing to compare
+    fr, fc = float(ref["hot_frac"]), float(cur["hot_frac"])
+    if fr <= 0.0 and fc <= 0.0:
+        return 1.0                        # both overcast: they agree there is no sun patch
+    if fr <= 0.0 or fc <= 0.0:
+        return 0.0                        # one has directional light and the other has none
+    # presence, in octaves — 3x more or less sun patch is a different photograph
+    octaves = abs(math.log2(fr / fc))
+    presence = max(0.0, 1.0 - octaves / 2.0)
+    # placement: where the patches landed
+    placement = (cosine(ref.get("hot_grid") or [], cur.get("hot_grid") or []) + 1.0) / 2.0
+    return round(0.5 * presence + 0.5 * placement, 4)
 
 
 # --------------------------------------------------------------------------- comparisons
