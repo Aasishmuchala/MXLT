@@ -97,8 +97,12 @@ def call(provider: str, key: str, system: str, messages: list, *, model: str,
          max_tokens: int = 8192, base_url: str = "", post: Optional[Callable] = None,
          timeout: int = omega.TIMEOUT_S) -> str:
     kind = str(provider or "omega").strip().lower().replace("-", "_")
-    if kind in ("omega", "kesar", "kesarcloud"):
-        kwargs = {"model": model, "max_tokens": max_tokens}
+    if kind in ("omega", "omega_plus", "omegaplus", "kesar", "kesarcloud"):
+        # base_url was accepted and then DROPPED here, so a user who pasted a gateway URL
+        # into Settings got the shipped default with no warning. It is threaded now: blank
+        # keeps omega.GATEWAY_URL, and either docs form (".../v1" or ".../v1/messages")
+        # resolves correctly.
+        kwargs = {"model": model, "max_tokens": max_tokens, "base_url": base_url}
         if post is not None:
             kwargs["post"] = post
         return omega.call(key, system, messages, **kwargs)

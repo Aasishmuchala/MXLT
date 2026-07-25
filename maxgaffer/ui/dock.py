@@ -1697,7 +1697,9 @@ class SettingsDialog(QtWidgets.QDialog):
             io_runner = getattr(self.parent(), "_run_blocking_io", None)
             run = io_runner or (lambda fn: fn())   # standalone use: no pump available
             if provider == "omega":
-                self.lbl_status.setText(run(lambda: ping(key, model)))
+                # honour the Settings base-URL for omega too — Test gateway must probe
+                # the endpoint the match will actually use, not the shipped default
+                self.lbl_status.setText(run(lambda: ping(key, model, base_url=base_url)))
             else:
                 self.lbl_status.setText(run(
                     lambda: providers.ping(provider, key, model, base_url)))

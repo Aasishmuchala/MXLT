@@ -137,7 +137,7 @@ def test_busy_camera_switch_reverts_combo(dock):
 def test_test_gateway_routes_through_io_worker(dock, monkeypatch):
     from maxgaffer.ui import dock as dockmod
 
-    monkeypatch.setattr(dockmod, "ping", lambda key, model: "gateway reachable: 'OK'")
+    monkeypatch.setattr(dockmod, "ping", lambda key, model, **kw: "gateway reachable: 'OK'")
     used = []
     real_io = dock._run_blocking_io
     monkeypatch.setattr(dock, "_run_blocking_io",
@@ -158,7 +158,7 @@ def test_test_gateway_ping_runs_off_the_main_thread(dock, monkeypatch):
     main_thread = threading.current_thread()
     seen = []
 
-    def _ping(key, model):
+    def _ping(key, model, **kw):
         seen.append(threading.current_thread())
         return "gateway reachable: 'OK'"
 

@@ -46,7 +46,10 @@ class Config:
     api_key: str = ""                        # oc_ gateway key
     model: str = "claude-opus-4-8"           # vision-capable — the loop shows it images
     semantic_provider: str = "omega"          # omega | anthropic | openai | openai_compatible | offline
-    semantic_base_url: str = ""               # required only for compatible/local endpoints
+    # blank = each provider's shipped default. For "omega" this overrides the Omega Plus
+    # endpoint and accepts either docs form (".../v1" or ".../v1/messages"), so a gateway
+    # move is a Settings edit, not a code change.
+    semantic_base_url: str = ""
     vantage_exe: str = r"C:\Program Files\Chaos\Vantage\vantage.exe"
     # Vantage 3.x REMOVED stock command-line rendering (Chaos support-confirmed; it now
     # needs the Developer Edition). Default backend renders finals through V-Ray in Max —

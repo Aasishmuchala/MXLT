@@ -249,7 +249,7 @@ def test_settings_save_failure_logged(dock, monkeypatch):
 def test_test_gateway_routes_through_io_worker(dock, monkeypatch):
     from maxgaffer.ui import dock as dockmod
 
-    monkeypatch.setattr(dockmod, "ping", lambda key, model: "gateway reachable: 'OK'")
+    monkeypatch.setattr(dockmod, "ping", lambda key, model, **kw: "gateway reachable: 'OK'")
     used = []
     real_io = dock._run_blocking_io
     monkeypatch.setattr(dock, "_run_blocking_io",
@@ -266,7 +266,7 @@ def test_test_gateway_failure_lands_in_label(dock, monkeypatch):
     from maxgaffer.ui import dock as dockmod
     from maxgaffer.core.omega import OmegaError
 
-    def _down(key, model):
+    def _down(key, model, **kw):
         raise OmegaError("gateway down", "network")
 
     monkeypatch.setattr(dockmod, "ping", _down)

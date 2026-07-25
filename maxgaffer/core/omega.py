@@ -21,7 +21,12 @@ import random
 import time
 from typing import Optional
 
-GATEWAY_URL = "https://omega.kesarcloud.in/v1/messages"
+#: Default Omega Plus messages endpoint (Anthropic-compatible wire, Bearer auth). The
+#: docs print the base as ".../v1"; the messages path is appended by resolve_url, which
+#: also honours a user-configured override so a future endpoint move needs no code change.
+#: (Was omega.kesarcloud.in until 2026-07-25 — same vendor, new host.)
+GATEWAY_BASE_URL = "https://api.omegaplusapi.com/v1"
+GATEWAY_URL = GATEWAY_BASE_URL + "/messages"
 TIMEOUT_S = 120
 BACKOFF_S = (2.0, 6.0, 15.0)
 DEFAULT_MODEL = "claude-opus-4-8"
@@ -105,6 +110,18 @@ def _default_post(url: str, headers: dict, body: bytes, timeout: int) -> tuple:
         return e.code, e.read().decode("utf-8", errors="replace")
 
 
+def resolve_url(base_url: str = "") -> str:
+    """The messages endpoint for an optional configured base. Accepts EITHER the
+    Anthropic-compatible base as the Omega Plus docs print it (``https://api.
+    omegaplusapi.com/v1``) or a full ``.../v1/messages`` endpoint, so a user pasting
+    either form from the docs into Settings gets a working gateway. Blank → the shipped
+    default."""
+    url = str(base_url or "").strip().rstrip("/")
+    if not url:
+        return GATEWAY_URL
+    return url if url.endswith("/messages") else url + "/messages"
+
+
 def call(
     key: str,
     system: str,
@@ -112,9 +129,11 @@ def call(
     model: str = DEFAULT_MODEL,
     max_tokens: int = 8192,
     post=_default_post,
+    base_url: str = "",
 ) -> str:
     """One resilient gateway round; returns the reply TEXT. Raises OmegaError with a typed
-    kind (auth | network | other) on failure. ``post`` is injectable for tests."""
+    kind (auth | network | other) on failure. ``post`` is injectable for tests.
+    ``base_url`` overrides the shipped endpoint (config.semantic_base_url)."""
     if not key:
         raise OmegaError("No API key set — paste your oc_ key in MaxGaffer's settings.", "auth")
     body = json.dumps(
@@ -140,7 +159,7 @@ def call(
         status = None
         text_body = ""
         try:
-            status, text_body = post(GATEWAY_URL, headers, body, TIMEOUT_S)
+            status, text_body = post(resolve_url(base_url), headers, body, TIMEOUT_S)
         except Exception as e:  # noqa: BLE001 network layer surfaces as a retryable miss
             last = f"network error: {e}"
         if status is not None:
@@ -200,9 +219,11 @@ def image_block_from_file(path: str, max_bytes: int = 3_500_000) -> Optional[dic
         return None
 
 
-def ping(key: str, model: str = DEFAULT_MODEL, post=_default_post) -> str:
+def ping(key: str, model: str = DEFAULT_MODEL, post=_default_post,
+         base_url: str = "") -> str:
     text = call(
         key, "Reply with exactly the two characters: OK",
         [{"role": "user", "content": "ping"}], model=model, max_tokens=16, post=post,
+        base_url=base_url,
     )
     return f"gateway reachable ({model}): {text.strip()[:24]!r}"
