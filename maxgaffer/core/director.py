@@ -658,6 +658,11 @@ def run_match(
         result.best_state, result.best_score = p_state, p_score
         if getattr(hooks, "_polish_best_components", None):
             result.best_components = dict(hooks._polish_best_components)
+        # ...and the plate that state actually produced. Without this the artist is handed
+        # a render of a state the match discarded, and anything that scores best_render
+        # scores the wrong image.
+        if getattr(hooks, "_polish_best_render", None):
+            result.best_render = hooks._polish_best_render
         # NO trailing apply here — every run_polish return path already landed `best`;
         # re-applying the identical state is a no-op undo step (SPEC: one undo per apply)
         if converged and p_score < cfg.polish_stop_at:
@@ -691,6 +696,22 @@ def run_polish(
     best = state.copy()
     best_score = score_now
     hooks._polish_best_components = {}
+    hooks._polish_best_render = None
+    memo_render: Dict[tuple, Optional[str]] = {}
+
+    def _record_best() -> None:
+        """Pin BOTH halves of the winning probe: its components and the plate it produced.
+
+        Only the components were being kept. best_render therefore still pointed at the
+        LOOP's best plate after polish moved the state somewhere else entirely — measured
+        on-box 2026-07-25, a run whose polish gained 55.67 points saved a blown frame (81%
+        of pixels clipped, scoring 26.5 against the reference) as the 'best render' of a
+        state that actually renders at 91.2. It diverges in both directions: another run
+        saved a plate scoring 77.2 for a state whose own render scores 55.5."""
+        hooks._polish_best_components = dict(
+            getattr(hooks, "_last_polish_components", {}))
+        hooks._polish_best_render = getattr(hooks, "_last_polish_render", None)
+
     probes = 0
     axes = polish_axes(state)               # static params + this rig's groups/fog
     # dynamic ridge couples: EV can fake ANY dimmer group (measured 2026-07-24 on the
@@ -739,6 +760,8 @@ def run_polish(
             if cached is not None:
                 hooks._last_polish_components = dict(
                     memo_components.get(key, getattr(hooks, "_last_polish_components", {})))
+                hooks._last_polish_render = memo_render.get(
+                    key, getattr(hooks, "_last_polish_render", None))
             return cached
         if probes >= cfg.polish_max_probes:
             return None
@@ -749,7 +772,9 @@ def run_polish(
         st = hooks.stats(path)
         if st is None:
             return None
+        hooks._last_polish_render = path
         probes += 1
+        memo_render[key] = path
         verdict = critic.score(ref_stats, st, cfg.weights)
         verdict.score = blend_transfer(verdict.score, cand, hooks, cfg)
         hooks._last_polish_components = dict(verdict.components)
@@ -842,8 +867,7 @@ def run_polish(
                             hooks.log(f"polish: {key} {v:.2f}→{cand.get(key):.2f} · "
                                       f"{best_score:.2f}→{sc:.2f} ✓")
                             best, best_score = cand, sc
-                            hooks._polish_best_components = dict(
-                                getattr(hooks, "_last_polish_components", {}))
+                            _record_best()
                             improved_any = True
                             param_moved = True
                             stride *= 1.6          # keep riding the slope, faster
@@ -902,8 +926,7 @@ def run_polish(
                             cand.set(ka, va * (2.0 ** da) if is_log[ka] else va + da)
                             cand.set(kb, vb * (2.0 ** db) if is_log[kb] else vb + db)
                             best, best_score = cand, sc
-                            hooks._polish_best_components = dict(
-                                getattr(hooks, "_last_polish_components", {}))
+                            _record_best()
                             improved_any = escaped = True
                             # ride the valley: accelerate along the winning diagonal
                             # exactly like the single-axis climb does (stride ×1.6)
@@ -921,8 +944,7 @@ def run_polish(
                                 cand.set(ka, va * (2.0 ** da) if is_log[ka] else va + da)
                                 cand.set(kb, vb * (2.0 ** db) if is_log[kb] else vb + db)
                                 best, best_score = cand, sc2
-                                hooks._polish_best_components = dict(
-                                    getattr(hooks, "_last_polish_components", {}))
+                                _record_best()
                                 mult *= 1.6
                             break
                 if not escaped:
@@ -948,8 +970,7 @@ def run_polish(
                                       f"{cand.get(flag):.0f} · {best_score:.2f}→{sc:.2f} ✓ "
                                       "(discrete escape)")
                             best, best_score = cand, sc
-                            hooks._polish_best_components = dict(
-                                getattr(hooks, "_last_polish_components", {}))
+                            _record_best()
                             improved_any = escaped = True
 
                 if not escaped:
@@ -1027,8 +1048,7 @@ def run_polish(
                                 f"wb→{jump_best.get('exposure.wb_kelvin'):.0f}) · "
                                 f"{best_score:.2f}→{jump_score:.2f}, descending from here")
                             best, best_score = jump_best, jump_score
-                            hooks._polish_best_components = dict(
-                                getattr(hooks, "_last_polish_components", {}))
+                            _record_best()
                             improved_any = escaped = True
                             for k, s0, _l, _f in axes:   # fresh descent from the jump
                                 steps[k] = s0
@@ -1058,8 +1078,7 @@ def run_polish(
                                     f"{cand.get('sun.azimuth_deg'):.0f}° · "
                                     f"{best_score:.2f}→{sc:.2f} ✓")
                                 best, best_score = cand, sc
-                                hooks._polish_best_components = dict(
-                                    getattr(hooks, "_last_polish_components", {}))
+                                _record_best()
                                 improved_any = escaped = True
                                 hops_used += 1
                                 # a new basin deserves a fresh descent, not the fine

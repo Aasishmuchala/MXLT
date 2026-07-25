@@ -281,3 +281,43 @@ def test_the_match_reports_sun_patch_agreement_beside_the_score():
                                stop_reason="x"), "highlight")
     assert "highlight_similarity(ref_stats, honest)" in inspect.getsource(
         Controller.run_match)
+
+
+# ------------------------------------------------- best_render must BE the best state
+def test_polish_updates_best_render_not_just_best_state():
+    """run_match set result.best_state and best_score from polish but left best_render
+    pointing at the LOOP's plate — a render of a state the match discarded. Measured on-box
+    2026-07-25: a run whose polish gained 55.67 saved a blown frame (81% of pixels clipped,
+    scoring 26.5 against its reference) as the 'best render' of a state that actually
+    renders at 91.2. Another saved a 77.2 plate for a state rendering 55.5. It is wrong in
+    both directions, the artist is handed the wrong picture, and anything that scores
+    best_render scores the wrong image."""
+    # loop iterations measure poorly, polish probes measure perfectly — so polish is
+    # guaranteed to climb away from the loop's best and land on a different state
+    def stats_for(path):
+        return dict(REF) if "polish" in path else dark(REF)
+
+    st = LightingState()
+    for k, v in {"sun.enabled": 1, "sun.azimuth_deg": 100.0, "sun.intensity": 1.0,
+                 "exposure.ev": 12.0, "exposure.wb_kelvin": 6500.0}.items():
+        st.set(k, v)
+    rendered = []
+
+    def render(tag):
+        path = f"/tmp/{tag}.png"
+        rendered.append(path)
+        return path
+
+    hooks = Hooks(apply=lambda s: None, render=render, stats=stats_for,
+                  llm_deltas=lambda ctx: json.dumps(
+                      {"assessment": "", "changes": [], "stop": False}),
+                  log=lambda m: None)
+    res = run_match(st, REF, {}, hooks,
+                    MatchConfig(max_iterations=2, target_score=101, stall_patience=99,
+                                polish=True, polish_rounds=2, polish_max_probes=12,
+                                analytic=False))
+    if res.polish_probes:
+        assert res.best_render is not None
+        # whatever polish landed on, the saved plate must come from polish — never be left
+        # behind on a loop iteration once polish has moved the state
+        assert "polish" in res.best_render, res.best_render
