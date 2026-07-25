@@ -31,10 +31,14 @@ def test_hero_profile_has_strict_finite_render_cap():
     # measured exhausted with gains still coming, and the axis list is now dynamic —
     # groups + fog — so the budget covers more parameters). The cap stays FINITE and
     # explicit; that property, not the old constant, is what this test locks.
+    # sweep raised 6 -> 12 (2026-07-25): 6 directions is 60-degree resolution on the one
+    # decision that sets the basin, and on-box a true sun at 105 degrees could only be
+    # offered 60 or 120 — it picked 60 and the match ended 45 degrees out. Twelve extra
+    # half-res renders against a 500-probe polish budget is not where hero's time goes.
     p = resolve_profile("hero", loop_width=480, loop_height=270,
                         max_iterations=5, sweep_count=8, target_score=82)
     assert p.polish and p.polish_max_probes == 500 and p.target_score == 99
-    assert p.worst_case_renders == 8 + 6 + 500
+    assert p.worst_case_renders == 8 + 12 + 500
 
 
 def test_deep_is_hero_alias_and_unknown_is_rejected():

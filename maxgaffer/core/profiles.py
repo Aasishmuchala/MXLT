@@ -75,8 +75,15 @@ def resolve_profile(name: str, *, loop_width: int, loop_height: int,
         # deterministic in the state), and because polish STOPS when it proves a local
         # optimum: the deterministic sim converges at 185 probes from a bad basin, so this
         # is headroom for harder real landscapes, not a licence to grind.
+        # Sweep 12 directions, not 6. Six is 60-degree resolution, and the sweep's answer
+        # is the ONE decision that sets the basin everything downstream refines inside:
+        # measured on-box 2026-07-25 with locks applied, the true sun sat at 105 degrees
+        # and a 6-way sweep could only offer 60 or 120. It picked 60 and the match ended 45
+        # degrees out. Twelve small half-res renders against a 500-probe polish budget is
+        # not where this profile's time goes. Raised the way iterations already are — hero
+        # lifts a too-low setting rather than capping a generous one.
         return MatchProfile("hero", "Hero", width, height, sw, sh,
-                            max(iterations, 8), min(sweeps, 6), 99.0,
+                            max(iterations, 8), max(sweeps, 12), 99.0,
                             True, 24, 500, stall_patience=5)
 
     sw, sh = _scaled(width, height, 0.5, floor_w=192)

@@ -116,8 +116,14 @@ def score(semantics: Optional[Dict], state: Optional[LightingState],
             want_az = (_num(camera_yaw_deg) + _num(semantics.get("sun_bearing_deg"))) % 360.0
             got_az = _num(state.get("sun.azimuth_deg")) % 360.0
             err = _angle_delta(want_az, got_az)
-            # 15° is within a lighting artist's own margin; 90° is a different shot
-            parts["direction"] = max(0.0, 1.0 - max(0.0, err - 15.0) / 75.0)
+            # 15° is within a lighting artist's own margin; 90° is a different shot. When
+            # the bearing came from the SWEEP the tolerance widens to the sweep's own
+            # sampling step, because a measurement is no more precise than its interval —
+            # a 12-way sweep resolves 30°, so defending its answer to the nearest degree
+            # claims precision it does not have and pins the sun off-target inside a
+            # bracket the sweep genuinely could not separate.
+            slack = max(15.0, _num(semantics.get("sun_bearing_slack_deg"), 15.0))
+            parts["direction"] = max(0.0, 1.0 - max(0.0, err - slack) / 75.0)
             notes.append("sun bearing off by %.0f°" % err)
 
     # ---- elevation: against the analysed BAND, not a point value

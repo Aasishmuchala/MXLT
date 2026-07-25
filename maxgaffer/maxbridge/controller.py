@@ -1124,6 +1124,12 @@ class Controller:
                         # defends nor fights the measurement — the WEIGHT decides how hard
                         # it resists polish moving away from it.
                         sem_live["sun_bearing_deg"] = round(swept_bearing, 1)
+                        # ...to the resolution the sweep actually has. Inside half a step
+                        # the sweep cannot tell directions apart, so the objective must not
+                        # pretend it can — polish and the pixel term choose within the
+                        # bracket.
+                        sem_live["sun_bearing_slack_deg"] = max(
+                            15.0, 180.0 / max(2, profile.sweep_count))
                         # How hard, from how DECISIVE the sweep actually was. Asserting
                         # certainty here was a mistake and it cost a match: on an interior
                         # where every direction lit the room about equally the sweep landed

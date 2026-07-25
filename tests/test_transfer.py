@@ -301,3 +301,37 @@ def test_a_coin_flip_sweep_does_not_get_defended_at_full_strength():
     assert 'sweep_out.get("confidence"' in src
     assert 'sem_live["sun_bearing_agreement"] = 1.0' not in src, (
         "the sweep must not assert certainty it has not earned")
+
+
+def test_direction_tolerance_widens_to_the_sweeps_own_resolution():
+    """A measurement is no more precise than its sampling interval. The sweep samples every
+    360/N degrees, so its answer is +/- half a step at best; defending it to the nearest
+    degree claims precision it does not have. Measured on-box 2026-07-25 with locks: hero
+    swept 6 directions, the true sun sat at 105 degrees, the sweep could only offer 60 or
+    120, picked 60, and the objective then held the sun there — 45 degrees out."""
+    ref = dict(_sunlit_ref(), sun_bearing_deg=-60.0)     # camera_yaw 165 -> aim 105
+    off_by_25 = _rig(**{"sun.azimuth_deg": 80.0})
+
+    tight = transfer.score(ref, off_by_25, 165.0)["parts"]["direction"]
+    wide = transfer.score(dict(ref, sun_bearing_slack_deg=30.0),
+                          off_by_25, 165.0)["parts"]["direction"]
+    assert wide > tight, "a coarse sweep must not be defended as a point estimate"
+    assert wide == 1.0, "inside the sweep's own resolution there is nothing to penalise"
+    # but the slack never TIGHTENS below the artist margin, and a real miss still counts
+    assert transfer.score(dict(ref, sun_bearing_slack_deg=1.0),
+                          off_by_25, 165.0)["parts"]["direction"] == tight
+    assert transfer.score(dict(ref, sun_bearing_slack_deg=30.0),
+                          _rig(**{"sun.azimuth_deg": 285.0}), 165.0)["parts"]["direction"] == 0.0
+
+
+def test_hero_sweeps_finer_than_a_60_degree_grid():
+    from maxgaffer.core.profiles import resolve_profile
+
+    hero = resolve_profile("hero", loop_width=640, loop_height=360, max_iterations=10,
+                           sweep_count=6, target_score=95.0)
+    assert hero.sweep_count >= 12, "60-degree sweep resolution cost a match by 45 degrees"
+    # hero LIFTS a low setting rather than capping a generous one, as it already does
+    # for iterations
+    generous = resolve_profile("hero", loop_width=640, loop_height=360, max_iterations=10,
+                               sweep_count=24, target_score=95.0)
+    assert generous.sweep_count == 24
