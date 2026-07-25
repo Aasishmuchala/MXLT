@@ -48,23 +48,29 @@ def test_exposure_less_rig_runs_clean_no_phantom_keys_no_false_leash():
 
 
 # ------------------------------------------------- slump-revert must re-measure, not re-tweak
-def test_revert_iteration_skips_solve_and_llm():
-    """After a slump-revert, the stats in hand describe the ABANDONED state — the loop must
-    re-render before solving or asking the LLM anything (found by this recheck: it was
-    applying stale-evidence changes to the restored state)."""
+def test_revert_iteration_reasons_from_the_restored_states_own_stats():
+    """After a slump-revert the loop must never solve or prompt from the ABANDONED frame's
+    stats (the original recheck: it was applying stale-evidence changes to the restored
+    state). It used to buy that safety by skipping the iteration and re-rendering.
+
+    Renders are deterministic in the lighting state (on-box 2026-07-25: a state re-rendered
+    scores 100.0 against itself), and the restored state was already measured when it
+    became best — so the loop now ADOPTS those cached stats. Same guarantee, no wasted
+    render: measured on-box, 5 of 9 iterations in a live match were being spent
+    re-measuring states the loop already had."""
     good, bad = dict(REF), dark(REF)
-    # iter0 great (best), iter1+2 slump (revert fires on iter2), iter3 re-measures
+    # iter0 great (best), iter1+2 slump (revert fires on iter2)
     stats_seq = [good, bad, bad, good]
     reply = json.dumps({"assessment": "", "changes": [
         {"param": "sun.intensity", "value": 1.4, "why": "ratio"}], "stop": False})
     replies = [reply] * 4
-    llm_calls = []
+    rendered = []
 
     def llm(ctx):
-        llm_calls.append(ctx["iteration"])
         return replies.pop(0)
 
-    hooks = Hooks(apply=lambda s: None, render=lambda t: f"/tmp/{t}.png",
+    hooks = Hooks(apply=lambda s: None,
+                  render=lambda t: rendered.append(t) or f"/tmp/{t}.png",
                   stats=lambda p: stats_seq.pop(0) if stats_seq else dict(REF),
                   llm_deltas=llm, log=lambda m: None)
     st = LightingState()
@@ -77,10 +83,12 @@ def test_revert_iteration_skips_solve_and_llm():
     reverted = [r for r in res.iterations if r.reverted_to_best]
     assert reverted, "test setup should trigger a revert"
     rev = reverted[0]
-    assert rev.analytic_changes == {}          # no solve from stale stats
-    assert rev.llm_accepted == {} and rev.assessment == ""   # no LLM on stale evidence
-    assert rev.index not in llm_calls
-    # and the loop continued afterwards (re-measured the restored state)
+    # the revert iteration reports the RESTORED state's score and frame — never the
+    # abandoned one it had just measured
+    assert rev.score == res.best_score
+    assert rev.render_path == res.best_render
+    # and it did NOT spend an extra render to learn what was already known
+    assert len(rendered) == len(res.iterations)
     assert any(r.index > rev.index for r in res.iterations)
 
 

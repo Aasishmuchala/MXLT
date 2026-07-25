@@ -237,6 +237,7 @@ def run_match(
     best_score: Optional[float] = None
     best_render: Optional[str] = None
     best_components: Dict[str, float] = {}
+    best_stats: Optional[Dict] = None      # stats of best_state, reused on revert
     live: Optional[LightingState] = None   # what the scene is actually wearing right now
     records: List[IterationRecord] = []
     score_history: List[Tuple[int, float]] = []
@@ -304,6 +305,9 @@ def run_match(
                         stall_count = 0
                     best_score, best_state, best_render = verdict.score, state.copy(), path
                     best_components = dict(verdict.components)
+                    best_stats = dict(cur_stats)   # measurements OF the best state — the
+                    # revert path below restores this exact state, so its stats are already
+                    # in hand and re-rendering it would reproduce them frame-for-frame
                     slump_count = 0
                 else:
                     if verdict.score < (best_score or 0) - cfg.slump_tolerance:
@@ -337,12 +341,33 @@ def run_match(
                     best_state, best_render = state.copy(), path
 
             if rec.reverted_to_best:
-                # the stats in hand describe the state we just ABANDONED — solving or asking
-                # the LLM from them would tweak the restored state on stale evidence. Re-render
-                # first; next iteration reasons from coherent measurements.
-                hooks.log(f"iter {i}: reverted — re-measuring before further changes")
-                records.append(rec)
-                continue
+                # The stats in hand describe the state we just ABANDONED, so the next
+                # iteration must not reason from them. The restored state's OWN
+                # measurements are already known, though — they were taken when it became
+                # best, and a render is deterministic in the state (on-box 2026-07-25: the
+                # same state re-rendered scores 100.0 against itself). So adopt the cached
+                # measurements instead of burning an iteration re-rendering a known frame.
+                # Measured waste this removes: 5 of 9 iterations in a live A3 match were
+                # spent re-measuring states the loop already had.
+                if best_stats is not None and best_render is not None:
+                    cur_stats, path = dict(best_stats), best_render
+                    rec.render_path = path
+                    rec.score = best_score
+                    # misexposure was measured from the ABANDONED frame above; recompute it
+                    # against the restored state's stats or the contamination guard would
+                    # judge this iteration on the wrong frame
+                    if ref_stats is not None:
+                        import math as _math
+
+                        misexposure = abs(_math.log2(
+                            max(1e-5, float(ref_stats.get("log_key", 0.0)))
+                            / max(1e-5, float(cur_stats.get("log_key", 0.0)))))
+                    hooks.log(f"iter {i}: reverted to best ({best_score:.1f}) — reusing its "
+                              "measurements (no re-render)")
+                else:
+                    hooks.log(f"iter {i}: reverted — re-measuring before further changes")
+                    records.append(rec)
+                    continue
 
             if i == cfg.max_iterations - 1:  # last render measured; no point proposing more
                 records.append(rec)
@@ -585,8 +610,38 @@ def run_polish(
     hooks.log(f"polish: adaptive line search from {best_score:.2f} "
               f"(≤{cfg.polish_rounds} rounds · ≤{cfg.polish_max_probes} probes)")
 
+    def _memo_note() -> str:
+        return (f" · {memo_hits} repeat states served from the probe memo (renders saved)"
+                if memo_hits else "")
+
+    # EXACT probe memo. A render is a deterministic function of the lighting state
+    # (measured on-box 2026-07-25: the same state rendered twice scores a perfect 100.0
+    # against itself at every resolution — V-Ray reproduces the frame bit-for-bit), so a
+    # state already measured NEVER needs re-rendering. The line search revisits states
+    # constantly: it climbs a direction, overshoots, and steps back onto a point it just
+    # measured; the diagonal ridge-escape re-probes the same corners. Serving those from
+    # the memo costs nothing and buys real probes — on a heavy scene each saved probe is
+    # a whole frame.
+    seen: Dict[tuple, Optional[float]] = {}
+    memo_components: Dict[tuple, Dict[str, float]] = {}
+    memo_hits = 0
+
+    def _memo_key(st: LightingState) -> tuple:
+        vals = tuple(sorted((k, round(float(v), 6)) for k, v in st.values.items()))
+        grps = tuple(sorted((k, round(float(v), 6)) for k, v in st.groups.items()))
+        return (vals, grps)
+
     def measure(cand: LightingState, tag: str) -> Optional[float]:
-        nonlocal probes
+        nonlocal probes, memo_hits
+        key = _memo_key(cand)
+        if key in seen:
+            memo_hits += 1
+            hooks.apply(cand)          # the scene must still BE the state we report on
+            cached = seen[key]
+            if cached is not None:
+                hooks._last_polish_components = dict(
+                    memo_components.get(key, getattr(hooks, "_last_polish_components", {})))
+            return cached
         if probes >= cfg.polish_max_probes:
             return None
         hooks.apply(cand)
@@ -599,7 +654,11 @@ def run_polish(
         probes += 1
         verdict = critic.score(ref_stats, st, cfg.weights)
         hooks._last_polish_components = dict(verdict.components)
+        seen[key] = verdict.score
+        memo_components[key] = dict(verdict.components)
         return verdict.score
+
+    seen[_memo_key(state)] = score_now      # the seed state is already measured
 
     try:
         low_gain_rounds = 0
@@ -728,6 +787,7 @@ def run_polish(
                                   for k, _s, _l, floor in axes)
                 if all_floored:
                     hooks.apply(best)
+                    hooks.log(f"polish: converged at {best_score:.2f}{_memo_note()}")
                     return best, best_score, probes, True, True   # proven local optimum
                 # A no-improve round at COARSE steps means the step size is wrong, not
                 # that the climb is over — refine and keep going. Exiting here was
@@ -739,13 +799,13 @@ def run_polish(
             elif low_gain_rounds >= 2:
                 if all(steps[k] <= floor + 1e-9 for k, _s, _l, floor in axes):
                     hooks.apply(best)
-                    # diminishing returns at the FINEST steps — a real plateau, but the
-                    # last round still gained, so it is not a proven local optimum
+                    hooks.log(f"polish: plateau at {best_score:.2f}{_memo_note()}")
                     return best, best_score, probes, True, False
                 for k, _s, _l, floor in axes:   # still coarse — refine before concluding
                     steps[k] = max(floor, steps[k] / 2.0)
                 low_gain_rounds = 0
         hooks.apply(best)
+        hooks.log(f"polish: budget spent at {best_score:.2f}{_memo_note()}")
         return best, best_score, probes, False, False
     except Exception:
         # polish is exploratory too — a dead hook mid-climb must leave the best state

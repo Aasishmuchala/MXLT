@@ -62,13 +62,17 @@ def resolve_profile(name: str, *, loop_width: int, loop_height: int,
                             False, 0, 0)
     if key == "hero":
         sw, sh = _scaled(width, height, 0.5, floor_w=192)
-        # polish budget 10 rounds / 160 probes: the old 6/48 cap was measured EXHAUSTED
-        # with gains still coming (2026-07-24 on-box hero runs: polish_gain +43..+49 and
-        # ceiling_converged False at the cap, three runs in a row) — and the axis list
-        # is now dynamic (groups + fog), so the budget must cover more parameters too.
+        # Polish budget 24 rounds / 500 probes. Every raise so far was measured, not
+        # guessed: 6/48 -> 10/160 when the cap was hit with gains still coming, and now
+        # -> 24/500 because on-box hero runs still ended ceiling_converged=False at 240
+        # probes while climbing. The budget is affordable because a probe on an
+        # already-measured state no longer renders (run_polish's exact memo — renders are
+        # deterministic in the state), and because polish STOPS when it proves a local
+        # optimum: the deterministic sim converges at 185 probes from a bad basin, so this
+        # is headroom for harder real landscapes, not a licence to grind.
         return MatchProfile("hero", "Hero", width, height, sw, sh,
                             max(iterations, 8), min(sweeps, 6), 99.0,
-                            True, 10, 160)
+                            True, 24, 500)
 
     sw, sh = _scaled(width, height, 0.5, floor_w=192)
     return MatchProfile("standard", "Standard", width, height, sw, sh,
