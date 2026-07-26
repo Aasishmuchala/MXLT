@@ -134,3 +134,20 @@ def test_an_unreadable_illuminant_leaves_the_model_s_estimate_alone():
     assert "wb_kelvin_estimate" not in refread.measure({"hot_frac": 0.0})
     kept = refread.fuse({"wb_kelvin_estimate": 5200.0}, refread.measure({"hot_frac": 0.0}))
     assert kept["wb_kelvin_estimate"] == 5200.0
+
+
+def test_shadow_hardness_is_shipped_but_not_fused_yet():
+    """core/shadowedge.py measures light_quality and atmosphere and is available as a
+    diagnostic, but it does not overrule the model's reading. Checked against this session's
+    references it called a known-hard golden-hour sun "mixed" at 0.59 — an honest miss,
+    reported at low confidence — but it also called a dome-only HDRI "mixed" at 0.81 with
+    confidence 1.0. A measurement that is CONFIDENTLY wrong is worse than a guess, and the
+    bar for replacing a guess is beating it."""
+    from maxgaffer.core import shadowedge          # shipped and importable
+
+    assert hasattr(shadowedge, "edge_hardness") and hasattr(shadowedge, "haze_estimate")
+    measured = refread.measure({"hot_frac": 0.03, "illum": [0.6, 0.55, 0.45],
+                                "illum_sog": [0.6, 0.55, 0.45],
+                                "illum_edge": [0.6, 0.55, 0.45]})
+    assert "light_quality" not in measured
+    assert "atmosphere" not in measured

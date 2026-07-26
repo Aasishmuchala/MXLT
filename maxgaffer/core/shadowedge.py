@@ -244,22 +244,39 @@ def edge_hardness(source) -> Optional[Dict]:
         boundary. A shadow changes the illumination over ONE albedo; a paint line, a rug
         edge, a green plant against a grey wall changes the albedo itself.
 
-    WHAT THAT DOES NOT CATCH, stated plainly: an OCCLUSION boundary between two objects of
-    similar colour — a grey chair against a grey wall, a dark doorway, a window frame against
-    sky — passes all three tests, and being a true step it reads maximally HARD. That is this
-    estimator's dominant failure mode. Two things blunt it and neither removes it: the
-    reported value is the MEDIAN over hundreds of samples, so a handful of silhouettes cannot
-    swing a frame; and the material test does remove the coloured ones, which in practice is
-    most of them. A scene built mostly of hard same-hue object edges under a soft sky — a
-    grey bookshelf on an overcast day — will read harder than it is. Treat a "hard" reading
-    from a cluttered monochrome interior as weak evidence, and note that the failure is
-    ONE-SIDED: nothing here makes a genuinely hard-lit frame read soft, so a "soft" reading
-    is the more trustworthy of the two.
+    WHAT THAT DOES NOT CATCH, stated plainly, because it is the limit of the whole method:
+    an OCCLUSION boundary between two objects of similar CHROMATICITY — a grey chair against
+    a grey wall, a dark doorway, a tree canopy against a pale sky — passes all three tests,
+    and being a true step it reads maximally HARD. Being dark does not make a thing
+    saturated: a canopy at r̄ 0.28 / b̄ 0.30 against sky at 0.30 / 0.36 is 0.08 apart, a
+    third of CHROMA_TOL, so the material test never sees it.
+
+    Measured on-box 2026-07-26 on the session's own dawn plate (a 3840×2160 landscape, two
+    big trees, low sun): 1237 of 1317 accepted samples came back hard, and 62% of them sit
+    in the upper half of the frame — which is where the canopies are and where no shadow
+    boundary in that image is. The reading is foliage. A density veto was measured as a fix
+    and refused: a shadow edge scored 0.077 neighbourhood density, but a genuinely SOFT edge
+    scored 0.231 against foliage's 0.231, so vetoing on density would have thrown away the
+    soft population and biased the answer the one way it must never go.
+
+    So: two things blunt this failure and neither removes it — the reported value is the
+    MEDIAN over hundreds of samples, so a handful of silhouettes cannot swing a frame, and
+    the material test does remove the saturated ones, which indoors is most of them. The
+    failure is ONE-SIDED, which is the useful part: nothing here makes a genuinely hard-lit
+    frame read soft. A "soft" reading is therefore strong evidence; a "hard" reading from a
+    frame full of fine same-hue structure (foliage, bookshelves, mullions) is weak, and
+    ``hard_frac`` beside a low ``confidence`` is the tell.
 
     Diagonal boundaries are measured on a ramp, where the central-difference magnitude is
     exact at any orientation; only true steps (already clamped at the operator floor) carry
     an orientation bias. Boundaries within EDGE_MARGIN_PX of the frame border are not
-    sampled at all, because their far probe would fall outside."""
+    sampled at all, because their far probe would fall outside.
+
+    ``width_px`` is the RAW median width and is a diagnostic, not a clamped one: a sharpened
+    or aliased plate overshoots at its edges, which makes the local slope steeper than the
+    plateau difference implies and reports widths under EDGE_OPERATOR_FLOOR_PX. That is not
+    an error — it is the operator saying "sharper than I can resolve" — and ``hardness``
+    clamps it to 1.0."""
     try:
         return _edge_hardness(source)
     except Exception:                        # the loop's stats can never fail — see metrics

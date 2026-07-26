@@ -67,6 +67,16 @@ def measure(stats: Optional[Dict]) -> Dict:
             "blend": True,
         }
 
+    # NOT MEASURED HERE, deliberately: light_quality and atmosphere.
+    # core/shadowedge.py measures both and is shipped, but it has not earned the right to
+    # overrule the model's reading. Checked against this session's references it called a
+    # known-hard golden-hour sun "mixed" at 0.59 — an honest miss, and it reported low
+    # confidence for it — but it also called a dome-only HDRI "mixed" at 0.81 with
+    # confidence 1.0, and a measurement that is CONFIDENTLY wrong is worse than a guess.
+    # Object silhouettes and contact shadows read as hard edges however soft the source is,
+    # and separating them from shadow boundaries is the unsolved part. Use it as a
+    # diagnostic; fuse it when a case can be made that it beats the model.
+
     hot = stats.get("hot_frac")
     if isinstance(hot, (int, float)):
         lit = float(hot) >= SUN_ACTIVE_HOT_FRAC
