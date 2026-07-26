@@ -108,11 +108,21 @@ def solve_sun_angles(
         cand.set("sun.azimuth_deg", float(azimuth) % 360.0)
         if altitude is not None and has_altitude:
             cand.set("sun.altitude_deg", _clamp_altitude(altitude))
-        apply(cand)
-        path = render(tag)
-        if path is None:
+        # A probe must never be able to end a match — the same rule the basin picker
+        # already lives by. apply hits pymxs (a deleted node raises RuntimeError), render
+        # hits V-Ray, stats hits an image decoder; any of the three can fail on ONE frame
+        # of a 44-probe grid, and before this guard a single such failure propagated out
+        # of the whole solve and killed the run (found by stress, 2026-07-26). A failed
+        # probe is skipped; if every probe fails the coarse pass returns None and the
+        # caller falls back to the sweep.
+        try:
+            apply(cand)
+            path = render(tag)
+            if path is None:
+                return None
+            cur = stats(path)
+        except Exception:  # noqa: BLE001 — one bad frame is a skip, not a dead match
             return None
-        cur = stats(path)
         if cur is None:
             return None
         probes += 1

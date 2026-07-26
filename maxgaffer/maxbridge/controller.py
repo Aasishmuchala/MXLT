@@ -1184,9 +1184,14 @@ class Controller:
             solved: Optional[Dict] = None
             if start_override is None and rig.get("sun") is not None \
                     and ref_stats is not None and not should_cancel():
-                solved = sunsolve.solve_sun_angles(
-                    start, ref_stats, hooks.apply, hooks.render, self.stats_for,
-                    log=log, should_cancel=should_cancel, locks=locks)
+                try:
+                    solved = sunsolve.solve_sun_angles(
+                        start, ref_stats, hooks.apply, hooks.render, self.stats_for,
+                        log=log, should_cancel=should_cancel, locks=locks)
+                except Exception as err:  # noqa: BLE001 — the solve is an ASSIST; losing
+                    # it must cost the assist, never the match (the sweep still runs)
+                    log(f"⚠ sun solve failed ({err}) — falling back to the sweep")
+                    solved = None
             if solved is not None and solved.get("confidence", 0.0) >= 0.5:
                 start.set("sun.azimuth_deg", solved["azimuth_deg"])
                 if solved.get("altitude_deg") is not None \
