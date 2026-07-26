@@ -134,12 +134,26 @@ MIN_STEP = 0.02
 SUSTAIN_FRAC = 0.6
 
 #: THE MATERIAL TEST. A shadow is a change of ILLUMINATION over one albedo, so normalised
-#: chromaticity is roughly preserved across it; a material boundary usually jumps. The
-#: tolerance is |Δr̄| + |Δb̄| in normalised rgb and is deliberately loose, because real
-#: shadows DO shift: lit by a 2500 K sun and filled by a 10000 K sky, a golden-hour shadow
-#: edge moves ~0.08 in each coordinate, and a tighter tolerance would reject the very
-#: reference this module was built for. See the docstring for what it therefore cannot do.
-CHROMA_TOL = 0.22
+#: chromaticity is roughly preserved across it; a material boundary changes the albedo and
+#: usually jumps. Tolerance is |Δr̄| + |Δb̄| in normalised rgb.
+#:
+#: The value is derived, not tuned, by pushing both sides through the repo's own
+#: `colortemp.kelvin_to_rgb` and measuring how far a pure ILLUMINANT change can move one
+#: neutral albedo (measured 2026-07-26):
+#:      key 5500 K vs fill  9000 K → 0.112      key 3200 K vs fill 9000 K → 0.301
+#:      key 4500 K vs fill 12000 K → 0.200      key 2500 K vs fill 9000 K → 0.448
+#: against albedo changes measured the same way:
+#:      saturated (green vs red)   → 0.536      wood vs plaster           → 0.258
+#:      foliage vs pale sky        → 0.095      grey vs grey              → 0.004
+#: 0.35 sits above a golden-hour sun/sky shadow that a white-balanced capture would plausibly
+#: still show, and below a saturated albedo change.
+#:
+#: THE BANDS OVERLAP AND THIS TEST CANNOT SEPARATE THEM CLEANLY — a wood/plaster edge (0.258)
+#: is LESS chromatic than a genuine 3200 K shadow edge (0.301). It is a filter for the
+#: blatant cases, not a classifier, and it is worthless against exactly the case that hurts
+#: most: foliage against sky at 0.095 is a third of the tolerance, so no setting of this
+#: constant would ever have caught it. See `edge_hardness` for what that costs.
+CHROMA_TOL = 0.35
 
 #: Fewer boundary samples than this and the median is an anecdote → None.
 MIN_SAMPLES = 40
@@ -248,8 +262,10 @@ def edge_hardness(source) -> Optional[Dict]:
     an OCCLUSION boundary between two objects of similar CHROMATICITY — a grey chair against
     a grey wall, a dark doorway, a tree canopy against a pale sky — passes all three tests,
     and being a true step it reads maximally HARD. Being dark does not make a thing
-    saturated: a canopy at r̄ 0.28 / b̄ 0.30 against sky at 0.30 / 0.36 is 0.08 apart, a
-    third of CHROMA_TOL, so the material test never sees it.
+    saturated: measured 2026-07-26, foliage against pale sky is 0.095 apart in normalised
+    chromaticity, a quarter of CHROMA_TOL, so the material test never sees it — and no
+    setting of that constant would fix it, because a real golden-hour shadow edge is three
+    times MORE chromatic than that canopy.
 
     Measured on-box 2026-07-26 on the session's own dawn plate (a 3840×2160 landscape, two
     big trees, low sun): 1237 of 1317 accepted samples came back hard, and 62% of them sit

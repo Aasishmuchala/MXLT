@@ -12,7 +12,6 @@ Images are written with `png_min.write_png_rgb` — the same zero-dependency cod
 work inside Max — so the whole path from bytes to answer is exercised.
 """
 import math
-import os
 import random
 
 import pytest
@@ -406,10 +405,9 @@ def test_the_cost_is_small_enough_to_take_on_every_probe(tmp_path):
     later 'small' change to the probe baseline cannot quietly reintroduce it."""
     import time
 
-    path = write(tmp_path, "cost.png", ramp_painter(6), size=256)
-    loaded = None
     from maxgaffer.core import metrics
 
+    path = write(tmp_path, "cost.png", ramp_painter(6), size=256)
     loaded = metrics._load_pixels(path, max_dim=shadowedge.WORK_MAX_DIM)
     start = time.perf_counter()
     shadowedge.edge_hardness(loaded)
