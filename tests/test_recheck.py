@@ -565,3 +565,40 @@ def test_the_reset_button_asks_first_and_says_what_it_will_do():
     assert "if self._busy" in src, "a reset mid-match would race the worker"
     # and the panels are emptied, or a stale reading outlives the session that produced it
     assert "_clear_after_reset" in src
+
+
+def test_progress_survives_a_phase_that_renders_nothing():
+    """The stall an artist actually hits is BEFORE the first render: three ANALYZE image
+    calls plus a plan call, all network, all at near-zero CPU. A meter driven only by
+    renders shows a frozen bar there — which is precisely the moment "am I stuck?" gets
+    asked. A clock that keeps counting is the difference between working and hung."""
+    import inspect
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6.QtWidgets")
+
+    from maxgaffer.ui import dock as dockmod
+
+    for name in ("_on_heartbeat", "_progress_stage", "_clock"):
+        assert hasattr(dockmod.MaxGafferDock, name), name
+    beat = inspect.getsource(dockmod.MaxGafferDock._on_heartbeat)
+    assert "self._busy" in beat, "the heartbeat must stop when the run does"
+    start = inspect.getsource(dockmod.MaxGafferDock._start_match)
+    # the phases that render nothing are NAMED, so the label is never stale during a wait
+    assert '_progress_begin("reading the reference")' in start
+    assert '_progress_stage("planning")' in start
+    assert '_progress_stage("matching")' in start
+    # and the timer is stopped on the way out, or it ticks forever over an idle dock
+    assert "self._beat.stop()" in inspect.getsource(dockmod.MaxGafferDock._progress_end)
+
+
+def test_the_reload_script_purges_modules_and_the_cached_dock():
+    """show_dock REUSES an existing panel and Python caches modules for the process
+    lifetime, so editing the plugin and calling launch() again returns the OLD code in the
+    OLD widget — indistinguishable from the change not working."""
+    src = open("scripts/reload_dock.py", encoding="utf-8").read()
+    assert "_dock_wrapper" in src and "_dock_instance" in src, "a reused panel is not reloaded"
+    assert "sys.modules.pop" in src
+    assert "reverse=True" in src, "submodules must be dropped before their packages"
+    assert "import maxgaffer.bootstrap" in src

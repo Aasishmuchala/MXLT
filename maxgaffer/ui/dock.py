@@ -201,6 +201,8 @@ class MaxGafferDock(QtWidgets.QWidget):
         self._workers: List[_Worker] = []
         self._cancel = False
         self._busy = False
+        self._beat = None
+        self._last_tick = ""
         self._active_camera = ""
         self._active_camera_id = ""
         self._camera_fingerprint = ()
@@ -679,16 +681,51 @@ class MaxGafferDock(QtWidgets.QWidget):
     def _on_match_progress(self, stage: str, done: int, total: int, pct: float):
         """Main-thread slot. Qt widgets are never touched from the worker."""
         self.lbl_stage.setText(str(stage).upper())
-        self.lbl_pct.setText("%d/%d   %3d%%" % (done, total, int(pct)))
+        self._last_tick = "%d/%d   %3d%%   " % (done, total, int(pct))
+        self.lbl_pct.setText(self._last_tick + self._clock())
         self.bar.setValue(int(round(pct * 10)))
+
+    def _clock(self) -> str:
+        if not hasattr(self, "_elapsed"):
+            return ""
+        secs = int(self._elapsed.elapsed() / 1000)
+        return "%d:%02d" % (secs // 60, secs % 60)
 
     def _progress_begin(self, what: str):
         self.lbl_stage.setText(str(what).upper())
-        self.lbl_pct.setText("starting…")
+        self.lbl_pct.setText("0:00")
         self.bar.setValue(0)
+        self.progress_row.setVisible(True)
+        self._elapsed = QtCore.QElapsedTimer()
+        self._elapsed.start()
+        self._last_tick = ""
+        if getattr(self, "_beat", None) is None:
+            self._beat = QtCore.QTimer(self)
+            self._beat.setInterval(1000)
+            self._beat.timeout.connect(self._on_heartbeat)
+        self._beat.start()
+
+    def _on_heartbeat(self):
+        """Proves the run is alive when nothing is rendering.
+
+        The pre-render phases are network waits — three ANALYZE image calls and a plan call
+        — during which no probe completes, the CPU sits near zero and a render-driven meter
+        would show a frozen bar. A clock that keeps counting is the difference between
+        'working' and 'hung', and it costs one timer."""
+        if not self._busy or not hasattr(self, "_elapsed"):
+            return
+        secs = int(self._elapsed.elapsed() / 1000)
+        clock = "%d:%02d" % (secs // 60, secs % 60)
+        self.lbl_pct.setText(f"{self._last_tick}{clock}" if self._last_tick else clock)
+
+    def _progress_stage(self, what: str):
+        """Name a phase that renders nothing, so the label is never stale during a wait."""
+        self.lbl_stage.setText(str(what).upper())
         self.progress_row.setVisible(True)
 
     def _progress_end(self, note: str = ""):
+        if getattr(self, "_beat", None) is not None:
+            self._beat.stop()
         # Left ON at 100 rather than hidden: after a long run the artist wants to see that
         # it finished, not an empty space where the meter was.
         self.bar.setValue(1000)
@@ -1262,12 +1299,15 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.cfg.auto_execute_plan = self.act_autoexec.isChecked()
         self.cfg.draft_sampler = self.act_draft.isChecked()
         self.log.clear()
-        self._progress_begin("preparing")
+        self._progress_begin("reading the reference")
         self._log(f"— match: {cam} —")
+        self._log("· the reference is read by the gateway first — this is a network wait, "
+                  "not a render, so the clock moves and the meter does not")
         plan_report = None
         try:
             if mode != 2:
                 try:
+                    self._progress_stage("planning")
                     plan = self.ctrl.make_plan(cam, log=self._log)
                 except (OmegaError, RuntimeError) as err:
                     self._log(f"⚠ plan skipped ({err}) — continuing with the match loop")
@@ -1283,6 +1323,7 @@ class MaxGafferDock(QtWidgets.QWidget):
                     plan_report = self.ctrl.execute_plan(ops, cam, log=self._log)
                 else:
                     self._log("plan declined — continuing with the match loop only")
+            self._progress_stage("matching")
             result = self.ctrl.run_match(
                 cam, log=self._log,
                 should_cancel=lambda: self._cancel,
