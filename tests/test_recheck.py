@@ -895,3 +895,26 @@ def test_a_gateway_request_that_never_reaches_the_socket_still_times_out():
     assert elapsed < 10, f"the watchdog did not fire in time ({elapsed:.1f}s)"
     assert err.value.kind == "network", "the retry loop keys off the kind"
     assert "never reached the socket" in str(err.value)
+
+
+def test_exposure_is_aligned_to_the_reference_before_geometry_is_judged():
+    """Measured on the street scene, same photo, three runs: exposure free -> the solve
+    picked the backlit 277-degree sun (the photograph's character, 76.6); exposure locked a
+    stop brighter -> a bland front-lit 53-degree sun (63.2). The solve ranks directions on
+    the hot-patch map, which is thresholded on ABSOLUTE luminance — so probe exposure
+    silently decided which geometry won. Tone must be aligned first; a locked exposure is
+    the artist's call, respected and announced, never silently decisive."""
+    import inspect
+
+    from maxgaffer.maxbridge.controller import Controller
+
+    src = inspect.getsource(Controller.run_match)
+    align_at = src.index("sunsolve_tonealign")
+    solve_at = src.index("sunsolve.solve_sun_angles(")
+    assert align_at < solve_at, "geometry is still judged under arbitrary tone"
+    seg = src[max(0, align_at - 2200):solve_at]
+    assert 'if "exposure.ev" in locks:' in seg, "a locked exposure must be respected"
+    assert "under your chosen tone" in seg, "…and its consequence said out loud"
+    assert "solver.solve_ev(" in seg
+    # the alignment probes render at SWEEP size — the tag routes through the small tier
+    assert '"sunsolve_tonealign"' in seg, "the tag must hit the cheap render tier"

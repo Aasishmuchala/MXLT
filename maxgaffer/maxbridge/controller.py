@@ -23,7 +23,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from ..core import (animation, consensus, critic, domeseed, expose, fairness, feedback,
                     transfer,
                     metrics, omega, planner, profiles, prompts, providers, rules,
-                    scenedigest, sunsolve, refread, scenarios as scen)
+                    scenedigest, solver, sunsolve, refread, scenarios as scen)
 from ..core.director import (Hooks, MatchConfig, MatchResult, TRANSFER_WEIGHT,
                              blend_transfer, run_match, run_sun_sweep)
 from ..core.genome import LightingState
@@ -1171,6 +1171,41 @@ class Controller:
                 locks = set(locks) | {"sun.enabled"}
                 log("sun locked ON for this match (the starting rig is sunlit — it may "
                     "be dimmed, not switched off)")
+
+            # TONE BEFORE GEOMETRY. The sun solve ranks directions on the hot-patch
+            # map, and that map is thresholded on absolute luminance — so the probes'
+            # EXPOSURE decides which geometry looks right. Measured on the street scene,
+            # same photo, three runs: exposure free -> the backlit 277-degree sun (the
+            # photograph's character, 76.6); exposure locked a stop brighter -> a bland
+            # front-lit 53-degree sun (63.2), because under a hot tone a front-lit canopy
+            # out-glows the true glare streak. So exposure is aligned to the reference
+            # FIRST, with up to two small probes; a locked exposure is respected and the
+            # consequence said out loud rather than silently deciding the basin.
+            if start_override is None and ref_stats is not None                     and rig.get("sun") is not None and not should_cancel():
+                if "exposure.ev" in locks:
+                    log("exposure.ev is locked — the sun solve will judge geometry "
+                        "under your chosen tone, which can favour a different basin")
+                elif "exposure.ev" in start.values:
+                    # an ASSIST, like the solve it serves: losing it costs the assist,
+                    # never the match — off-box and degraded rigs skip it cleanly
+                    try:
+                        for _tone_pass in range(2):
+                            hooks.apply(start)
+                            tone_path = hooks.render("sunsolve_tonealign")
+                            tone_stats = (self.stats_for(tone_path)
+                                          if tone_path else None)
+                            if tone_stats is None:
+                                break
+                            ev_new = solver.solve_ev(ref_stats, tone_stats,
+                                                     start.get("exposure.ev"))
+                            if ev_new is None:
+                                break
+                            log(f"tone-align: exposure.ev "
+                                f"{start.get('exposure.ev'):.2f} → {ev_new:.2f} so the "
+                                f"sun solve judges geometry at the reference's exposure")
+                            start.set("exposure.ev", ev_new)
+                    except Exception as err:  # noqa: BLE001
+                        log(f"tone-align skipped ({err})")
 
             # GLOBAL SUN SOLVE, before the sweep and usually instead of it. Sun direction
             # was this plugin's worst failure and it was being attacked with local search:
