@@ -129,6 +129,75 @@ def solve_wb(ref_stats: Dict, cur_stats: Dict, current_kelvin: float,
     return None if abs(new - current_kelvin) < 1e-9 else new
 
 
+#: How far the shadow floor or the sun's own contribution may sit from the reference's
+#: before it is worth a scene write. These are RATIOS, so 0.12 is roughly an eighth of a
+#: stop — tighter than the EV deadband because this solve is separating two lights rather
+#: than sliding both, and a small persistent bias here is what the search kept papering
+#: over with exposure.
+AMBIENT_DEADBAND = 0.12
+#: Correction cap per iteration, in octaves. A stability rail, like EV_MAX_STEP.
+AMBIENT_MAX_OCTAVES = 1.5
+
+
+def _srgb_to_linear(c: float) -> float:
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def solve_ambient(ref_stats: Dict, cur_stats: Dict, current_dome: Optional[float],
+                  current_sun: Optional[float],
+                  tighten: float = 1.0) -> Dict[str, float]:
+    """Separate the AMBIENT level from the SUN level, using the two ends of the histogram.
+
+    The darkest part of a sunlit frame sees no direct sun — it is lit by ambient alone — so
+    the 5th percentile measures the dome almost independently of the sun. The brightest
+    part is where the sun lands, so (p95 - p5) measures the sun almost independently of the
+    dome. Two measurements, two unknowns, and no search required.
+
+    That separation is what was missing. Measured on-box 2026-07-26, a match that had the
+    sun's DIRECTION right to 2.5 degrees still recovered dome 1.66 against a 0.55 target,
+    with exposure compensating: nothing was solving the two lights apart, so the loop kept
+    trading one against the other and the shadows came back lifted (p5 0.183 against the
+    reference's 0.164). The ratio is deliberately scale-free — it corrects the two lights
+    RELATIVE to each other and leaves the overall level to solve_ev, which is the one that
+    owns it.
+
+    → {"dome.intensity": v, "sun.intensity": v} for whichever is worth moving. Percentiles
+    are display-referred, so they are linearised first: a ratio of display values is not a
+    ratio of light."""
+    out: Dict[str, float] = {}
+    try:
+        p_ref, p_cur = ref_stats.get("p"), cur_stats.get("p")
+        if not isinstance(p_ref, dict) or not isinstance(p_cur, dict):
+            return out
+        lo_ref = _srgb_to_linear(max(0.0, float(p_ref["5"])))
+        hi_ref = _srgb_to_linear(max(0.0, float(p_ref["95"])))
+        lo_cur = _srgb_to_linear(max(0.0, float(p_cur["5"])))
+        hi_cur = _srgb_to_linear(max(0.0, float(p_cur["95"])))
+    except (KeyError, TypeError, ValueError):
+        return out
+    if min(lo_ref, lo_cur) <= 1e-6:
+        return out          # a frame crushed to black carries no ambient measurement
+
+    def _scaled(current: Optional[float], want: float, have: float,
+                key: str) -> None:
+        if current is None or have <= 1e-9 or want <= 1e-9:
+            return
+        octaves = math.log2(want / have)
+        if abs(octaves) < AMBIENT_DEADBAND * max(0.1, tighten):
+            return
+        octaves = max(-AMBIENT_MAX_OCTAVES, min(AMBIENT_MAX_OCTAVES, octaves))
+        new = clamp(key, float(current) * (2.0 ** octaves))
+        if abs(new - float(current)) > 1e-9:
+            out[key] = new
+
+    _scaled(current_dome, lo_ref, lo_cur, "dome.intensity")
+    # the sun's OWN contribution is what sits above the ambient floor at the bright end;
+    # comparing raw p95 would credit the sun for ambient the dome is already supplying
+    _scaled(current_sun, max(1e-9, hi_ref - lo_ref), max(1e-9, hi_cur - lo_cur),
+            "sun.intensity")
+    return out
+
+
 def analytic_pass(
     state: LightingState,
     ref_stats: Dict,
@@ -153,4 +222,15 @@ def analytic_pass(
                       tighten=tighten)
         if wb is not None:
             changes["exposure.wb_kelvin"] = wb
+    # ...and the two LIGHTS, separated from each other by the two ends of the histogram.
+    # Capability-gated exactly like the tonal pair above: a key absent from the state means
+    # the rig has no host for it.
+    ambient = solve_ambient(
+        ref_stats, cur_stats,
+        state.get("dome.intensity") if "dome.intensity" in state.values
+        and "dome.intensity" not in locks else None,
+        state.get("sun.intensity") if "sun.intensity" in state.values
+        and "sun.intensity" not in locks else None,
+        tighten=tighten)
+    changes.update(ambient)
     return changes
