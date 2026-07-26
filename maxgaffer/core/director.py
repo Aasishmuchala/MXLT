@@ -876,6 +876,11 @@ def run_polish(
         for rnd in range(cfg.polish_rounds):
             improved_any = False
             round_start = best_score
+            # the first probe of each direction, per axis, per round. On a stall round —
+            # exactly when the diagonal escape fires — BOTH directions of every live axis
+            # were probed and failed, so these two numbers carry the local slope sign the
+            # escape used to re-derive blind at four renders a pair.
+            axis_slopes: Dict[str, Dict[float, float]] = {}
             for key, _init, is_log, floor in axes:
                 if hooks.should_cancel() or best_score >= cfg.polish_stop_at \
                         or probes >= cfg.polish_max_probes:
@@ -903,6 +908,8 @@ def run_polish(
                         if abs(cand.get(key) - v) < 1e-6:
                             break            # clamped to a bound — nowhere to go
                         sc = measure(cand, f"polish{rnd}_{key.split('.')[-1]}")
+                        if sc is not None and stride == step:
+                            axis_slopes.setdefault(key, {})[direction] = sc
                         if sc is not None and sc > best_score + cfg.polish_min_gain:
                             hooks.log(f"polish: {key} {v:.2f}→{cand.get(key):.2f} · "
                                       f"{best_score:.2f}→{sc:.2f} ✓")
@@ -954,6 +961,38 @@ def run_polish(
                         return sc, cand
                     return None
 
+                def _combo_order(ka: str, kb: str):
+                    """Sign combinations to try, best-informed first.
+
+                    The stall that triggers this escape probed BOTH directions of every
+                    live axis moments ago; the two first-probe scores per axis give the
+                    local slope sign for free. The gradient-predicted quadrant goes
+                    first; second, the same quadrant with the WEAKER axis flipped, which
+                    is where an anti-correlated valley points when single moves fail.
+                    Two probes instead of four. Measured before this change: the blind
+                    enumeration was 75 of 193 renders of a live match — 39% of the whole
+                    run spent asking questions whose answers were already on the table.
+                    Axes with no slope information keep the full enumeration; the escape
+                    exists for nasty landscapes, and guessing is only allowed to replace
+                    measurement when there was a measurement."""
+                    def _sign(key):
+                        got = axis_slopes.get(key) or {}
+                        up, dn = got.get(1.0), got.get(-1.0)
+                        if up is None or dn is None or up == dn:
+                            return None
+                        return 1.0 if up > dn else -1.0
+
+                    sa, sb = _sign(ka), _sign(kb)
+                    if sa is None or sb is None:
+                        return [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)]
+                    ga = axis_slopes[ka]
+                    gb = axis_slopes[kb]
+                    # flip the axis whose slope evidence is WEAKER — it is the one the
+                    # gradient is least sure about
+                    if abs(ga[1.0] - ga[-1.0]) < abs(gb[1.0] - gb[-1.0]):
+                        return [(sa, sb), (-sa, sb)]
+                    return [(sa, sb), (sa, -sb)]
+
                 for ka, kb in pairs:
                     if escaped or hooks.should_cancel() \
                             or probes >= cfg.polish_max_probes:
@@ -961,10 +1000,8 @@ def run_polish(
                     if ka in locks or kb in locks or not _has_axis(best, ka) \
                             or not _has_axis(best, kb):
                         continue
-                    for sa in (1.0, -1.0):
-                        if escaped:
-                            break
-                        for sb in (1.0, -1.0):
+                    for sa, sb in _combo_order(ka, kb):
+                        if not escaped:
                             got = _diag_probe(ka, kb, sa, sb, 1.0)
                             if got is None:
                                 continue

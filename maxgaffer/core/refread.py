@@ -66,7 +66,14 @@ NON_NEUTRAL_TIMES = ("golden_hour", "blue_hour", "sunrise", "sunset", "dawn", "d
 #: and content fixed and only sun size varying, the response is strictly monotonic across a
 #: 0.836 spread. That is enough to DRIVE sun.size in the polish loop, which is a comparison
 #: against a render of the same scene. It is not enough to overrule a reading taken off a
-#: photograph of somewhere else. Those are different questions and only one has been tested.
+#: photograph of somewhere else.
+#:
+#: SETTLED 2026-07-26 by the second-scene experiment: the street scene's ladder is also
+#: strictly monotonic (0.967 -> 0.724) but sits FAR above the golden-hour scale
+#: (0.984 -> 0.148) — a size-30 soft sun still reads "hard" 0.724 there, because box edges
+#: and canopy lobes are occlusion-sharp under any light. The scale is scene-dependent,
+#: measured, not suspected. Hardness stays a WITHIN-scene instrument permanently; the
+#: absolute gate is not coming back.
 HARDNESS_TRUST = None
 
 
