@@ -455,7 +455,9 @@ class Controller:
         # The cached e.semantics stays exactly as the model said it; the measurements ride
         # on top of the copy the match actually uses, and only where they are confident.
         try:
-            return refread.fuse(semantics, refread.measure(self.ref_stats(ref_path)))
+            return refread.fuse(
+                semantics,
+                refread.measure(self.ref_stats(ref_path), reading=semantics))
         except Exception:  # noqa: BLE001 — a measurement must never sink an analysis
             return semantics
 

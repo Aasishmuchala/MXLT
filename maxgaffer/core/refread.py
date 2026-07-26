@@ -37,18 +37,58 @@ from . import cct
 #: reading, so it must never fire on a real sun.
 SUN_ACTIVE_HOT_FRAC = 0.004
 
+#: Kelvin band around daylight-neutral within which a measured illuminant carries no
+#: information about how warm the LIGHT was. A consumer photograph has already been
+#: white-balanced in camera, so what survives is the residue, and the residue of a sunset
+#: reads neutral. cct cannot see this — it returns a clean, on-locus, self-consistent wrong
+#: answer with good confidence, which is the worst failure shape there is.
+AWB_NEUTRAL_LO, AWB_NEUTRAL_HI = 5900.0, 7100.0
 
-def measure(stats: Optional[Dict]) -> Dict:
+#: Times of day whose light is definitionally NOT neutral. When the model names one of
+#: these and the measurement comes back neutral anyway, the disagreement is itself the
+#: evidence: the picture was auto-white-balanced. This is the one thing the model can do
+#: that the pixels cannot — it recognises a sunset as a sunset after the camera has
+#: colour-corrected it away.
+NON_NEUTRAL_TIMES = ("golden_hour", "blue_hour", "sunrise", "sunset", "dawn", "dusk",
+                     "night")
+
+
+def measure(stats: Optional[Dict], reading: Optional[Dict] = None) -> Dict:
     """→ {field: {"value", "confidence", "why"}} for everything the pixels can answer.
 
     Only fields with real evidence appear. An empty dict means the image told us nothing,
-    which is a fine answer and quite different from telling us something uncertain."""
+    which is a fine answer and quite different from telling us something uncertain.
+
+    ``reading`` is the model's own report, used ONLY to catch the one failure the pixels
+    cannot see for themselves — see AWB_NEUTRAL_LO."""
     out: Dict[str, Dict] = {}
     if not isinstance(stats, dict):
         return out
 
     # ---- illuminant colour temperature, measured off the pixels
     measured_k = cct.illuminant_kelvin(stats)
+    # AUTO-WHITE-BALANCE CROSS-CHECK. A phone or camera JPEG has already neutralised its
+    # own cast, so measuring it recovers the residue rather than the light — and cct cannot
+    # detect this: it returns a clean on-locus answer with healthy confidence, which is the
+    # worst way for a measurement to be wrong. The model, however, can still see that the
+    # picture is OF a sunset. When it names a time of day whose light is definitionally not
+    # neutral and the measurement comes back neutral anyway, the disagreement IS the
+    # evidence, and the right move is to stand down rather than average a laundered number
+    # into the reading.
+    if measured_k and measured_k.get("kelvin") and isinstance(reading, dict):
+        tod = str(reading.get("time_of_day", "") or "").lower()
+        if (tod in NON_NEUTRAL_TIMES
+                and AWB_NEUTRAL_LO <= float(measured_k["kelvin"]) <= AWB_NEUTRAL_HI):
+            out["_wb_withheld"] = {
+                "value": float(measured_k["kelvin"]),
+                "confidence": 0.0,
+                "why": ("illuminant measures neutral (%.0f K) but the reference reads as "
+                        "'%s' — the picture was almost certainly white-balanced in camera, "
+                        "so the measurement describes the correction and not the light"
+                        % (measured_k["kelvin"], tod)),
+            }
+            measured_k = None
+
     if measured_k and measured_k.get("kelvin"):
         out["wb_kelvin_estimate"] = {
             "value": float(measured_k["kelvin"]),

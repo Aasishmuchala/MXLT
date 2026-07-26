@@ -79,8 +79,11 @@ def test_the_analyze_path_measures_and_leaves_the_cache_alone():
 
     from maxgaffer.maxbridge.controller import Controller
 
-    src = inspect.getsource(Controller.analyze_reference)
-    assert "refread.fuse(semantics, refread.measure(" in src
+    src = " ".join(inspect.getsource(Controller.analyze_reference).split())
+    assert "refread.fuse( semantics, refread.measure(" in src
+    # the model's reading is handed to measure() so the auto-white-balance cross-check can
+    # see the time of day — the one thing the pixels cannot tell it
+    assert "reading=semantics" in src
     cache_at = src.index("e.semantics = semantics")
     fuse_at = src.index("refread.fuse(")
     assert cache_at < fuse_at, "the cache must be written from the UNFUSED reading"
@@ -151,3 +154,53 @@ def test_shadow_hardness_is_shipped_but_not_fused_yet():
                                 "illum_edge": [0.6, 0.55, 0.45]})
     assert "light_quality" not in measured
     assert "atmosphere" not in measured
+
+
+# ------------------------------------------------ the one thing the pixels cannot see
+def _warm_lit_stats():
+    """An illuminant measuring neutral — what a camera's own white balance leaves behind."""
+    return {"hot_frac": 0.03, "illum": [0.5774, 0.5774, 0.5774],
+            "illum_sog": [0.5774, 0.5774, 0.5774], "illum_edge": [0.5774, 0.5774, 0.5774]}
+
+
+def test_a_neutral_measurement_on_a_golden_hour_photo_is_withheld():
+    """A consumer photograph has already been white-balanced in camera, so measuring it
+    recovers the CORRECTION rather than the light — and cct cannot detect this. It returns a
+    clean, on-locus, self-consistent wrong answer with healthy confidence, which is the worst
+    shape a wrong measurement can take.
+
+    The model can still see the picture is OF a sunset. When it names a time of day whose
+    light is definitionally not neutral and the measurement comes back neutral anyway, the
+    disagreement IS the evidence."""
+    st = _warm_lit_stats()
+    guessed = {"time_of_day": "golden_hour", "wb_kelvin_estimate": 3800.0}
+    m = refread.measure(st, reading=guessed)
+    assert "wb_kelvin_estimate" not in m, "a laundered neutral must not reach the reading"
+    assert "_wb_withheld" in m and "white-balanced in camera" in m["_wb_withheld"]["why"]
+
+    fused = refread.fuse(guessed, m)
+    assert fused["wb_kelvin_estimate"] == 3800.0, "the model's warm read must survive intact"
+
+
+def test_a_neutral_measurement_on_a_MIDDAY_photo_is_kept():
+    """The cross-check must not fire on scenes whose light really is neutral, or it would
+    veto every correct daylight reading."""
+    m = refread.measure(_warm_lit_stats(), reading={"time_of_day": "midday"})
+    assert "wb_kelvin_estimate" in m
+    assert "_wb_withheld" not in m
+
+
+def test_a_WARM_measurement_on_a_golden_hour_photo_is_kept():
+    """Only a NEUTRAL measurement is suspicious on a warm scene. A raw or CG reference that
+    genuinely measures warm is the case this whole module exists to serve."""
+    warm = {"hot_frac": 0.03, "illum": [0.66, 0.55, 0.39],
+            "illum_sog": [0.66, 0.55, 0.39], "illum_edge": [0.66, 0.55, 0.39]}
+    m = refread.measure(warm, reading={"time_of_day": "golden_hour"})
+    assert "_wb_withheld" not in m
+
+
+def test_measure_still_works_without_the_model_s_reading():
+    """The cross-check is an addition, not a dependency — measure(stats) alone must behave
+    exactly as it did."""
+    assert "wb_kelvin_estimate" in refread.measure(_warm_lit_stats())
+    assert refread.measure(_warm_lit_stats(), reading=None).get("_wb_withheld") is None

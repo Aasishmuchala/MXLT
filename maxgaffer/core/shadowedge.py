@@ -133,27 +133,70 @@ MIN_STEP = 0.02
 #: flat plateaus would have thrown away precisely the soft edges.
 SUSTAIN_FRAC = 0.6
 
-#: THE MATERIAL TEST. A shadow is a change of ILLUMINATION over one albedo, so normalised
-#: chromaticity is roughly preserved across it; a material boundary changes the albedo and
-#: usually jumps. Tolerance is |Δr̄| + |Δb̄| in normalised rgb.
+#: THE MATERIAL TEST — a shared SHADOW RATIO, which is an exact invariant rather than a
+#: tolerance on colours. Across a true shadow boundary the surface is the same and only the
+#: illumination changes:
+#:      shadow = albedo · a                (ambient alone)
+#:      lit    = albedo · (a + s)          (ambient plus sun)
+#: so the per-channel ratio is (a + s)/a = 1 + s/a and THE ALBEDO CANCELS EXACTLY. A material
+#: boundary is albedo₁/albedo₂, which is arbitrary; foliage against sky is arbitrary. Every
+#: genuine shadow edge in one image therefore agrees on one direction, and nothing else does.
 #:
-#: The value is derived, not tuned, by pushing both sides through the repo's own
-#: `colortemp.kelvin_to_rgb` and measuring how far a pure ILLUMINANT change can move one
-#: neutral albedo (measured 2026-07-26):
-#:      key 5500 K vs fill  9000 K → 0.112      key 3200 K vs fill 9000 K → 0.301
-#:      key 4500 K vs fill 12000 K → 0.200      key 2500 K vs fill 9000 K → 0.448
-#: against albedo changes measured the same way:
-#:      saturated (green vs red)   → 0.536      wood vs plaster           → 0.258
-#:      foliage vs pale sky        → 0.095      grey vs grey              → 0.004
-#: 0.35 sits above a golden-hour sun/sky shadow that a white-balanced capture would plausibly
-#: still show, and below a saturated albedo change.
+#: The quantity clustered is `ratio − 1`, NOT the ratio. This matters and is not a detail.
+#: Surfaces sit in different amounts of ambient occlusion, so the ambient at one shadow edge
+#: is k times the ambient at another. Then ratio = 1 + s/(k·a), which is a DIFFERENT vector
+#: for every k — the ratios of genuine shadow edges do not share a direction, they lie on a
+#: ray anchored at (1,1,1). Subtract the 1 and that ray becomes a direction: (ratio − 1) =
+#: s/(k·a), whose direction is s/a for every k. So `ratio − 1` is invariant to how deep the
+#: shade is, and the raw ratio is not. Measured both ways on the plates (2026-07-26) the
+#: difference is decisive and is recorded in `edge_hardness`.
 #:
-#: THE BANDS OVERLAP AND THIS TEST CANNOT SEPARATE THEM CLEANLY — a wood/plaster edge (0.258)
-#: is LESS chromatic than a genuine 3200 K shadow edge (0.301). It is a filter for the
-#: blatant cases, not a classifier, and it is worthless against exactly the case that hurts
-#: most: foliage against sky at 0.095 is a third of the tolerance, so no setting of this
-#: constant would ever have caught it. See `edge_hardness` for what that costs.
-CHROMA_TOL = 0.35
+#: What survives is the SUN-TO-AMBIENT SPECTRAL RATIO, reported as `ratio_rgb`.
+#: This replaces a normalised-chromaticity tolerance that was measured to be unfixable: the
+#: bands overlapped (a wood/plaster edge at 0.258 was LESS chromatic than a genuine 3200 K
+#: shadow edge at 0.301) and foliage against pale sky sat at 0.095, a quarter of any usable
+#: tolerance. No threshold on colour distance could separate those; a consensus on the ratio
+#: does not have to, because it asks a different question — not "are these two colours
+#: similar" but "do all these boundaries agree on one illuminant change".
+
+#: Half-angle of the inlier cone, in degrees, about the consensus direction. Real scenes are
+#: not perfectly bi-illuminant — bounce off a coloured wall genuinely changes the local
+#: ambient SPECTRUM, which moves the direction — so this is loose enough to hold one scene's
+#: shadows together and tight enough that an arbitrary albedo ratio has to be lucky to land
+#: inside it. A cone of this half-angle covers ~1.4% of the sphere of unit directions.
+RATIO_INLIER_DEG = 12.0
+
+#: Below this share of candidates agreeing, the frame's boundaries share no common
+#: illuminant change, which means they are not shadow boundaries — foliage, clutter, a
+#: texture field. The honest answer there is None, not a hardness with a low confidence
+#: attached: a number that gets reported is a number that gets used.
+MIN_INLIER_FRAC = 0.35
+
+#: Hypotheses tested in the consensus. Every sample's own direction is a candidate axis, but
+#: scoring all of them is O(k²) and k runs to ~1500 on a detailed plate. An evenly-strided
+#: subset is enough: missing the true cluster entirely requires every one of these to be an
+#: outlier, which at even a 20% inlier fraction is (0.8)^96 ≈ 4e-10. Strided rather than
+#: random so the answer is reproducible — the loop must not return a different rig twice.
+CONSENSUS_HYPOTHESES = 96
+
+#: Sun light is ADDITIVE, so the lit side cannot be darker than the shadow side in ANY
+#: channel. A material edge routinely is (red brick against grey mortar is brighter in red
+#: and darker in blue). Allowed a small negative slack for 8-bit noise, as a fraction of the
+#: strongest channel's lift.
+RATIO_NEG_SLACK = 0.06
+
+#: Linear-light floor for the shadow side. Ratios taken against a near-black window are
+#: numerically meaningless — the denominator is quantisation.
+MIN_SHADOW_LINEAR = 0.002
+
+#: sRGB→linear as a 256-entry table. The decode is a pow() per channel per pixel otherwise,
+#: and there are only 256 possible 8-bit inputs, so the whole transfer function is a lookup.
+#: Scaled to integers so the window sums stay exact, like the summed-area tables.
+_LIN_SCALE = 65535
+_LIN_LUT = tuple(
+    int(round((v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4) * _LIN_SCALE))
+    for v in (i / 255.0 for i in range(256))
+)
 
 #: Fewer boundary samples than this and the median is an anecdote → None.
 MIN_SAMPLES = 40
@@ -219,6 +262,111 @@ def _window(sats, w: int, h: int, cx: int, cy: int,
     if total <= 0:
         return lum, 1.0 / 3.0, 1.0 / 3.0     # a black patch has no chromaticity to compare
     return lum, tot_r / total, tot_b / total
+
+
+def _linear_window(pixels, w: int, h: int, cx: int, cy: int,
+                   radius: int = PLATEAU_RADIUS) -> Optional[Tuple[float, float, float]]:
+    """Mean LINEAR-light R, G, B over the window at (cx, cy) — or None off-frame.
+
+    Summed directly rather than from a summed-area table on purpose. Only accepted
+    candidates ever need a linear reading, and there are a few hundred of those against
+    65k pixels, so paying per candidate (25 lookups) beats building three more tables over
+    the whole frame. A ratio of DISPLAY-referred values is not a ratio of light — the sRGB
+    curve has to come off first or the invariant below is being computed on the wrong
+    numbers entirely."""
+    x0, x1 = cx - radius, cx + radius + 1
+    y0, y1 = cy - radius, cy + radius + 1
+    if x0 < 0 or y0 < 0 or x1 > w or y1 > h:
+        return None
+    tr = tg = tb = 0
+    for yy in range(y0, y1):
+        base = yy * w
+        for xx in range(x0, x1):
+            r, g, b = pixels[base + xx]
+            tr += _LIN_LUT[r]
+            tg += _LIN_LUT[g]
+            tb += _LIN_LUT[b]
+    area = (x1 - x0) * (y1 - y0) * float(_LIN_SCALE)
+    return tr / area, tg / area, tb / area
+
+
+def _shadow_direction(lit, shade) -> Optional[Tuple[float, float, float]]:
+    """Unit direction of (lit / shade − 1) in linear RGB — the sun-to-ambient spectral
+    ratio s/a — or None when this pair cannot be a shadow boundary.
+
+    Declines when any channel of the shadow side is below MIN_SHADOW_LINEAR (the ratio would
+    be quantisation noise) and when the lit side is meaningfully DARKER in some channel,
+    which additive sunlight cannot do and an albedo change routinely does."""
+    lift = []
+    for i in range(3):
+        if shade[i] < MIN_SHADOW_LINEAR:
+            return None
+        lift.append(lit[i] / shade[i] - 1.0)
+    peak = max(lift)
+    if peak <= 0.0:
+        return None                          # the "lit" side is not brighter in any channel
+    if min(lift) < -RATIO_NEG_SLACK * peak:
+        return None                          # darker somewhere: an albedo change, not sun
+    clamped = [v if v > 0.0 else 0.0 for v in lift]      # tiny negatives are noise
+    norm = math.sqrt(sum(v * v for v in clamped))
+    if norm <= 0.0:
+        return None
+    return clamped[0] / norm, clamped[1] / norm, clamped[2] / norm
+
+
+def _consensus(directions: List[Tuple[float, float, float]],
+               tol_deg: float = RATIO_INLIER_DEG):
+    """The one illuminant change the frame's boundaries agree on. → (axis, inlier flags,
+    mean cosine) or None.
+
+    Strided-hypothesis consensus: every sample's own direction is a candidate axis, each
+    scored by how many samples fall inside a cone of ``tol_deg`` about it, and the best wins.
+    A spherical MEAN would be pulled off the cluster by the outliers this exists to reject —
+    on the dawn plate the outliers are the majority — so the estimator has to be a vote, not
+    an average. One refinement pass re-centres the winning axis on the mean of its own
+    inliers and re-counts, which recovers the precision a discrete hypothesis set gives up."""
+    k = len(directions)
+    if k == 0:
+        return None
+    tol_cos = math.cos(math.radians(tol_deg))
+    stride = max(1, k // CONSENSUS_HYPOTHESES)
+    best_axis, best_count = None, -1
+    for hi in range(0, k, stride):
+        ax, ay, az = directions[hi]
+        count = 0
+        for dx, dy, dz in directions:
+            if dx * ax + dy * ay + dz * az >= tol_cos:
+                count += 1
+        if count > best_count:
+            best_axis, best_count = directions[hi], count
+    if best_axis is None:
+        return None
+    # refine: re-centre on the mean of the inliers, then take the final membership from it
+    for _ in range(2):
+        ax, ay, az = best_axis
+        sx = sy = sz = 0.0
+        for dx, dy, dz in directions:
+            if dx * ax + dy * ay + dz * az >= tol_cos:
+                sx += dx
+                sy += dy
+                sz += dz
+        norm = math.sqrt(sx * sx + sy * sy + sz * sz)
+        if norm <= 0.0:
+            break
+        best_axis = (sx / norm, sy / norm, sz / norm)
+    ax, ay, az = best_axis
+    flags = []
+    dot_sum = 0.0
+    for dx, dy, dz in directions:
+        dot = dx * ax + dy * ay + dz * az
+        inlier = dot >= tol_cos
+        flags.append(inlier)
+        if inlier:
+            dot_sum += dot
+    hits = sum(1 for f in flags if f)
+    if not hits:
+        return None
+    return best_axis, flags, dot_sum / hits
 
 
 def _hardness_from_width(width_px: float) -> float:
@@ -347,6 +495,7 @@ def _edge_hardness(source) -> Optional[Dict]:
     sats = _sat3(pixels, w, h)
     hardnesses: List[float] = []
     widths: List[float] = []
+    directions: List[Tuple[float, float, float]] = []
     lo_y, hi_y = EDGE_MARGIN_PX, h - EDGE_MARGIN_PX
     lo_x, hi_x = EDGE_MARGIN_PX, w - EDGE_MARGIN_PX
     for y in range(lo_y, hi_y):
@@ -389,12 +538,42 @@ def _edge_hardness(source) -> Optional[Dict]:
             hi_lum, lo_lum = (a[0], b[0]) if near_step > 0 else (b[0], a[0])
             if lo_lum <= 1e-6 or hi_lum / lo_lum < MIN_STEP_RATIO:
                 continue
-            # MATERIAL — one albedo either side, so the chromaticity should survive
-            if abs(a[1] - b[1]) + abs(a[2] - b[2]) > CHROMA_TOL:
+            # MATERIAL — the shadow ratio, in LINEAR light, for the consensus below. The
+            # brighter plateau is the lit side by construction of near_step's sign.
+            if near_step > 0:
+                lit_xy, shade_xy = (x + near_dx, y + near_dy), (x - near_dx, y - near_dy)
+            else:
+                lit_xy, shade_xy = (x - near_dx, y - near_dy), (x + near_dx, y + near_dy)
+            lit_lin = _linear_window(pixels, w, h, lit_xy[0], lit_xy[1])
+            shade_lin = _linear_window(pixels, w, h, shade_xy[0], shade_xy[1])
+            if lit_lin is None or shade_lin is None:
+                continue
+            direction = _shadow_direction(lit_lin, shade_lin)
+            if direction is None:
                 continue
             width = abs(near_step) / m       # Δ / slope: the edge's own width, in pixels
             widths.append(width)
             hardnesses.append(_hardness_from_width(width))
+            directions.append(direction)
+
+    # ---- CONSENSUS. Keep only the boundaries that agree on one illuminant change; measure
+    # hardness on those alone. This is the step that decides whether the frame contains
+    # shadow edges at all, so it runs before the sample-count gate.
+    candidates = len(hardnesses)
+    if candidates < MIN_SAMPLES:
+        return None
+    agreed = _consensus(directions)
+    if agreed is None:
+        return None
+    axis, flags, mean_cos = agreed
+    inlier_frac = sum(1 for f in flags if f) / float(candidates)
+    if inlier_frac < MIN_INLIER_FRAC:
+        # No shared illuminant change ⇒ these are not shadow boundaries. Reporting a
+        # hardness here is exactly the confidently-wrong reading this consensus exists to
+        # stop, so the answer is absence, not a low-confidence number.
+        return None
+    hardnesses = [v for v, keep in zip(hardnesses, flags) if keep]
+    widths = [v for v, keep in zip(widths, flags) if keep]
     samples = len(hardnesses)
     if samples < MIN_SAMPLES:
         return None
