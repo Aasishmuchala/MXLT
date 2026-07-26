@@ -629,3 +629,40 @@ def test_cancel_can_release_a_run_that_will_not_respond_to_it():
     rel = inspect.getsource(dockmod.MaxGafferDock._force_release)
     assert "self._busy = False" in rel and "setEnabled(True)" in rel
     assert "does NOT stop" in src, "it must not imply the work was killed"
+
+
+def test_a_long_run_always_shows_its_own_log():
+    """THE bug behind "it is just stuck half the time". The transcript widget is created
+    hidden and was only ever revealed by clicking "Transcript ▾" — so a running match
+    displayed nothing at all: no log, no meter, no clock. That is indistinguishable from a
+    hang, and the plugin was logging every step of its work the whole time.
+
+    Anything that takes minutes reveals its transcript when it starts. The toggle stays,
+    for hiding it afterwards."""
+    import inspect
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6.QtWidgets")
+
+    from maxgaffer.ui import dock as dockmod
+
+    begin = inspect.getsource(dockmod.MaxGafferDock._progress_begin)
+    assert "self.log.setVisible(True)" in begin, "a run that shows nothing looks hung"
+    assert 'setText("Transcript ▴")' in begin, "the toggle label must not contradict it"
+
+
+def test_progress_never_starts_for_a_run_that_was_refused():
+    """_progress_begin resets the clock and reveals the panel, so it must sit AFTER the
+    busy guard and every early return. Called first, a click while busy would restart the
+    timer for a run that never began — the readout would then be describing nothing."""
+    import re
+
+    src = open("maxgaffer/ui/dock.py", encoding="utf-8").read()
+    for fn in ("_start_match", "_start_match_all", "_start_refine"):
+        body = re.search(r"\n    def %s\(self\):\n(.*?)(?=\n    def )" % fn, src, re.S)
+        assert body, fn
+        guard = body.group(1).find("if self._busy")
+        begin = body.group(1).find("_progress_begin")
+        assert guard != -1, f"{fn} lost its busy guard"
+        assert begin == -1 or guard < begin, f"{fn} starts progress before it commits"

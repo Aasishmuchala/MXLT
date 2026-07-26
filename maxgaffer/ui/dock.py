@@ -692,6 +692,13 @@ class MaxGafferDock(QtWidgets.QWidget):
         return "%d:%02d" % (secs // 60, secs % 60)
 
     def _progress_begin(self, what: str):
+        # The transcript is created hidden and was only ever revealed by clicking
+        # "Transcript ▾". So a running match showed NOTHING — no log, no meter — which is
+        # indistinguishable from a hang, and is what "it is just stuck half the time"
+        # actually was. Anything that takes minutes shows its work from the start; the
+        # toggle stays, for hiding it afterwards.
+        self.log.setVisible(True)
+        self.btn_transcript.setText("Transcript ▴")
         self.lbl_stage.setText(str(what).upper())
         self.lbl_pct.setText("0:00")
         self.bar.setValue(0)
@@ -1379,6 +1386,7 @@ class MaxGafferDock(QtWidgets.QWidget):
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
         ) != QtWidgets.QMessageBox.Yes:
             return
+        self._progress_begin("matching every camera")
         self._busy = True
         self._cancel = False
         for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
@@ -1473,6 +1481,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         if not (e and e.reference):
             self._log("bind a reference image first")
             return
+        self._progress_begin("refining")
         self._busy = True
         self._cancel = False
         for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
