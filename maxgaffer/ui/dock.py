@@ -180,6 +180,135 @@ class _Worker(QtCore.QThread):
             self.failed.emit(str(e))
 
 
+class _PlateWipe(QtWidgets.QWidget):
+    """A reference monitor: reference left of a draggable split, match right, corner crop
+    marks per the plate grammar. Judging a match is comparing, and a wipe puts the
+    comparison exactly where the artist's eye already is.
+
+    Pixmaps are kept at native size and scaled at paint time, so the split stays crisp on
+    resize instead of re-sampling a pre-shrunk thumb."""
+
+    def __init__(self):
+        super().__init__()
+        self._ref = None
+        self._match = None
+        self._ref_note = "no reference"
+        self._match_note = "no match yet"
+        self._split = 0.5
+        self.setMinimumWidth(420)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.setFixedHeight(236)
+        self.setCursor(QtCore.Qt.SplitHCursor)
+
+    def set_side(self, side, pixmap):
+        if side == "ref":
+            self._ref = pixmap
+        else:
+            self._match = pixmap
+        self.update()
+
+    def set_note(self, side, text):
+        if side == "ref":
+            self._ref_note = text
+        else:
+            self._match_note = text
+        self.update()
+
+    def mousePressEvent(self, ev):
+        self._drag_to(ev)
+
+    def mouseMoveEvent(self, ev):
+        if ev.buttons() & QtCore.Qt.LeftButton:
+            self._drag_to(ev)
+
+    def mouseDoubleClickEvent(self, ev):
+        self._split = (1.0 if self._split < 0.25
+                       else 0.0 if self._split > 0.75 else 0.5)
+        self.update()
+
+    def _drag_to(self, ev):
+        w = max(1, self.width())
+        try:
+            x = ev.position().x()
+        except AttributeError:              # Qt5-style event object
+            x = ev.pos().x()
+        self._split = min(1.0, max(0.0, x / w))
+        self.update()
+
+    def paintEvent(self, _ev):
+        p = QtGui.QPainter(self)
+        rect = self.rect()
+        p.fillRect(rect, QtGui.QColor("#0d0d0d"))
+        split_x = int(rect.width() * self._split)
+
+        def _draw(pix, clip, note):
+            if clip.isEmpty():
+                return
+            p.save()
+            p.setClipRect(clip)
+            if pix is not None and not pix.isNull():
+                scaled = pix.scaled(rect.size(), QtCore.Qt.KeepAspectRatio,
+                                    QtCore.Qt.SmoothTransformation)
+                x = rect.x() + (rect.width() - scaled.width()) // 2
+                y = rect.y() + (rect.height() - scaled.height()) // 2
+                p.drawPixmap(x, y, scaled)
+            else:
+                p.setPen(QtGui.QColor(FAINT))
+                p.setFont(QtGui.QFont("Consolas", 8))
+                p.drawText(clip, QtCore.Qt.AlignCenter, note)
+            p.restore()
+
+        _draw(self._ref, QtCore.QRect(rect.x(), rect.y(), split_x, rect.height()),
+              self._ref_note)
+        _draw(self._match, QtCore.QRect(rect.x() + split_x, rect.y(),
+                                        rect.width() - split_x, rect.height()),
+              self._match_note)
+        p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 60), 1))
+        p.drawLine(split_x, rect.y(), split_x, rect.bottom())
+        p.setPen(QtGui.QPen(QtGui.QColor(SIGNAL), 1))
+        mid = rect.center().y()
+        p.drawLine(split_x, mid - 7, split_x, mid + 7)
+        p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 70), 1))
+        m, ln = 5, 9
+        for cx, sx in ((rect.left() + m, 1), (rect.right() - m, -1)):
+            for cy, sy in ((rect.top() + m, 1), (rect.bottom() - m, -1)):
+                p.drawLine(cx, cy, cx + sx * ln, cy)
+                p.drawLine(cx, cy, cx, cy + sy * ln)
+        p.end()
+
+
+class _PlateSide:
+    """Adapter with the old thumb-label surface (setPixmap/setText/size/clear), so every
+    existing handler keeps working while both sides land on the ONE wipe monitor."""
+
+    def __init__(self, plate, side):
+        self._plate, self._side = plate, side
+
+    def setPixmap(self, pix):
+        pix = None if (pix is None or pix.isNull()) else pix
+        if pix is not None:
+            self._last_text = ""
+        self._plate.set_side(self._side, pix)
+
+    def pixmap(self):
+        return self._plate._ref if self._side == "ref" else self._plate._match
+
+    def setText(self, text):
+        self._last_text = text
+        self._plate.set_note(self._side, text)
+        self._plate.set_side(self._side, None)
+
+    def text(self):
+        return getattr(self, "_last_text", "")
+
+    def size(self):
+        # scale target for _bounded_pixmap; the plate rescales at paint time anyway
+        return QtCore.QSize(640, 360)
+
+    def clear(self):
+        self._plate.set_side(self._side, None)
+
+
 class _ProgressRelay(QtCore.QObject):
     """Marshals worker-thread progress callbacks onto the main thread — Qt widgets must
     never be touched from a vantage_console watcher thread."""
@@ -286,35 +415,27 @@ class MaxGafferDock(QtWidgets.QWidget):
             "notes and locks. Asks first.")
         self.btn_reset.clicked.connect(self._on_reset)
         head.addWidget(self.btn_reset)
-        self.lbl_score = QtWidgets.QLabel("—")
-        self.lbl_score.setObjectName("dim")
-        self.lbl_score.setToolTip("Last match score for this camera.")
-        head.addWidget(self.lbl_score)
         btn_settings = QtWidgets.QPushButton("Settings")
         btn_settings.clicked.connect(self._open_settings)
         head.addWidget(btn_settings)
         col.addLayout(head)
 
-        # ---- card: reference vs latest match
+        # ---- card: the reference monitor. ONE plate with a draggable REF|MATCH wipe,
+        # because judging a match IS comparing — two small wells side by side made the
+        # artist's eye do the wipe. Same pixels, twice the judging precision. Drag to move
+        # the split; double-click snaps it full either way.
         lr = self._card(col)
         thumbs = QtWidgets.QHBoxLayout()
         thumbs.setSpacing(14)
-
-        def _thumb(placeholder, cap):
-            wrap = QtWidgets.QVBoxLayout()
-            wrap.setSpacing(6)
-            t = QtWidgets.QLabel(placeholder)
-            t.setFixedSize(272, 153)
-            t.setAlignment(QtCore.Qt.AlignCenter)
-            t.setStyleSheet(f"background:{WELLIMG};border:{WELLINE};border-radius:{RAD};"
-                            f"color:{FAINT};font-family:{MONO};letter-spacing:1px;")
-            wrap.addWidget(t)
-            wrap.addWidget(_cap(cap), 0, QtCore.Qt.AlignHCenter)
-            thumbs.addLayout(wrap)
-            return t
-
-        self.ref_thumb = _thumb("no reference", "REFERENCE")
-        self.match_thumb = _thumb("no match yet", "LATEST MATCH")
+        plate_wrap = QtWidgets.QVBoxLayout()
+        plate_wrap.setSpacing(6)
+        self.plate = _PlateWipe()
+        plate_wrap.addWidget(self.plate)
+        plate_wrap.addWidget(_cap("REFERENCE ◂ wipe ▸ MATCH"), 0,
+                             QtCore.Qt.AlignHCenter)
+        thumbs.addLayout(plate_wrap)
+        self.ref_thumb = _PlateSide(self.plate, "ref")
+        self.match_thumb = _PlateSide(self.plate, "match")
         side = QtWidgets.QVBoxLayout()
         side.setSpacing(10)
         btn_ref = QtWidgets.QPushButton("Load / swap reference…")
@@ -388,6 +509,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.btn_locks.setToolTip("Locked parameters are never touched — not by the "
                                   "solver, not by the model.")
         self.lock_menu = QtWidgets.QMenu(self)
+        self.lock_menu.triggered.connect(self._on_lock_menu_triggered)
         self.btn_locks.setMenu(self.lock_menu)
         bar.addWidget(self.btn_locks)
 
@@ -439,6 +561,51 @@ class MaxGafferDock(QtWidgets.QWidget):
         bar.addWidget(self.btn_cancel)
         la.addLayout(bar)
 
+        # ---- VERDICT STRIP — the instrument readout. The session's hardest lesson was
+        # that the headline score hides structure: a 39 can have perfect direction and
+        # ruined warmth, a 92 can be missing its sun entirely. The components and the
+        # honesty flags existed all along and lived only in a scrolling log; this gives
+        # them a fixed place the eye can land on. Weakest component lights up in signal —
+        # it is where the next point of score is.
+        lv = self._card(col)
+        vrow = QtWidgets.QHBoxLayout()
+        vrow.setSpacing(16)
+        self.lbl_score = QtWidgets.QLabel("—")
+        self.lbl_score.setStyleSheet(
+            f"font-family:{MONO};font-size:22px;color:{TEXT};letter-spacing:1px;")
+        self.lbl_score.setFixedWidth(74)
+        vrow.addWidget(self.lbl_score, 0, QtCore.Qt.AlignVCenter)
+        self._meters = {}
+        for mkey, cap in (("key", "KEY"), ("envelope", "ENV"), ("histogram", "HIST"),
+                          ("color", "COLR"), ("hue", "HUE"), ("direction", "DIR"),
+                          ("highlight", "HL")):
+            box = QtWidgets.QVBoxLayout()
+            box.setSpacing(3)
+            capl = QtWidgets.QLabel(cap)
+            capl.setStyleSheet(f"font-family:{MONO};font-size:8px;"
+                               f"letter-spacing:.12em;color:{FAINT};")
+            capl.setAlignment(QtCore.Qt.AlignHCenter)
+            mbar = QtWidgets.QProgressBar()
+            mbar.setRange(0, 1000)
+            mbar.setValue(0)
+            mbar.setTextVisible(False)
+            mbar.setFixedSize(52, 3)
+            mbar.setStyleSheet(
+                f"QProgressBar{{background:{INSET};border:none;border-radius:1px;}}"
+                f"QProgressBar::chunk{{background:{DIM};border-radius:1px;}}")
+            box.addWidget(capl)
+            box.addWidget(mbar, 0, QtCore.Qt.AlignHCenter)
+            vrow.addLayout(box)
+            self._meters[mkey] = (capl, mbar)
+        vrow.addStretch(1)
+        lv.addLayout(vrow)
+        self.lbl_verdict_flag = QtWidgets.QLabel("")
+        self.lbl_verdict_flag.setStyleSheet(
+            f"font-family:{MONO};font-size:9px;letter-spacing:.06em;color:{ALERT};")
+        self.lbl_verdict_flag.setVisible(False)
+        self.lbl_verdict_flag.setWordWrap(True)
+        lv.addWidget(self.lbl_verdict_flag)
+
         # ---- card: CHANGES (the record) + collapsed transcript
         lc = self._card(col)
         crow = QtWidgets.QHBoxLayout()
@@ -467,7 +634,11 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.changes_tree.setRootIsDecorated(True)
         self.changes_tree.setColumnWidth(0, 320)
         self.changes_tree.setColumnWidth(1, 140)
-        self.changes_tree.setMinimumHeight(180)
+        self.changes_tree.setMinimumHeight(110)
+        # the tree no longer earns unbounded height: the rig rows carry the
+        # same facts as delta chips, so spare vertical goes to the transcript
+        # (live evidence) and the rig (controls), not an often-empty record
+        self.changes_tree.setMaximumHeight(170)
         lc.addWidget(self.changes_tree)
         # ---- PROGRESS readout. A match runs for minutes and the log alone cannot tell a
         # working run from a hung one. Instrument, not toy: mono stage label on the left,
@@ -581,8 +752,41 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.log.setVisible(vis)
         self.btn_transcript.setText("Transcript ▴" if vis else "Transcript ▾")
 
+    def _set_verdict(self, score, components, flags):
+        """Fixed-place readout: score, seven component meters, one honesty line.
+
+        The weakest measured component is lit in signal because it is literally where the
+        next point of score is; unmeasured components grey out rather than read as full,
+        the same never-score-an-absence rule the metrics learned. Flags carry the
+        "the score cannot see this" class of warnings that previously scrolled away."""
+        self.lbl_score.setText("—" if score is None else f"{float(score):.1f}")
+        comps = {k: float(v) for k, v in (components or {}).items()
+                 if isinstance(v, (int, float))}
+        worst = min(comps, key=comps.get) if comps else None
+        for mkey, (capl, mbar) in self._meters.items():
+            if mkey in comps:
+                mbar.setValue(int(round(comps[mkey] * 1000)))
+                lit = SIGNAL if mkey == worst else DIM
+                capl.setStyleSheet(f"font-family:{MONO};font-size:8px;"
+                                   f"letter-spacing:.12em;color:{lit};")
+                mbar.setStyleSheet(
+                    f"QProgressBar{{background:{INSET};border:none;border-radius:1px;}}"
+                    f"QProgressBar::chunk{{background:{lit};border-radius:1px;}}")
+            else:
+                mbar.setValue(0)
+                capl.setStyleSheet(f"font-family:{MONO};font-size:8px;"
+                                   f"letter-spacing:.12em;color:{FAINT};")
+        flags = [f for f in (flags or []) if f]
+        self.lbl_verdict_flag.setText(flags[0] + (f"   (+{len(flags)-1} more in the "
+                                                  f"transcript)" if len(flags) > 1 else "")
+                                      if flags else "")
+        self.lbl_verdict_flag.setVisible(bool(flags))
+
     def _fill_changes(self, plan_report, state_rows, headline):
         """The CHANGES panel — the requested always-visible record of what was done."""
+        # the rig rows carry the same facts inline (Δ chips), so remember them here
+        self._rig_deltas = {str(r.get("prop")): (r.get("before"), r.get("after"))
+                            for r in (state_rows or [])}
         t = self.changes_tree
         t.clear()
         top = QtWidgets.QTreeWidgetItem([headline, "", ""])
@@ -674,7 +878,9 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.bar.setValue(0)
         self.lbl_stage.setText("IDLE")
         self.lbl_pct.setText("")
-        for attr in ("thumb_ref", "thumb_match"):
+        self._set_verdict(None, {}, [])
+        self._rig_deltas = {}
+        for attr in ("ref_thumb", "match_thumb"):
             w = getattr(self, attr, None)
             if w is not None:
                 try:
@@ -890,8 +1096,16 @@ class MaxGafferDock(QtWidgets.QWidget):
         self._refresh_reference_panel(self._current_camera())
 
     def _sync_score_badge(self):
+        """Repopulate the verdict strip from the camera's persisted record, so switching
+        cameras (or reopening the dock) shows the last verdict rather than a blank strip
+        — the score alone used to survive the switch while its components vanished."""
         e = self._camera_entry(self._current_camera())
-        self.lbl_score.setText(f"{e.score:.1f}" if (e and e.score is not None) else "—")
+        card = getattr(e, "scorecard", {}) if e is not None else {}
+        flags = []
+        if card.get("content_gap"):
+            flags.append("ceiling proven — the remaining gap is content, not lighting")
+        self._set_verdict(getattr(e, "score", None) if e else None,
+                          card.get("components") or {}, flags)
     def _on_camera_combo(self, _idx: int):
         if self._busy:
             self._log("busy — camera switch ignored until the current run finishes")
@@ -1143,14 +1357,36 @@ class MaxGafferDock(QtWidgets.QWidget):
             a = self.lock_menu.addAction(key)
             a.setCheckable(True)
             a.setChecked(key in locked)
+    def _on_lock_menu_triggered(self, action):
+        btn = getattr(self, "_lock_toggles", {}).get(action.text())
+        if btn is not None and btn.isChecked() != action.isChecked():
+            btn.blockSignals(True)
+            btn.setChecked(action.isChecked())
+            self._style_lock(btn, action.isChecked())
+            btn.blockSignals(False)
+
     def _locks(self) -> set:
         return {a.text() for a in self.lock_menu.actions()
                 if a.isCheckable() and a.isChecked()}
     # ================================================================= rig sliders
+    #: rig section headers, in the order a gaffer reasons: light sources, then the
+    #: camera, then the air. Params fall into the first prefix that matches.
+    _RIG_SECTIONS = (("sun.", "SUN"), ("dome.", "DOME"), ("exposure.", "EXPOSURE"),
+                     ("atmosphere.", "ATMOSPHERE"), (GROUP_PREFIX, "LIGHT GROUPS"))
+
     def rebuild_rig_controls(self):
+        """The rig, grouped by fixture, with each parameter's lock BESIDE its value and the
+        last match's change as a Δ chip on the row it changed.
+
+        This is the CHANGES/RIG merge: the two panels listed the same parameters twice,
+        one of them usually empty (every screenshot the artist sent showed a blank CHANGES
+        tree over a flat rig list). A change IS a rig row with a before-value, and the
+        artist's most precise gesture — hold THIS, solve the rest — should not require a
+        trip to a dropdown two cards away from the value it holds."""
         while self.rig_form.rowCount() > 0:
             self.rig_form.removeRow(0)
         self._sliders.clear()
+        self._lock_toggles = {}
         try:
             state = self.ctrl.read_state(self._current_camera())
         except Exception as e:  # noqa: BLE001
@@ -1158,19 +1394,81 @@ class MaxGafferDock(QtWidgets.QWidget):
             lbl.setObjectName("dim")
             self.rig_form.addRow(lbl)
             return
+        deltas = getattr(self, "_rig_deltas", {}) or {}
+        menu_locked = self._locks()
+
+        def _section_label(text):
+            cap = QtWidgets.QLabel(text)
+            cap.setStyleSheet(f"font-family:{MONO};font-size:8px;letter-spacing:.16em;"
+                              f"color:{FAINT};padding-top:6px;")
+            return cap
+
+        sections = {label: [] for _pref, label in self._RIG_SECTIONS}
+        sections["OTHER"] = []
         for key in sorted(state.keys()):
-            spec = spec_for(key)
-            if spec is None:
+            for pref, label in self._RIG_SECTIONS:
+                if key.startswith(pref):
+                    sections[label].append(key)
+                    break
+            else:
+                sections["OTHER"].append(key)
+
+        for _pref, label in self._RIG_SECTIONS + (("", "OTHER"),):
+            keys = sections.get(label) or []
+            if not keys:
                 continue
-            spin = QtWidgets.QDoubleSpinBox()
-            spin.setRange(spec.lo, spec.hi)
-            spin.setDecimals(2)
-            spin.setSingleStep(1.0 if spec.hi - spec.lo > 20 else 0.1)
-            spin.setValue(state.get(key))
-            spin.setToolTip(spec.doc)
-            spin.valueChanged.connect(lambda v, k=key: self._on_slider(k, v))
-            self._sliders[key] = spin
-            self.rig_form.addRow(key, spin)
+            self.rig_form.addRow(_section_label(label))
+            for key in keys:
+                spec = spec_for(key)
+                if spec is None:
+                    continue
+                row = QtWidgets.QHBoxLayout()
+                row.setSpacing(8)
+                lock = QtWidgets.QPushButton("○")
+                lock.setCheckable(True)
+                lock.setFixedSize(22, 22)
+                lock.setChecked(key in menu_locked)
+                lock.setToolTip(f"Lock {key} — the solver and the model never touch a "
+                                f"locked value.")
+                lock.setStyleSheet(
+                    f"QPushButton{{background:transparent;border:none;color:{FAINT};"
+                    f"font-family:{MONO};padding:0;}}"
+                    f"QPushButton:checked{{color:{SIGNAL};}}")
+                lock.toggled.connect(lambda on, k=key: self._on_inline_lock(k, on))
+                self._style_lock(lock, key in menu_locked)
+                row.addWidget(lock)
+                spin = QtWidgets.QDoubleSpinBox()
+                spin.setRange(spec.lo, spec.hi)
+                spin.setDecimals(2)
+                spin.setSingleStep(1.0 if spec.hi - spec.lo > 20 else 0.1)
+                spin.setValue(state.get(key))
+                spin.setToolTip(spec.doc)
+                spin.valueChanged.connect(lambda v, k=key: self._on_slider(k, v))
+                row.addWidget(spin, 1)
+                if key in deltas:
+                    before, _after = deltas[key]
+                    chip = QtWidgets.QLabel(f"Δ was {before}")
+                    chip.setStyleSheet(f"font-family:{MONO};font-size:9px;color:{DIM};")
+                    chip.setToolTip("changed by the last match — Restore returns it")
+                    row.addWidget(chip)
+                self._sliders[key] = spin
+                self._lock_toggles[key] = lock
+                self.rig_form.addRow(key, row)
+
+    @staticmethod
+    def _style_lock(btn, locked):
+        btn.setText("●" if locked else "○")
+
+    def _on_inline_lock(self, key: str, on: bool):
+        """The inline toggle DRIVES the Locks ▾ menu action of the same name — one source
+        of truth (`_locks()` reads the menu, exactly as before), two places to reach it."""
+        btn = self._lock_toggles.get(key)
+        if btn is not None:
+            self._style_lock(btn, on)
+        for a in self.lock_menu.actions():
+            if a.isCheckable() and a.text() == key and a.isChecked() != on:
+                a.setChecked(on)
+                break
     def _pick_hdri(self):
         if self._busy:
             return
@@ -1390,6 +1688,16 @@ class MaxGafferDock(QtWidgets.QWidget):
                 elif result.ceiling_converged:
                     ceiling = " · plateau (finer steps untested — not a proven ceiling)"
             self._progress_end(f"score {score}")
+            vflags = []
+            hi = getattr(result, "highlight", None)
+            if hi is not None and hi < 0.75:
+                vflags.append(f"sun-patch agreement {hi:.0%} — the reference's directional "
+                              f"light is not landing the same way; the score cannot see "
+                              f"this, your eyes can")
+            if getattr(result, "ceiling_proven", False) and (result.best_score or 0) < 95:
+                vflags.append("ceiling proven — the remaining gap is content, not lighting")
+            self._set_verdict(result.best_score,
+                              getattr(result, "best_components", None), vflags)
             self._log(f"✓ done ({result.stop_reason}) — best {score}{ceiling}")
             self._set_match_thumb(result.best_render)
             headline = f"{cam} — {result.stop_reason}, score {score}"
