@@ -44,6 +44,22 @@ class MatchProfile:
         too coarse to be safe here — polish accepts a move on a 0.03 gain, so a shift that
         size would let it chase measurement error instead of light. Half is the tier the
         evidence supports.
+
+        That first measurement compared GROSS states (scores 16 to 79) and so proved the
+        easy claim. What polish actually needs is the harder one: that a single nudge of one
+        parameter moves the score the same WAY at both sizes. Measured separately, one nudge
+        per polish axis in both directions, 13 in total: every one agreed on direction.
+        Median disagreement on the delta itself was 0.19 and the worst 1.20, and the two
+        nudges that fell under polish's own 0.03 gate were rejected at both sizes, so the
+        decision matched there too.
+
+        Known limit, stated because it is not covered by either measurement: nudges taken
+        near CONVERGENCE, where the true delta is a few hundredths, are not represented in
+        that set. The direction was right in every case tested, but the magnitude error
+        means polish can stop at a marginally different point than a full-size run would.
+        The score reported to the artist never comes from these frames — the final state is
+        re-rendered full size — so the cost of being wrong here is a slightly different
+        answer, never a wrong number about it.
         """
         return (max(64, self.loop_width // 2), max(36, self.loop_height // 2))
 

@@ -793,3 +793,28 @@ def test_polish_renders_cheap_but_the_answer_is_verified_full_size():
     verify_at = src.index("final_full.png")
     score_at = src.index("honest = self.stats_for(")
     assert verify_at < score_at, "the reported score would come from a cheap frame"
+
+
+def test_half_res_agrees_on_the_DIRECTION_of_a_polish_nudge():
+    """The first resolution measurement compared GROSS states (scores 16 to 79) and proved
+    only the easy claim. Polish nudges ONE parameter by its own step and accepts the move on
+    a 0.03 gain, so what has to survive is the sign of a single small delta.
+
+    Measured separately on-box 2026-07-26, one nudge per polish axis in both directions,
+    13 in total: every one agreed on direction between full and half resolution. Median
+    delta disagreement 0.19, worst 1.20, and the two nudges below polish's own 0.03 gate
+    were rejected at both sizes.
+
+    This test guards the CONTRACT that makes that safe — the polish tier stays strictly
+    between the sweep tier and full loop size, so it is cheap without collapsing to the
+    coarse quarter that drifted 1.33."""
+    from maxgaffer.core.profiles import resolve_profile
+
+    for name in ("standard", "hero"):
+        p = resolve_profile(name, loop_width=400, loop_height=600, max_iterations=10,
+                            sweep_count=8, target_score=95.0)
+        pw, ph = p.polish_size
+        assert pw == p.loop_width // 2 and ph == p.loop_height // 2, name
+        assert pw < p.loop_width, "polish must be cheaper than the loop"
+        assert pw >= p.loop_width // 3, (
+            "quarter resolution drifted 1.33 points — too coarse for a 0.03 gain gate")
