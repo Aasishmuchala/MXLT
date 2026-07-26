@@ -97,17 +97,58 @@ def parse_json_from_text(text: str) -> Optional[dict]:
     return None
 
 
+#: Grace added to the caller's timeout before the watchdog abandons the request thread.
+_WATCHDOG_GRACE_S = 15
+
+
 def _default_post(url: str, headers: dict, body: bytes, timeout: int) -> tuple:
-    """Stdlib HTTP POST, imported lazily so tests never touch the network by accident."""
+    """Stdlib HTTP POST with a HARD overall deadline, imported lazily so tests never touch
+    the network by accident.
+
+    The urlopen timeout only bounds socket operations — connect and read. Everything BEFORE
+    the socket is unbounded: getaddrinfo has no timeout parameter at all, and Windows proxy
+    auto-discovery can block indefinitely. That gap is not theoretical here. Measured
+    2026-07-26, twice in one day: the identical request completed in 3.4-5.7s from a plain
+    python process while hanging FOREVER (70 minutes at ~0% CPU, and again for 15 minutes)
+    inside 3ds Max's embedded interpreter — wedged before the first byte moved, where the
+    120s "timeout" never sees it. Inside the dock that presented as the plugin freezing
+    with the MATCH button dead, which cost most of a day to corner.
+
+    So the request runs on a daemon worker and this thread waits ``timeout`` plus grace.
+    On expiry the worker is ABANDONED — there is no portable way to kill it, and a leaked
+    daemon thread parked in getaddrinfo costs nothing — and a typed network error is
+    raised, which the retry loop and the dock's offline fallback already know how to
+    handle. A hang becomes an error; an error has a message; a message can be acted on."""
+    import queue
+    import threading
     import urllib.error
     import urllib.request
 
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    def _worker(out: "queue.Queue") -> None:
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 fixed https base
+                out.put((resp.getcode(), resp.read().decode("utf-8", errors="replace")))
+        except urllib.error.HTTPError as e:   # 4xx/5xx still carry a body worth reading
+            out.put((e.code, e.read().decode("utf-8", errors="replace")))
+        except BaseException as e:  # noqa: BLE001 — marshalled, re-raised on the caller
+            out.put(e)
+
+    out: "queue.Queue" = queue.Queue(maxsize=1)
+    t = threading.Thread(target=_worker, args=(out,), daemon=True,
+                         name="maxgaffer-gateway-post")
+    t.start()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 fixed https base
-            return resp.getcode(), resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:  # 4xx/5xx still carry a body we want to inspect
-        return e.code, e.read().decode("utf-8", errors="replace")
+        got = out.get(timeout=float(timeout) + _WATCHDOG_GRACE_S)
+    except queue.Empty:
+        raise OmegaError(
+            f"gateway gave no response within {int(timeout) + _WATCHDOG_GRACE_S}s — the "
+            f"request never reached the socket stage (DNS or proxy discovery wedged, a "
+            f"known failure inside 3ds Max's python). The request thread was abandoned.",
+            kind="network")
+    if isinstance(got, BaseException):
+        raise got
+    return got
 
 
 def resolve_url(base_url: str = "") -> str:

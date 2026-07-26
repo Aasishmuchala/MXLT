@@ -847,3 +847,49 @@ def test_a_probe_time_budget_exists_and_is_off_by_default():
     src = open("maxgaffer/maxbridge/draft.py", encoding="utf-8").read()
     assert "seconds / 60.0" in src, "V-Ray states this cap in MINUTES"
     assert "probe_max_seconds" in src
+
+
+def test_a_gateway_request_that_never_reaches_the_socket_still_times_out():
+    """THE root cause of the day's "plugin is stuck" reports, cornered twice: the identical
+    ANALYZE request completed in 3.4-5.7s from a plain python process while hanging FOREVER
+    inside 3ds Max's embedded interpreter — 70 minutes at ~0% CPU in the dock, 15 in a
+    batch run, both wedged BEFORE the first byte moved. urlopen's timeout only bounds
+    socket operations; getaddrinfo has no timeout parameter at all and Windows proxy
+    discovery can block unboundedly, so the 120s "timeout" never saw the hang.
+
+    The post now runs on an abandoned-on-expiry daemon worker under a hard deadline. A hang
+    becomes a typed network error; an error has a message; a message can be acted on — the
+    retry loop and the dock's offline fallback both already know what to do with it."""
+    import threading
+    import time
+
+    from maxgaffer.core import omega
+
+    started = threading.Event()
+
+    # the wedge is simulated at urlopen itself — the exact call that sat under the real
+    # hang — so the watchdog is exercised through the same seam the failure used
+    import urllib.request
+
+    real_urlopen = urllib.request.urlopen
+
+    def hang_forever(*a, **kw):
+        started.set()
+        time.sleep(3600)
+
+    urllib.request.urlopen = hang_forever
+    real_grace = omega._WATCHDOG_GRACE_S
+    omega._WATCHDOG_GRACE_S = 1
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(omega.OmegaError) as err:
+            omega._default_post("https://example.invalid/v1/messages", {}, b"{}", 1)
+        elapsed = time.monotonic() - t0
+    finally:
+        urllib.request.urlopen = real_urlopen
+        omega._WATCHDOG_GRACE_S = real_grace
+
+    assert started.wait(1), "the worker never even started"
+    assert elapsed < 10, f"the watchdog did not fire in time ({elapsed:.1f}s)"
+    assert err.value.kind == "network", "the retry loop keys off the kind"
+    assert "never reached the socket" in str(err.value)
