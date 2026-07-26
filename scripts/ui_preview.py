@@ -112,6 +112,12 @@ def main() -> None:
     app.processEvents()
     d.grab().save(os.path.join(OUT, "dock.png"))
 
+    # mid-match: the progress readout an artist watches for minutes at a time
+    d._progress_begin("preparing")
+    d._on_match_progress("sun solve", 27, 44, 34.8)
+    app.processEvents()
+    d.grab().save(os.path.join(OUT, "dock_matching.png"))
+
     cands = [
         {"key": "as_analyzed", "label": "As analyzed", "why": "the reference's own read",
          "state": T.demo_state(), "render": ref_warm, "score": 84.1},

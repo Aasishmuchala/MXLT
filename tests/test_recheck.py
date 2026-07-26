@@ -491,3 +491,31 @@ def test_the_diagonal_escape_adopts_the_state_it_actually_measured():
     after = diag[diag.index("for ka, kb in pairs:"):]
     assert "cand.set(ka," not in after, "a caller rebuilt the diagonal instead of adopting it"
     assert "sc, cand = got" in after and "sc2, cand2 = got2" in after
+
+
+def test_the_match_reports_progress_from_the_single_render_seam():
+    """A match runs for minutes and the log alone cannot distinguish a working run from a
+    hung one. Every unit of work already passes through render_hook and the tag names the
+    stage, so progress is counted there rather than threaded separately through the solver,
+    the sweep, the loop and polish — one seam, no plumbing, and it cannot drift out of sync
+    with what is actually being rendered."""
+    import inspect
+
+    from maxgaffer.maxbridge.controller import Controller
+
+    sig = inspect.signature(Controller.run_match)
+    assert "on_progress" in sig.parameters
+    assert sig.parameters["on_progress"].default is None, "progress must be opt-in"
+
+    src = inspect.getsource(Controller.run_match)
+    hook_at = src.index("def render_hook(")
+    assert "_tick(tag)" in src[hook_at:hook_at + 900], "the seam does not count its work"
+    # every stage the artist waits through must be nameable, or the label lies
+    for stage in ("basin", "sunsolve", "sweep", "polish"):
+        assert f'"{stage}"' in src
+    # a stage that overruns its budget must not push the bar past 100
+    assert "min(_seen[key], budget)" in src
+    assert "min(100.0," in src
+    # and a broken readout must never take a match down with it
+    tick_at = src.index("def _tick(")
+    assert "except Exception" in src[tick_at:tick_at + 1200]

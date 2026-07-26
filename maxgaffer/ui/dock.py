@@ -184,6 +184,8 @@ class _ProgressRelay(QtCore.QObject):
     never be touched from a vantage_console watcher thread."""
 
     progress = QtCore.Signal(str, str)
+    #: stage label, done, total, overall percent — emitted from the match worker thread
+    match_progress = QtCore.Signal(str, int, int, float)
 
 
 class MaxGafferDock(QtWidgets.QWidget):
@@ -194,6 +196,8 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.cfg = cfgmod.load()
         self.ctrl = Controller(self.cfg)
         self.ctrl.io = self._run_blocking_io   # gateway waits run off-thread, Max stays alive
+        self._relay = _ProgressRelay(self)
+        self._relay.match_progress.connect(self._on_match_progress)
         self._workers: List[_Worker] = []
         self._cancel = False
         self._busy = False
@@ -446,6 +450,39 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.changes_tree.setColumnWidth(1, 140)
         self.changes_tree.setMinimumHeight(180)
         lc.addWidget(self.changes_tree)
+        # ---- PROGRESS readout. A match runs for minutes and the log alone cannot tell a
+        # working run from a hung one. Instrument, not toy: mono stage label on the left,
+        # tabular probe count and percent on the right, and a hairline meter that only
+        # moves because work was actually done (SthyraDesign2 loading/processing).
+        self.progress_row = QtWidgets.QWidget()
+        pr = QtWidgets.QVBoxLayout(self.progress_row)
+        pr.setContentsMargins(0, 2, 0, 0)
+        pr.setSpacing(5)
+        ptop = QtWidgets.QHBoxLayout()
+        ptop.setSpacing(8)
+        self.lbl_stage = QtWidgets.QLabel("IDLE")
+        self.lbl_stage.setStyleSheet(
+            f"font-family:{MONO};font-size:9px;letter-spacing:.14em;color:{DIM};")
+        self.lbl_pct = QtWidgets.QLabel("")
+        self.lbl_pct.setStyleSheet(
+            f"font-family:{MONO};font-size:9px;letter-spacing:.10em;color:{SIGNAL};")
+        self.lbl_pct.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        ptop.addWidget(self.lbl_stage)
+        ptop.addStretch(1)
+        ptop.addWidget(self.lbl_pct)
+        pr.addLayout(ptop)
+        self.bar = QtWidgets.QProgressBar()
+        self.bar.setRange(0, 1000)          # tenths of a percent — the meter never jumps
+        self.bar.setValue(0)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(3)
+        self.bar.setStyleSheet(
+            f"QProgressBar{{background:{INSET};border:none;border-radius:1px;}}"
+            f"QProgressBar::chunk{{background:{SIGNAL};border-radius:1px;}}")
+        pr.addWidget(self.bar)
+        self.progress_row.setVisible(False)
+        lc.addWidget(self.progress_row)
+
         self.log = QtWidgets.QTextEdit()
         self.log.setReadOnly(True)
         self.log.setMinimumHeight(150)
@@ -565,6 +602,25 @@ class MaxGafferDock(QtWidgets.QWidget):
         top.setExpanded(True)
 
     # ================================================================= helpers
+    def _on_match_progress(self, stage: str, done: int, total: int, pct: float):
+        """Main-thread slot. Qt widgets are never touched from the worker."""
+        self.lbl_stage.setText(str(stage).upper())
+        self.lbl_pct.setText("%d/%d   %3d%%" % (done, total, int(pct)))
+        self.bar.setValue(int(round(pct * 10)))
+
+    def _progress_begin(self, what: str):
+        self.lbl_stage.setText(str(what).upper())
+        self.lbl_pct.setText("starting…")
+        self.bar.setValue(0)
+        self.progress_row.setVisible(True)
+
+    def _progress_end(self, note: str = ""):
+        # Left ON at 100 rather than hidden: after a long run the artist wants to see that
+        # it finished, not an empty space where the meter was.
+        self.bar.setValue(1000)
+        self.lbl_stage.setText("DONE")
+        self.lbl_pct.setText(note or "100%")
+
     def _log(self, msg: str):
         _mirror_log(msg)
         if msg.startswith("THUMB::"):
@@ -1132,6 +1188,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.cfg.auto_execute_plan = self.act_autoexec.isChecked()
         self.cfg.draft_sampler = self.act_draft.isChecked()
         self.log.clear()
+        self._progress_begin("preparing")
         self._log(f"— match: {cam} —")
         plan_report = None
         try:
@@ -1155,6 +1212,8 @@ class MaxGafferDock(QtWidgets.QWidget):
             result = self.ctrl.run_match(
                 cam, log=self._log,
                 should_cancel=lambda: self._cancel,
+                on_progress=lambda st, d, t, p: self._relay.match_progress.emit(
+                    st, d, t, p),
                 locks=self._locks(),
                 do_sweep=self.act_sweep.isChecked(),
                 deep=(mode == 1),
@@ -1167,6 +1226,7 @@ class MaxGafferDock(QtWidgets.QWidget):
                     ceiling = " · ceiling proven — the gap left is content, not lighting"
                 elif result.ceiling_converged:
                     ceiling = " · plateau (finer steps untested — not a proven ceiling)"
+            self._progress_end(f"score {score}")
             self._log(f"✓ done ({result.stop_reason}) — best {score}{ceiling}")
             self._set_match_thumb(result.best_render)
             headline = f"{cam} — {result.stop_reason}, score {score}"

@@ -864,6 +864,7 @@ class Controller:
         log: Callable[[str], None],
         should_cancel: Callable[[], bool] = lambda: False,
         locks: Optional[set] = None,
+        on_progress: Optional[Callable[[str, int, int, float], None]] = None,
         do_sweep: bool = False,
         deep: bool = False,
         quality_profile: str = "standard",
@@ -1000,7 +1001,57 @@ class Controller:
                 log("software exposure ON — EV/WB applied to loop frames before scoring "
                     "(renderer-independent; V-Ray GPU's exposure is display-stage only)")
 
+            # ---- PROGRESS. Stages are counted by their render tags and weighted by the
+            # budget each one is allowed, so the bar tracks work actually done rather than
+            # a guess. Totals come from the resolved profile, so a fast run and a hero run
+            # both read 0..100 honestly instead of the hero crawling to 30.
+            _stage_budget = [
+                ("basin", "multi-start", 6),
+                ("sunsolve", "sun solve", int(sunsolve.__dict__.get("COARSE_AZIMUTHS", 12))
+                 * len(sunsolve.COARSE_ALTITUDES) + 8),
+                ("sweep", "sun sweep", max(1, int(profile.sweep_count))),
+                ("iter", "match loop", max(1, int(profile.max_iterations))),
+                ("polish", "polish", max(1, int(profile.polish_max_probes))),
+            ]
+            _total_units = float(sum(b for _k, _l, b in _stage_budget)) or 1.0
+            _seen = {k: 0 for k, _l, _b in _stage_budget}
+
+            def _stage_of(tag: str) -> str:
+                if tag.startswith("sweep_basin"):
+                    return "basin"
+                if tag.startswith("sunsolve"):
+                    return "sunsolve"
+                if tag.startswith("sweep"):
+                    return "sweep"
+                if tag.startswith("polish"):
+                    return "polish"
+                return "iter"
+
+            def _tick(tag: str) -> None:
+                if on_progress is None:
+                    return
+                st = _stage_of(tag)
+                _seen[st] = _seen[st] + 1
+                done_units = 0.0
+                label, cur, cap = st, _seen[st], 1
+                for key, lab, budget in _stage_budget:
+                    # a stage that overran its budget still counts as finished, never >100
+                    done_units += min(_seen[key], budget)
+                    if key == st:
+                        label, cap = lab, budget
+                try:
+                    on_progress(label, min(cur, cap), cap,
+                                max(0.0, min(100.0, 100.0 * done_units / _total_units)))
+                except Exception:  # noqa: BLE001 — a readout must never sink a match
+                    pass
+
             def render_hook(tag: str):
+                # Every unit of work in a match passes through here, and the tag says which
+                # STAGE it belongs to — so this is the one place progress can be counted
+                # without threading a callback through the solver, the sweep, the loop and
+                # polish separately. A match can run for many minutes; without this the
+                # artist has no way to tell a working run from a hung one.
+                _tick(tag)
                 # DIRECTION-solving stages render small. They are comparing where the light
                 # falls, not judging tone, and there are dozens of them: the global sun
                 # solve alone probes up to 56. Measured — it was rendering at full loop
