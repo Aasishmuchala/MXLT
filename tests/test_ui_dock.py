@@ -89,7 +89,11 @@ class FakeController:
 
     def run_match(self, camera_name, log, should_cancel=lambda: False, locks=None,
                   do_sweep=False, deep=False, quality_profile="standard",
-                  start_override=None, director_note=""):
+                  start_override=None, director_note="", **kw):
+        # **kw on purpose. A double with a FIXED signature turns every new optional
+        # argument into a silent TypeError that looks like the feature not working: adding
+        # on_progress made the dock stop calling run_match entirely, and the test reported
+        # "run_match not called" rather than "the double rejected a keyword".
         self.calls.append(("run_match", camera_name, frozenset(locks or set()),
                            do_sweep, deep, quality_profile))
         if self.raise_on_match:

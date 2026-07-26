@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import html as _html
 import os
+import traceback
 from typing import Dict, List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets  # type: ignore
@@ -691,14 +692,17 @@ class MaxGafferDock(QtWidgets.QWidget):
         secs = int(self._elapsed.elapsed() / 1000)
         return "%d:%02d" % (secs // 60, secs % 60)
 
+    def _show_log(self):
+        self.log.setVisible(True)
+        self.btn_transcript.setText("Transcript ▴")
+
     def _progress_begin(self, what: str):
         # The transcript is created hidden and was only ever revealed by clicking
         # "Transcript ▾". So a running match showed NOTHING — no log, no meter — which is
         # indistinguishable from a hang, and is what "it is just stuck half the time"
         # actually was. Anything that takes minutes shows its work from the start; the
         # toggle stays, for hiding it afterwards.
-        self.log.setVisible(True)
-        self.btn_transcript.setText("Transcript ▴")
+        self._show_log()
         self.lbl_stage.setText(str(what).upper())
         self.lbl_pct.setText("0:00")
         self.bar.setValue(0)
@@ -1206,17 +1210,20 @@ class MaxGafferDock(QtWidgets.QWidget):
         if not cam:
             self._log("select a camera first")
             return
-        self._busy = True
-        self._cancel = False
-        for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
-            b.setEnabled(False)
-        self.btn_cancel.setEnabled(True)
-        self._log(f"— scenario board: {cam} —")
         results = []
         try:
+            self._busy = True
+            self._cancel = False
+            for b in (self.btn_match, self.btn_match_all, self.btn_refine,
+                      self.btn_board):
+                b.setEnabled(False)
+            self.btn_cancel.setEnabled(True)
+            self._progress_begin("scenario board")
+            self._log(f"— scenario board: {cam} —")
             results = self.ctrl.run_scenarios(cam, log=self._log,
                                               should_cancel=lambda: self._cancel)
         except Exception as err:  # noqa: BLE001
+            self._show_log()
             self._log(f"✗ board: {err}")
         finally:
             self._busy = False
@@ -1297,21 +1304,30 @@ class MaxGafferDock(QtWidgets.QWidget):
                 "offline", "openai_compatible", "local"):
             self._log("no semantic API key — continuing with the reduced-intelligence "
                       "offline analytic solver")
-        self._busy = True
-        self._cancel = False
-        for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
-            b.setEnabled(False)
-        self.btn_cancel.setEnabled(True)
-        mode = self.cmb_mode.currentIndex()       # 0 standard · 1 hero · 2 loop-only · 3 fast
-        self.cfg.auto_execute_plan = self.act_autoexec.isChecked()
-        self.cfg.draft_sampler = self.act_draft.isChecked()
-        self.log.clear()
-        self._progress_begin("reading the reference")
-        self._log(f"— match: {cam} —")
-        self._log("· the reference is read by the gateway first — this is a network wait, "
-                  "not a render, so the clock moves and the meter does not")
+        # EVERYTHING from here is inside the try. It used to take the busy flag, disable
+        # the buttons and clear the log OUTSIDE it — eight statements, any of which could
+        # raise (a missing action, a config attribute, a Qt call). When one did, the finally
+        # never ran and the dock was locked for good: buttons dead, transcript cleared and
+        # empty, no meter, no message. Measured on-box 2026-07-26 — indistinguishable from a
+        # hang, and impossible to diagnose because the very widget that would have shown the
+        # error had just been emptied. A handler that disables its own controls must not have
+        # a single unguarded statement between doing so and the finally that restores them.
         plan_report = None
         try:
+            self._busy = True
+            self._cancel = False
+            for b in (self.btn_match, self.btn_match_all, self.btn_refine,
+                      self.btn_board):
+                b.setEnabled(False)
+            self.btn_cancel.setEnabled(True)
+            mode = self.cmb_mode.currentIndex()   # 0 standard 1 hero 2 loop-only 3 fast
+            self.cfg.auto_execute_plan = self.act_autoexec.isChecked()
+            self.cfg.draft_sampler = self.act_draft.isChecked()
+            self.log.clear()
+            self._progress_begin("reading the reference")
+            self._log(f"— match: {cam} —")
+            self._log("· the reference is read by the gateway first — this is a network "
+                      "wait, not a render, so the clock moves and the meter does not")
             if mode != 2:
                 try:
                     self._progress_stage("planning")
@@ -1358,9 +1374,13 @@ class MaxGafferDock(QtWidgets.QWidget):
                 ChangeReportDialog(plan_report, self.ctrl.state_change_rows(cam),
                                    headline, self).exec()
         except (OmegaError, RuntimeError) as err:
+            self._show_log()
             self._log(f"✗ {err}")
         except Exception as err:  # noqa: BLE001
-            self._log(f"✗ unexpected: {err}")
+            self._show_log()
+            self._log(f"✗ unexpected: {type(err).__name__}: {err}")
+            for line in traceback.format_exc().strip().splitlines()[-4:]:
+                self._log("   " + line)
         finally:
             self._busy = False
             self._ab_on_pre = False
@@ -1386,16 +1406,20 @@ class MaxGafferDock(QtWidgets.QWidget):
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
         ) != QtWidgets.QMessageBox.Yes:
             return
-        self._progress_begin("matching every camera")
-        self._busy = True
-        self._cancel = False
-        for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
-            b.setEnabled(False)
-        self.btn_cancel.setEnabled(True)
-        self.cfg.draft_sampler = self.act_draft.isChecked()
-        self.log.clear()
-        self._log(f"— batch match: {len(queue)} cameras —")
+        # inside the try for the same reason as _start_match: a handler that disables its
+        # own controls must not have an unguarded statement before the finally that
+        # restores them, or one exception locks the dock with no way back
         try:
+            self._busy = True
+            self._cancel = False
+            for b in (self.btn_match, self.btn_match_all, self.btn_refine,
+                      self.btn_board):
+                b.setEnabled(False)
+            self.btn_cancel.setEnabled(True)
+            self.cfg.draft_sampler = self.act_draft.isChecked()
+            self.log.clear()
+            self._progress_begin("matching every camera")
+            self._log(f"— batch match: {len(queue)} cameras —")
             results = self.ctrl.match_all(log=self._log,
                                           should_cancel=lambda: self._cancel,
                                           do_sweep=self.act_sweep.isChecked())
@@ -1481,14 +1505,15 @@ class MaxGafferDock(QtWidgets.QWidget):
         if not (e and e.reference):
             self._log("bind a reference image first")
             return
-        self._progress_begin("refining")
-        self._busy = True
-        self._cancel = False
-        for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
-            b.setEnabled(False)
-        self.btn_cancel.setEnabled(True)
-        self._log(f"— refine: {cam} — “{note}”")
         try:
+            self._busy = True
+            self._cancel = False
+            for b in (self.btn_match, self.btn_match_all, self.btn_refine,
+                      self.btn_board):
+                b.setEnabled(False)
+            self.btn_cancel.setEnabled(True)
+            self._progress_begin("refining")
+            self._log(f"— refine: {cam} — “{note}”")
             result = self.ctrl.refine(cam, note, log=self._log,
                                       should_cancel=lambda: self._cancel,
                                       locks=self._locks())
@@ -1508,9 +1533,13 @@ class MaxGafferDock(QtWidgets.QWidget):
                 ChangeReportDialog(None, self.ctrl.state_change_rows(cam),
                                    headline, self).exec()
         except (OmegaError, RuntimeError) as err:
+            self._show_log()
             self._log(f"✗ {err}")
         except Exception as err:  # noqa: BLE001
-            self._log(f"✗ unexpected: {err}")
+            self._show_log()
+            self._log(f"✗ unexpected: {type(err).__name__}: {err}")
+            for line in traceback.format_exc().strip().splitlines()[-4:]:
+                self._log("   " + line)
         finally:
             self._busy = False
             self._ab_on_pre = False
@@ -1596,10 +1625,11 @@ class MaxGafferDock(QtWidgets.QWidget):
         out_dir = QtWidgets.QFileDialog.getExistingDirectory(self, "Output folder")
         if not out_dir:
             return
-        self._busy = True
-        self._cancel = False
-        self.btn_cancel.setEnabled(True)     # finals can wedge for an hour per CLI job —
-        try:                                 # Cancel must reach the io wait-poll
+        try:
+            self._busy = True
+            self._cancel = False
+            # finals can wedge for an hour per CLI job — Cancel must reach the io wait-poll
+            self.btn_cancel.setEnabled(True)
             if self.cfg.final_render_backend == "vantage_cli":
                 # Developer-Edition CLI only — exports main-thread, renders on a worker
                 jobs = self.ctrl.prepare_vantage_jobs(

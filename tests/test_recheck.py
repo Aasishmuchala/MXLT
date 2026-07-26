@@ -648,8 +648,14 @@ def test_a_long_run_always_shows_its_own_log():
     from maxgaffer.ui import dock as dockmod
 
     begin = inspect.getsource(dockmod.MaxGafferDock._progress_begin)
-    assert "self.log.setVisible(True)" in begin, "a run that shows nothing looks hung"
-    assert 'setText("Transcript ▴")' in begin, "the toggle label must not contradict it"
+    assert "self._show_log()" in begin, "a run that shows nothing looks hung"
+    show = inspect.getsource(dockmod.MaxGafferDock._show_log)
+    assert "self.log.setVisible(True)" in show
+    assert 'setText("Transcript ▴")' in show, "the toggle label must not contradict it"
+    # an error must reveal the transcript too — one written into a hidden or freshly
+    # cleared panel is an error nobody sees, which is how this went undiagnosed
+    match_src = inspect.getsource(dockmod.MaxGafferDock._start_match)
+    assert match_src.count("self._show_log()") >= 2
 
 
 def test_progress_never_starts_for_a_run_that_was_refused():
@@ -666,3 +672,39 @@ def test_progress_never_starts_for_a_run_that_was_refused():
         begin = body.group(1).find("_progress_begin")
         assert guard != -1, f"{fn} lost its busy guard"
         assert begin == -1 or guard < begin, f"{fn} starts progress before it commits"
+
+
+def test_no_handler_can_strand_the_dock_between_disabling_and_its_finally():
+    """The permanent-stuck bug. _start_match took the busy flag, disabled the buttons and
+    cleared the transcript OUTSIDE its try — eight statements, any of which could raise (a
+    missing action, a config attribute, a Qt call). When one did, the finally never ran and
+    the dock was locked for good: buttons dead, transcript cleared and EMPTY, no meter, no
+    message. Indistinguishable from a hang, and undiagnosable, because the widget that
+    would have shown the error had just been emptied.
+
+    The rule: from the moment a handler takes self._busy, every statement until the
+    try/finally that releases it must be inside that try."""
+    import re
+
+    src = open("maxgaffer/ui/dock.py", encoding="utf-8").read()
+    offenders = []
+    for match in re.finditer(r"\n    def (_[a-z_]+)\(self.*?\):\n(.*?)(?=\n    def )",
+                             src, re.S):
+        fn, body = match.group(1), match.group(2)
+        at = body.find("self._busy = True")
+        if at == -1:
+            continue
+        before = body[:at].rstrip()
+        after = body[at + len("self._busy = True"):]
+        # safe either way: the flag is taken inside a try, or a try opens immediately after
+        # it with nothing in between that could raise
+        if before.endswith("try:"):
+            continue
+        gap = [ln.strip() for ln in after.splitlines()
+               if ln.strip() and not ln.strip().startswith("#")]
+        if gap and gap[0] == "try:":
+            continue
+        offenders.append(fn)
+    assert not offenders, (
+        "these handlers can leave the dock permanently disabled if a statement raises "
+        "before their finally: " + ", ".join(offenders))
