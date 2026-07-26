@@ -236,6 +236,292 @@ def test_confidence_reports_how_much_evidence_there_was(tmp_path):
         assert borderline["confidence"] < clear["confidence"]
 
 
+# ------------------------------------------------------- the shared shadow ratio
+#: A physical bi-illuminant scene, in LINEAR light: one warm sun, one blue sky, and albedos
+#: to paint it onto. These are the quantities the invariant is written in, so the synthetics
+#: are built here and encoded to sRGB on the way out rather than being picked as codes.
+SUN = (0.55, 0.36, 0.16)            # warm key, low sun
+SKY = (0.06, 0.075, 0.11)           # blue fill
+GREY = (0.55, 0.50, 0.45)           # near-neutral albedo
+BRICK = (0.42, 0.16, 0.11)          # a strongly different albedo
+MOSS = (0.16, 0.34, 0.14)           # and another
+
+
+def srgb8(linear):
+    """Linear RGB → 8-bit sRGB, so a test can state its scene in light and paint in codes."""
+    out = []
+    for v in linear:
+        v = max(0.0, min(1.0, v))
+        s = v * 12.92 if v <= 0.0031308 else 1.055 * v ** (1.0 / 2.4) - 0.055
+        out.append(max(0, min(255, int(round(s * 255.0)))))
+    return tuple(out)
+
+
+def surface(albedo, ambient_scale=1.0, sunlit=False):
+    """What one albedo looks like under this scene's light, in or out of the sun.
+
+    ``ambient_scale`` is ambient occlusion: how much of the sky this point can see. It
+    scales the SKY term in both the lit and the shadowed case, which is the whole reason
+    the invariant has to be taken on ``ratio - 1`` rather than on the ratio."""
+    return srgb8(tuple(albedo[i] * (SKY[i] * ambient_scale + (SUN[i] if sunlit else 0.0))
+                       for i in range(3)))
+
+
+def angle_deg(u, v):
+    dot = sum(a * b for a, b in zip(u, v))
+    nu = math.sqrt(sum(a * a for a in u))
+    nv = math.sqrt(sum(b * b for b in v))
+    return math.degrees(math.acos(max(-1.0, min(1.0, dot / (nu * nv)))))
+
+
+def test_a_material_edge_is_excluded_from_the_inlier_set(tmp_path):
+    """THE property this consensus exists for. One frame has a hard shadow edge; the other
+    has the identical shadow edge PLUS a strong material edge beside it. The material edge
+    must contribute candidates and no inliers, leaving the measurement untouched — a shadow
+    ratio has the albedo cancelled out of it, so a different albedo cannot join the cluster
+    however contrasty it is."""
+    shade, lit, other = surface(GREY), surface(GREY, sunlit=True), surface(BRICK, sunlit=True)
+
+    def shadow_only(x, _y):
+        return shade if x < 50 else lit
+
+    def shadow_plus_material(x, _y):
+        if x < 50:
+            return shade
+        return lit if x < 105 else other
+
+    control = shadowedge.edge_hardness(write(tmp_path, "so.png", shadow_only))
+    both = shadowedge.edge_hardness(write(tmp_path, "spm.png", shadow_plus_material))
+    assert control is not None and both is not None
+    # the material edge WAS seen as a candidate boundary...
+    assert both["candidates"] > control["candidates"] * 1.5
+    # ...and contributed nothing to the measurement
+    assert both["samples"] == control["samples"]
+    assert both["inlier_frac"] < 0.65
+    assert both["hardness"] == control["hardness"]
+    assert both["ratio_rgb"] == control["ratio_rgb"]     # the axis did not even shift
+
+
+def test_a_soft_material_edge_cannot_drag_the_hardness_down(tmp_path):
+    """The consequence of the above, stated as behaviour rather than bookkeeping. A hard
+    shadow beside a SOFT material transition must still read hard; if the material samples
+    leaked into the median they would pull it toward the middle."""
+    shade, lit = surface(GREY), surface(GREY, sunlit=True)
+    other = surface(MOSS, sunlit=True)
+
+    def hard_shadow_soft_material(x, _y):
+        if x < 50:
+            return shade
+        if x < 96:
+            return lit
+        t = max(0.0, min(1.0, (x - 96) / 22.0))          # a 22 px ramp between two albedos
+        return tuple(int(round(lit[i] + t * (other[i] - lit[i]))) for i in range(3))
+
+    got = shadowedge.edge_hardness(write(tmp_path, "hsm.png", hard_shadow_soft_material))
+    assert got is not None
+    assert got["label"] == "hard"
+    assert got["soft_frac"] == 0.0
+
+
+def test_the_shadow_ratio_cancels_the_albedo_EXACTLY():
+    """The invariant, asserted as the identity it is rather than as an approximation. The
+    same illumination change over three wildly different surfaces must give not merely a
+    similar direction but the SAME one, because albedo divides out of (a+s)/a."""
+    dirs = []
+    for albedo in (GREY, BRICK, MOSS):
+        shade = tuple(albedo[i] * SKY[i] for i in range(3))
+        lit = tuple(albedo[i] * (SKY[i] + SUN[i]) for i in range(3))
+        got = shadowedge._shadow_direction(lit, shade)
+        assert got is not None
+        dirs.append(got)
+    for other in dirs[1:]:
+        assert angle_deg(dirs[0], other) < 1e-9         # identical, not close
+    expected = [SUN[i] / SKY[i] for i in range(3)]      # s/a, the sun-to-ambient ratio
+    assert angle_deg(dirs[0], expected) < 1e-9
+
+
+def test_a_shadow_crossing_two_surfaces_is_measured_as_ONE_boundary(tmp_path):
+    """The same invariant at image level. A shadow band crosses two very different albedos,
+    and one albedo boundary crosses the frame. The shadow edges must out-vote the material
+    edge and the recovered axis must be the scene's real sun-to-ambient ratio.
+
+    The vote is the point, and it is also the weakness — see
+    ``test_a_repeated_material_pair_can_out_vote_the_shadows``."""
+    def banded(x, y):
+        albedo = GREY if y < SIZE // 2 else BRICK
+        return surface(albedo, sunlit=not (45 <= x < 115))
+
+    got = shadowedge.edge_hardness(write(tmp_path, "banded.png", banded))
+    assert got is not None
+    expected = [SUN[i] / SKY[i] for i in range(3)]
+    assert angle_deg(got["ratio_rgb"], expected) < shadowedge.RATIO_INLIER_DEG, got
+    assert got["label"] == "hard"
+    assert got["ratio_is_warm"] is True
+
+
+def test_a_repeated_material_pair_can_out_vote_the_shadows(tmp_path):
+    """The honest limit of the consensus, pinned so nobody mistakes it for a shadow detector.
+
+    The invariant is SYMMETRIC. A shadow edge's ratio is albedo-independent; a material
+    edge's ratio is illumination-independent — the same two surfaces meeting in shadow and
+    in sun give the same albedo ratio both times. So a material pair that repeats across a
+    frame forms its own tight cluster, and the consensus keeps whichever cluster is BIGGER,
+    not whichever is a shadow. This is the mechanism behind the dawn plate, where foliage
+    against sky is one repeated pair covering half the image.
+
+    What survives is the warmth check: an albedo ratio has no reason to be red-weighted,
+    and a sun-to-ambient ratio always is."""
+    stripes = (GREY, BRICK, MOSS)
+
+    def three_surfaces(x, y):
+        return surface(stripes[min(2, y * 3 // SIZE)], sunlit=(x >= SIZE // 2))
+
+    got = shadowedge.edge_hardness(write(tmp_path, "outvoted.png", three_surfaces))
+    assert got is not None
+    sun_axis = [SUN[i] / SKY[i] for i in range(3)]
+    albedo_axis = [GREY[i] / BRICK[i] - 1.0 for i in range(3)]
+    # the winner is the repeated ALBEDO pair, not the sun
+    assert angle_deg(got["ratio_rgb"], sun_axis) > 30.0
+    assert angle_deg(got["ratio_rgb"], albedo_axis) < shadowedge.RATIO_INLIER_DEG
+    # ...and the one guard that still fires says so: this is not a sun ratio
+    assert got["ratio_is_warm"] is False
+    assert got["confidence"] <= shadowedge.UNLIT_CONSENSUS_CONFIDENCE
+
+
+def test_the_ratio_direction_survives_a_change_in_how_deep_the_shade_is(tmp_path):
+    """Why the clustered quantity is ``ratio - 1`` and not the ratio.
+
+    Surfaces sit in different amounts of ambient occlusion, so one shadow edge's ambient is
+    a fraction of another's. The ratio is then 1 + s/(k*a), a different vector for every k,
+    and the ratios of genuine shadow edges do NOT share a direction. Subtracting the one
+    leaves s/(k*a), whose direction is s/a whatever k is. This test builds the same shadow
+    edge at two depths of shade and asserts the implemented quantity agrees while the raw
+    ratio does not — if that second assertion ever fails, the deviation is unnecessary."""
+    def edge(scale):
+        def paint(x, _y):
+            return surface(GREY, ambient_scale=scale, sunlit=(x >= SIZE // 2))
+        return paint
+
+    open_sky = shadowedge.edge_hardness(write(tmp_path, "open.png", edge(1.0)))
+    occluded = shadowedge.edge_hardness(write(tmp_path, "occl.png", edge(0.35)))
+    assert open_sky is not None and occluded is not None
+    assert angle_deg(open_sky["ratio_rgb"], occluded["ratio_rgb"]) \
+        < shadowedge.RATIO_INLIER_DEG
+
+    # ...and the size of the effect, honestly. `ratio - 1` is EXACTLY invariant at any sun
+    # strength; the raw ratio drifts, but only by as much as the "+1" is worth relative to
+    # s/a. Under a sun that swamps the ambient the two are nearly the same question — which
+    # is why this was worth measuring rather than assuming.
+    def drift(sun, scales=(1.0, 0.35)):
+        def raw(scale):
+            return [(SKY[i] * scale + sun[i]) / (SKY[i] * scale) for i in range(3)]
+
+        def minus_one(scale):
+            return [sun[i] / (SKY[i] * scale) for i in range(3)]
+
+        return (angle_deg(raw(scales[0]), raw(scales[1])),
+                angle_deg(minus_one(scales[0]), minus_one(scales[1])))
+
+    strong_raw, strong_m1 = drift(SUN)
+    weak_raw, weak_m1 = drift((0.05, 0.04, 0.02), (1.0, 0.15))   # filled shadow, deep AO
+    assert strong_m1 < 1e-6 and weak_m1 < 1e-6          # exact in BOTH regimes, by identity
+    assert strong_raw > 1.0                             # the raw ratio always drifts...
+    assert weak_raw > strong_raw * 2.0                  # ...and the weaker the sun, the more
+    # measured 2026-07-26: 2.7° under a sun that swamps the ambient, 11.8° for a filled
+    # shadow at deep occlusion — most of a cone width, i.e. enough to split one scene's
+    # shadows into two clusters and hand the vote to whichever half is bigger
+    assert weak_raw > 0.8 * shadowedge.RATIO_INLIER_DEG
+
+
+def test_a_frame_of_pure_albedo_noise_is_never_read_CONFIDENTLY(tmp_path):
+    """A patchwork of unrelated albedos under one light has plenty of sustained, high-ratio,
+    sharp boundaries and not one shadow among them.
+
+    The contract asserted here is deliberately weaker than "returns None", because the
+    measurement says it has to be. Over eight seeds (2026-07-26) four declined outright and
+    four found a cluster, one of them at inlier_frac 0.73 — HIGHER than any of the three
+    real plates, which sit at 0.52 to 0.68. So the inlier fraction is not a shadow detector
+    and no floor on it could be: raising MIN_INLIER_FRAC far enough to reject this noise
+    would reject real photographs first. What does hold, and is what this pins, is that none
+    of them is ever reported confidently."""
+    worst = 0.0
+    for seed in range(8):
+        rnd = random.Random(seed)
+        # every cell gets its OWN albedo, so no pair of surfaces ever meets twice. A
+        # repeating palette would defeat the point: the same two colours meeting again and
+        # again is a repeated material pair, which does form a real cluster (see above).
+        cells = {}
+        for cy in range(SIZE // 20 + 1):
+            for cx in range(SIZE // 20 + 1):
+                cells[(cx, cy)] = srgb8((rnd.uniform(0.05, 0.75), rnd.uniform(0.05, 0.75),
+                                         rnd.uniform(0.05, 0.75)))
+
+        def patchwork(x, y, _c=cells):
+            return _c[(x // 20, y // 20)]
+
+        got = shadowedge.edge_hardness(write(tmp_path, "patch%d.png" % seed, patchwork))
+        if got is not None:
+            worst = max(worst, got["confidence"])
+    assert worst <= shadowedge.UNLIT_CONSENSUS_CONFIDENCE + 0.01, worst
+
+
+def test_an_ambient_only_frame_is_flagged_as_carrying_no_sun(tmp_path):
+    """A dome-only scene has real illumination boundaries — ambient occlusion — and they
+    share a ratio honestly, so the consensus accepts them. But that ratio is the SKY's
+    colour, not a sun-to-sky ratio, and a blue-weighted axis means there is no sun whose
+    size this width could be evidence about. Measured on the dome-only archetype: all three
+    of its clusters came back blue-weighted."""
+    # An occluded patch is not simply "less of the same light". It sees mostly warm bounce
+    # off nearby surfaces, while an open patch also sees the blue sky — so the RATIO between
+    # them is the sky against the bounce, which is blue-weighted. A uniform dimming would be
+    # spectrally flat and would not exercise this at all.
+    bounce = (0.09, 0.075, 0.055)
+    occluded = srgb8(tuple(GREY[i] * bounce[i] for i in range(3)))
+    open_to_sky = srgb8(tuple(GREY[i] * (bounce[i] + SKY[i]) for i in range(3)))
+
+    def ambient_step(x, _y):
+        return occluded if x < SIZE // 2 else open_to_sky
+
+    got = shadowedge.edge_hardness(write(tmp_path, "ao.png", ambient_step))
+    assert got is not None
+    assert got["ratio_is_warm"] is False                 # the axis is the sky, not the sun
+    assert got["confidence"] <= shadowedge.UNLIT_CONSENSUS_CONFIDENCE
+
+
+def test_the_direction_extractor_refuses_what_additive_light_cannot_do():
+    """Sunlight only ever ADDS, so the lit side cannot be darker than the shadow side in any
+    channel. A material edge routinely is — red brick against grey mortar is brighter in red
+    and darker in blue — and that is free evidence, needing no consensus at all."""
+    assert shadowedge._shadow_direction((0.4, 0.3, 0.2), (0.1, 0.1, 0.1)) is not None
+    assert shadowedge._shadow_direction((0.4, 0.3, 0.05), (0.1, 0.1, 0.1)) is None  # blue down
+    assert shadowedge._shadow_direction((0.1, 0.1, 0.1), (0.1, 0.1, 0.1)) is None   # no step
+    # a denominator this small is quantisation, not a measurement
+    assert shadowedge._shadow_direction((0.4, 0.3, 0.2), (0.001, 0.1, 0.1)) is None
+
+
+def test_the_consensus_finds_the_cluster_and_not_the_average():
+    """A spherical mean would be dragged off the cluster by the outliers this exists to
+    reject — on the dawn plate the outliers are the majority — so the estimator has to be a
+    vote. Here two thirds of the directions are scattered and one third agree; the answer
+    must be the agreeing third, not somewhere in between."""
+    def unit(v):
+        n = math.sqrt(sum(c * c for c in v))
+        return tuple(c / n for c in v)
+
+    rnd = random.Random(23)
+    cluster = [unit((0.8 + rnd.uniform(-0.01, 0.01), 0.5, 0.2)) for _ in range(40)]
+    scatter = [unit((rnd.random() + 0.01, rnd.random() + 0.01, rnd.random() + 0.01))
+               for _ in range(80)]
+    got = shadowedge._consensus(cluster + scatter)
+    assert got is not None
+    axis, flags, mean_cos = got
+    assert angle_deg(axis, (0.8, 0.5, 0.2)) < shadowedge.RATIO_INLIER_DEG
+    assert all(flags[:40]), "the real cluster must be kept whole"
+    assert sum(flags[40:]) < 20, "most of the scatter must be rejected"
+    assert mean_cos >= math.cos(math.radians(shadowedge.RATIO_INLIER_DEG))
+    assert shadowedge._consensus([]) is None
+
+
 # ------------------------------------------------------------------------------- haze
 def checker(lift, gain, size=SIZE):
     """A high-frequency checkerboard scene, optionally veiled: ``gain`` compresses its

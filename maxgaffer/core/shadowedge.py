@@ -166,10 +166,18 @@ SUSTAIN_FRAC = 0.6
 #: inside it. A cone of this half-angle covers ~1.4% of the sphere of unit directions.
 RATIO_INLIER_DEG = 12.0
 
-#: Below this share of candidates agreeing, the frame's boundaries share no common
-#: illuminant change, which means they are not shadow boundaries — foliage, clutter, a
-#: texture field. The honest answer there is None, not a hardness with a low confidence
-#: attached: a number that gets reported is a number that gets used.
+#: Below this share of candidates agreeing, the frame's boundaries are too incoherent to be
+#: one scene's shadows and the answer is None.
+#:
+#: A WEAK GATE, and the measurement says so plainly. Eight random albedo patchworks with no
+#: shadow anywhere in them (2026-07-26): four declined, and the other four reached 0.41,
+#: 0.45, 0.50 and 0.73 — that last one HIGHER than any of the three real plates, which sit
+#: at 0.52 (golden hour), 0.52 (dawn landscape) and 0.68 (dome-only). So the inlier fraction
+#: does not separate "has shadows" from "has none", and no threshold on it could: raising
+#: this floor far enough to reject the noise would reject real photographs first. It is kept
+#: at a level that catches only the outright incoherent frames, and the work of not
+#: believing a bad reading is done by `confidence`, which stayed at or under 0.30 for every
+#: one of those patchworks.
 MIN_INLIER_FRAC = 0.35
 
 #: Hypotheses tested in the consensus. Every sample's own direction is a candidate axis, but
@@ -188,6 +196,17 @@ RATIO_NEG_SLACK = 0.06
 #: Linear-light floor for the shadow side. Ratios taken against a near-black window are
 #: numerically meaningless — the denominator is quantisation.
 MIN_SHADOW_LINEAR = 0.002
+
+#: A SUN-vs-ambient ratio is warm by construction: the key is a 2000–5500 K sun and the fill
+#: is 10000 K+ skylight, so s/a is red-weighted in every daylight scene. A consensus axis
+#: that is BLUE-weighted is therefore not a sun/shade population — it is ambient occlusion
+#: (more skylight against less skylight), which is a real illumination change that passes the
+#: invariant honestly but says nothing about how big the SUN is. Measured 2026-07-26 on the
+#: dome-only archetype, where there is no sun at all: every one of its three ratio clusters
+#: came back blue-weighted. Used to CAP confidence, never to change the label — the width
+#: was still measured, it just is not evidence about a source that is not in the frame.
+SUN_WARMTH_MIN = 1.0
+UNLIT_CONSENSUS_CONFIDENCE = 0.30
 
 #: sRGB→linear as a 256-entry table. The decode is a pow() per channel per pixel otherwise,
 #: and there are only 256 possible 8-bit inputs, so the whole transfer function is a lookup.
@@ -402,34 +421,42 @@ def edge_hardness(source) -> Optional[Dict]:
         making the texture higher-contrast.
       * STEP. The bright side must be MIN_STEP_RATIO brighter than the dark side, i.e. a
         real lighting ratio rather than a shading wobble on one surface.
-      * MATERIAL. Normalised chromaticity must be preserved to CHROMA_TOL across the
-        boundary. A shadow changes the illumination over ONE albedo; a paint line, a rug
-        edge, a green plant against a grey wall changes the albedo itself.
+      * SHARED RATIO. The linear-light lit/shadow ratio, minus one, must point the same way
+        as the rest of the frame's — see CHROMA's replacement above. The albedo cancels out
+        of a true shadow ratio, so every genuine shadow edge in one image agrees on one
+        direction and a material edge cannot. Samples outside the consensus cone are
+        discarded and the hardness is measured on the inliers alone.
 
-    WHAT THAT DOES NOT CATCH, stated plainly, because it is the limit of the whole method:
-    an OCCLUSION boundary between two objects of similar CHROMATICITY — a grey chair against
-    a grey wall, a dark doorway, a tree canopy against a pale sky — passes all three tests,
-    and being a true step it reads maximally HARD. Being dark does not make a thing
-    saturated: measured 2026-07-26, foliage against pale sky is 0.095 apart in normalised
-    chromaticity, a quarter of CHROMA_TOL, so the material test never sees it — and no
-    setting of that constant would fix it, because a real golden-hour shadow edge is three
-    times MORE chromatic than that canopy.
+    WHAT THAT STILL DOES NOT CATCH, measured rather than assumed. The shared-ratio test does
+    what it claims — it separates ILLUMINATION boundaries from MATERIAL boundaries — but
+    hardness needs a different separation that it does not provide: sun-PENUMBRA boundaries
+    from CONTACT and ambient-occlusion boundaries. A contact shadow is geometrically sharp
+    under a source of any size, because the penumbra closes to nothing where the occluder
+    meets the surface, and an ambient-occlusion boundary is a genuine illumination change
+    that passes the invariant honestly. Clustering the three session plates (2026-07-26,
+    12° cone) shows this directly:
 
-    Measured on-box 2026-07-26 on the session's own dawn plate (a 3840×2160 landscape, two
-    big trees, low sun): 1237 of 1317 accepted samples came back hard, and 62% of them sit
-    in the upper half of the frame — which is where the canopies are and where no shadow
-    boundary in that image is. The reading is foliage. A density veto was measured as a fix
-    and refused: a shadow edge scored 0.077 neighbourhood density, but a genuinely SOFT edge
-    scored 0.231 against foliage's 0.231, so vetoing on density would have thrown away the
-    soft population and biased the answer the one way it must never go.
+        dome-only archetype, TRUE soft, no sun at all
+            cluster 0  68% of candidates  BLUE-weighted axis  median hardness 0.93
+            cluster 1  15%                BLUE                              1.00
+            cluster 2   8%                BLUE                              0.38
+        golden-hour interior, TRUE hard sun
+            cluster 0  53%  BLUE  0.67   <- ambient occlusion, the majority
+            cluster 2  10%  RED   0.95   <- the actual sun-shadow population
+        real dawn landscape
+            cluster 0  52%  BLUE  0.98   <- 88% of it in the canopy half of the frame
+            cluster 1  24%  RED   1.00
 
-    So: two things blunt this failure and neither removes it — the reported value is the
-    MEDIAN over hundreds of samples, so a handful of silhouettes cannot swing a frame, and
-    the material test does remove the saturated ones, which indoors is most of them. The
-    failure is ONE-SIDED, which is the useful part: nothing here makes a genuinely hard-lit
-    frame read soft. A "soft" reading is therefore strong evidence; a "hard" reading from a
-    frame full of fine same-hue structure (foliage, bookshelves, mullions) is weak, and
-    ``hard_frac`` beside a low ``confidence`` is the tell.
+    So the largest coherent population is usually NOT the sun's. The consensus picks the
+    biggest cluster, and in all three plates that is ambient occlusion. What the axis does
+    reveal is whether a sun is present at all: s/a is red-weighted in any daylight scene
+    (a 2000–5500 K key against a 10000 K+ fill), so a blue-weighted consensus means there is
+    no sun population to have measured — which is why that case caps confidence.
+
+    The failure is ONE-SIDED and that is the useful part: nothing here makes a genuinely
+    hard-lit frame read soft. A "soft" reading is therefore strong evidence. A "hard"
+    reading is weak whenever ``ratio_is_warm`` is False or ``inlier_frac`` is near the floor,
+    and ``hard_frac`` beside a low ``confidence`` is the tell.
 
     Diagonal boundaries are measured on a ramp, where the central-difference magnitude is
     exact at any orientation; only true steps (already clamped at the operator floor) carry
@@ -590,16 +617,38 @@ def _edge_hardness(source) -> Optional[Dict]:
         label = "soft"
     else:
         label = "mixed"
-    # confidence: how much evidence, and how far the answer sits from the band it is not in
+    # CONFIDENCE IS THE CONSENSUS, not the sample count. The failure this replaced was a
+    # reading of 1.00 at confidence 1.00 taken off tree canopies: hundreds of samples, all
+    # agreeing they were sharp, none of them a shadow. Agreement about sharpness is worth
+    # nothing; agreement about the ILLUMINANT is the thing that says these are shadows. So
+    # the dominant term is how much of the frame joined the consensus, and the cluster's own
+    # tightness scales it — a cone filled to its edge is a weaker claim than a tight core.
+    consensus = (inlier_frac - MIN_INLIER_FRAC) / (1.0 - MIN_INLIER_FRAC)
+    tightness = max(0.0, min(1.0, (mean_cos - math.cos(math.radians(RATIO_INLIER_DEG)))
+                             / (1.0 - math.cos(math.radians(RATIO_INLIER_DEG)))))
     support = min(1.0, samples / float(CONFIDENT_SAMPLES))
     gap = min(abs(median - HARD_LABEL), abs(median - SOFT_LABEL))
     decisive = min(1.0, gap / 0.12)
+    # the WORST factor wins, the posture patchgeom.bearing_hint takes: a confident sub-measure
+    # must not paper over a weak one
+    confidence = min(max(0.0, consensus), 0.35 + 0.65 * tightness, support, decisive)
+    # ...and a blue-weighted axis means the population is ambient occlusion, not sun/shade,
+    # so whatever width it has is not evidence about the size of a sun
+    warm = axis[0] >= SUN_WARMTH_MIN * axis[2]
+    if not warm:
+        confidence = min(confidence, UNLIT_CONSENSUS_CONFIDENCE)
     widths.sort()
     return {
         "hardness": round(median, 4),
         "label": label,
-        "confidence": round(support * decisive, 3),
+        "confidence": round(confidence, 3),
         "samples": samples,
+        "candidates": candidates,
+        "inlier_frac": round(inlier_frac, 4),
+        "ratio_is_warm": warm,
+        # the recovered sun-to-ambient spectral ratio, unit linear RGB — a by-product, but
+        # a physically meaningful one: it is what separates the key from the fill
+        "ratio_rgb": [round(c, 4) for c in axis],
         "width_px": round(widths[samples // 2], 2),
         "hard_frac": round(hard_frac, 4),
         "soft_frac": round(soft_frac, 4),
