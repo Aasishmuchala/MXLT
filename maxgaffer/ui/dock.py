@@ -1404,8 +1404,53 @@ class MaxGafferDock(QtWidgets.QWidget):
             self.btn_cancel.setEnabled(False)
             self.refresh_cameras()
     def _cancel_match(self):
-        self._cancel = True
-        self._log("cancelling after the current step…")
+        """First press asks the run to stop; a second press releases the controls.
+
+        Cancel can only ever be a REQUEST — it sets a flag the running code has to notice,
+        and between checks there are long uninterruptible stretches (a gateway round trip,
+        a V-Ray frame). That is fine when the run is healthy. It is useless when the run is
+        wedged somewhere that never looks at the flag again, and then the dock stays locked
+        with no way out but reloading it, which is what an artist experiences as "stuck".
+
+        So the second press stops pretending. It hands the controls back. It does NOT
+        pretend to have killed anything — the worker may still be alive, and the log says
+        so plainly, because a released UI that silently leaves work running is its own
+        kind of lie."""
+        if not self._cancel:
+            self._cancel = True
+            self._log("cancelling after the current step… (press ✕ again to force the "
+                      "controls back if it does not respond)")
+            return
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Release the controls?")
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setText("This run is not responding to cancel.")
+        box.setInformativeText("\n".join([
+            "Releasing hands the buttons back so you can carry on.",
+            "",
+            "It does NOT stop whatever is still running — a gateway call or a render may "
+            "finish in the background, and if it does its result is discarded.",
+            "",
+            "If this keeps happening, reload the dock with scripts/reload_dock.py.",
+        ]))
+        box.setStandardButtons(QtWidgets.QMessageBox.Cancel | QtWidgets.QMessageBox.Ok)
+        box.setDefaultButton(QtWidgets.QMessageBox.Ok)
+        if box.exec() != QtWidgets.QMessageBox.Ok:
+            return
+        self._force_release("forced — the controls are yours again; anything still running "
+                            "in the background will be discarded when it lands")
+
+    def _force_release(self, why: str):
+        self._busy = False
+        self._cancel = False
+        if getattr(self, "_beat", None) is not None:
+            self._beat.stop()
+        for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
+            b.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        self.lbl_stage.setText("RELEASED")
+        self.lbl_pct.setText("")
+        self._log("⚠ " + why)
 
     def _set_match_thumb(self, path):
         if path and os.path.exists(path):

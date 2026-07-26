@@ -602,3 +602,30 @@ def test_the_reload_script_purges_modules_and_the_cached_dock():
     assert "sys.modules.pop" in src
     assert "reverse=True" in src, "submodules must be dropped before their packages"
     assert "import maxgaffer.bootstrap" in src
+
+
+def test_cancel_can_release_a_run_that_will_not_respond_to_it():
+    """Cancel can only ever be a REQUEST — it sets a flag the running code has to notice,
+    and between checks sit long uninterruptible stretches (a gateway round trip, a V-Ray
+    frame). That is fine when the run is healthy and useless when it is wedged somewhere
+    that never looks at the flag again, which locks the dock with no way out but reloading.
+    Measured on-box 2026-07-26: a match sat 70 minutes at 0.3% CPU having rendered nothing,
+    with MATCH greyed and no dialog to answer.
+
+    The second press hands the controls back. It must NOT claim to have killed anything —
+    a released UI that silently leaves work running is its own kind of lie."""
+    import inspect
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6.QtWidgets")
+
+    from maxgaffer.ui import dock as dockmod
+
+    src = inspect.getsource(dockmod.MaxGafferDock._cancel_match)
+    assert "if not self._cancel:" in src, "the first press must still be a polite request"
+    assert "press ✕ again" in src, "the escape hatch has to be discoverable"
+    assert "_force_release" in src
+    rel = inspect.getsource(dockmod.MaxGafferDock._force_release)
+    assert "self._busy = False" in rel and "setEnabled(True)" in rel
+    assert "does NOT stop" in src, "it must not imply the work was killed"
