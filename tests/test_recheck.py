@@ -485,7 +485,9 @@ def test_the_diagonal_escape_adopts_the_state_it_actually_measured():
     from maxgaffer.core.director import run_polish
 
     src = inspect.getsource(run_polish)
-    diag = src[src.index("def _diag_probe("):src.index("if not escaped:")]
+    # slice to the discrete-flip section, not to "if not escaped:" — the informed combo
+    # loop now uses that guard INSIDE the diagonal block, which truncated the old slice
+    diag = src[src.index("def _diag_probe("):src.index("for flag in (")]
     assert "return sc, cand" in diag, "the probe must hand back what it measured"
     # and no caller may reconstruct the move itself
     after = diag[diag.index("for ka, kb in pairs:"):]
