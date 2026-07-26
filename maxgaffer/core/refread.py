@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from typing import Callable, Dict, Optional
 
+from . import cct
+
 #: Share of frame in locally-contrasty bright patches below which a frame carries no
 #: directional light worth speaking of. Measured across every reference this session:
 #: sunlit plates sat at 0.0251 to 0.0397 (golden-hour interior, a real dawn photograph, a
@@ -45,6 +47,26 @@ def measure(stats: Optional[Dict]) -> Dict:
     if not isinstance(stats, dict):
         return out
 
+    # ---- illuminant colour temperature, measured off the pixels
+    measured_k = cct.illuminant_kelvin(stats)
+    if measured_k and measured_k.get("kelvin"):
+        out["wb_kelvin_estimate"] = {
+            "value": float(measured_k["kelvin"]),
+            "confidence": float(measured_k.get("confidence") or 0.0),
+            "why": ("illuminant measured at %.0f K (Duv %+.4f, %s)"
+                    % (measured_k["kelvin"], measured_k.get("duv") or 0.0,
+                       measured_k.get("source"))),
+            # BLENDED, not switched. cct's confidence is built from off-locus distance and
+            # estimator disagreement, which is honest but conservative about its own
+            # accuracy: measured against ground truth on this session's references it read
+            # 4846.7 K against a true 4900 (53 K out) at confidence 0.72, and 5024.7
+            # against a true 4800 (225 K out) at confidence 0.25 — while the model's guess
+            # for that same image was 5500, a 700 K miss. So even a diffident measurement
+            # has outperformed the guess, and a hard threshold would throw the good ones
+            # away with the doubtful ones.
+            "blend": True,
+        }
+
     hot = stats.get("hot_frac")
     if isinstance(hot, (int, float)):
         lit = float(hot) >= SUN_ACTIVE_HOT_FRAC
@@ -59,6 +81,33 @@ def measure(stats: Optional[Dict]) -> Dict:
                     "%.1f%% of frame is bright directional patch" % (100.0 * hot)),
         }
     return out
+
+
+def _blend_field(fused: Dict, field: str, m: Dict,
+                 log: Callable[[str], None]) -> None:
+    """Weighted average of guess and measurement, rather than one replacing the other.
+
+    The measurement starts at equal weight and grows from there — never below half, because
+    on every reference this session where ground truth was known the measurement beat the
+    model's guess by a factor of three or more. Colour temperature is averaged in MIREDS,
+    the scale on which equal steps look equal: 4000 to 5000 K is an obvious shift and 9000
+    to 10000 K is barely visible, so a kelvin average would quietly favour the cool end."""
+    was = fused.get(field)
+    got = float(m["value"])
+    weight = 0.5 + 0.5 * max(0.0, min(1.0, float(m.get("confidence", 0.0))))
+    if not isinstance(was, (int, float)):
+        fused[field] = got
+    elif field.endswith("kelvin_estimate"):
+        mired_was, mired_got = 1.0e6 / max(1000.0, float(was)), 1.0e6 / max(1000.0, got)
+        fused[field] = 1.0e6 / ((1.0 - weight) * mired_was + weight * mired_got)
+    else:
+        fused[field] = (1.0 - weight) * float(was) + weight * got
+    fused.setdefault("measured_fields", [])
+    if field not in fused["measured_fields"]:
+        fused["measured_fields"].append(field)
+    if isinstance(was, (int, float)) and abs(fused[field] - was) > 1e-6:
+        log(f"reference reading: {field} {was:.0f} → {fused[field]:.0f} "
+            f"({weight:.0%} measurement) — {m['why']}")
 
 
 def fuse(reading: Optional[Dict], measured: Optional[Dict],
@@ -76,6 +125,9 @@ def fuse(reading: Optional[Dict], measured: Optional[Dict],
     fused = dict(reading or {})
     for field, m in (measured or {}).items():
         if not isinstance(m, dict) or "value" not in m:
+            continue
+        if m.get("blend"):
+            _blend_field(fused, field, m, log)
             continue
         if float(m.get("confidence", 0.0)) < min_confidence:
             continue

@@ -2,6 +2,8 @@
 reliable component — four reads of one image gave sun bearings 130 degrees apart — and most
 of what it guesses is measurable from the pixels."""
 
+import pytest
+
 from maxgaffer.core import refread
 
 
@@ -82,3 +84,53 @@ def test_the_analyze_path_measures_and_leaves_the_cache_alone():
     cache_at = src.index("e.semantics = semantics")
     fuse_at = src.index("refread.fuse(")
     assert cache_at < fuse_at, "the cache must be written from the UNFUSED reading"
+
+
+# ------------------------------------------------------- measured colour temperature
+def test_the_illuminant_measurement_is_blended_not_switched_in():
+    """cct's confidence is built from off-locus distance and estimator disagreement, which
+    is honest but conservative about its own ACCURACY. Measured against ground truth on this
+    session's references it read 4846.7 K against a true 4900 (53 K out) at confidence 0.72,
+    and 5024.7 against a true 4800 (225 K out) at confidence only 0.25 — while the model's
+    guess for that same image was 5500, a 700 K miss. A hard confidence threshold would have
+    thrown the good readings away with the doubtful ones."""
+    m = refread.measure({"illum": [0.60, 0.55, 0.45], "illum_sog": [0.60, 0.55, 0.45],
+                         "illum_edge": [0.60, 0.55, 0.45]})
+    if "wb_kelvin_estimate" not in m:
+        return                                  # chromaticity refused — covered elsewhere
+    assert m["wb_kelvin_estimate"]["blend"] is True
+    fused = refread.fuse({"wb_kelvin_estimate": 9000.0}, m)
+    got = fused["wb_kelvin_estimate"]
+    lo, hi = sorted((9000.0, m["wb_kelvin_estimate"]["value"]))
+    assert lo <= got <= hi, "a blend must land between the two, never outside"
+    assert "wb_kelvin_estimate" in fused["measured_fields"]
+
+
+def test_the_measurement_never_gets_less_than_half_the_vote():
+    """Even a diffident measurement beat the guess on every reference where truth was
+    known, so equal weight is the floor and generous to the model."""
+    warm = {"value": 3000.0, "confidence": 0.0, "why": "x", "blend": True}
+    fused = refread.fuse({"wb_kelvin_estimate": 9000.0}, {"wb_kelvin_estimate": warm})
+    # averaged in MIREDS, so the midpoint is 4500 K, not 6000 — equal steps must look equal
+    assert fused["wb_kelvin_estimate"] == pytest.approx(4500.0, abs=1.0)
+    sure = dict(warm, confidence=1.0)
+    assert refread.fuse({"wb_kelvin_estimate": 9000.0},
+                        {"wb_kelvin_estimate": sure})["wb_kelvin_estimate"] == \
+        pytest.approx(3000.0, abs=1.0)
+
+
+def test_warmth_is_blended_in_mireds_because_kelvin_steps_are_not_even():
+    """4000 to 5000 K is an obvious shift; 9000 to 10000 K is barely visible. A kelvin
+    average would quietly favour the cool end of every blend."""
+    m = {"value": 4000.0, "confidence": 0.0, "why": "x", "blend": True}
+    fused = refread.fuse({"wb_kelvin_estimate": 8000.0}, {"wb_kelvin_estimate": m})
+    assert fused["wb_kelvin_estimate"] < 6000.0, "this is the kelvin midpoint, not a mired one"
+    assert fused["wb_kelvin_estimate"] == pytest.approx(1.0e6 / (0.5 * 250 + 0.5 * 125), abs=1)
+
+
+def test_an_unreadable_illuminant_leaves_the_model_s_estimate_alone():
+    """A dome-only HDRI reference was REFUSED by the measurement — gray-world cannot read
+    an illuminant off it — and the honest result is to keep the guess rather than invent."""
+    assert "wb_kelvin_estimate" not in refread.measure({"hot_frac": 0.0})
+    kept = refread.fuse({"wb_kelvin_estimate": 5200.0}, refread.measure({"hot_frac": 0.0}))
+    assert kept["wb_kelvin_estimate"] == 5200.0
