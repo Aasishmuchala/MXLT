@@ -708,3 +708,55 @@ def test_no_handler_can_strand_the_dock_between_disabling_and_its_finally():
     assert not offenders, (
         "these handlers can leave the dock permanently disabled if a statement raises "
         "before their finally: " + ", ".join(offenders))
+
+
+def test_an_option_checkbox_can_never_take_a_match_down():
+    """The exception that was locking the dock, finally visible once errors reached the
+    transcript: "Internal C++ object (PySide6.QtGui.QAction) already deleted". PySide6
+    raises that when a widget's Qt side is destroyed while Python still holds the shell,
+    and the match handler read one of those actions between taking the busy flag and the
+    try that releases it.
+
+    Two fixes, and both matter. The Options QMenu is now held on the dock like lock_menu
+    always was — it was the odd one out, kept only in a local. And every option read goes
+    through _opt, which falls back to the default: an option CHECKBOX must never be able to
+    stop a match, because not running at all is strictly worse than running with a default.
+    """
+    import inspect
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6.QtWidgets")
+
+    from maxgaffer.ui import dock as dockmod
+
+    class _Dead:
+        def isChecked(self):
+            raise RuntimeError("Internal C++ object (PySide6.QtGui.QAction) already deleted.")
+
+    assert dockmod.MaxGafferDock._opt(_Dead(), True) is True
+    assert dockmod.MaxGafferDock._opt(_Dead(), False) is False
+    assert dockmod.MaxGafferDock._opt(None, True) is True          # attribute gone entirely
+
+    src = inspect.getsource(dockmod)
+    assert "self.opts_menu = QtWidgets.QMenu(self)" in src, "the menu is a local again"
+    # no raw .isChecked() on an option action may survive anywhere
+    for name in ("act_sweep", "act_autoexec", "act_draft", "act_popup", "act_live"):
+        assert f"self.{name}.isChecked()" not in src, f"{name} is read unguarded"
+
+
+def test_show_dock_closes_an_orphan_panel_before_making_another():
+    """The module globals are the only handle on the previous panel, and a reload that
+    replaces this module loses them — leaving a live dock nobody tracks. Measured on-box:
+    the transcript logged the same failure TWICE, from two instances answering one click."""
+    import inspect
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6.QtWidgets")
+
+    from maxgaffer.ui import dock as dockmod
+
+    src = inspect.getsource(dockmod.show_dock)
+    assert 'findChildren(QtWidgets.QDockWidget, "MaxGafferDock")' in src
+    assert "old.close()" in src

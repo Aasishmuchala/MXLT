@@ -391,8 +391,13 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.btn_locks.setMenu(self.lock_menu)
         bar.addWidget(self.btn_locks)
 
-        btn_opts = QtWidgets.QPushButton("Options ▾")
-        m = QtWidgets.QMenu(self)
+        # Held on self, like lock_menu above. A QMenu kept only in a local was the odd one
+        # out here, and its QActions are what came back "Internal C++ object already
+        # deleted" when the match handler read them — see _opt below.
+        self.btn_opts = QtWidgets.QPushButton("Options ▾")
+        btn_opts = self.btn_opts
+        self.opts_menu = QtWidgets.QMenu(self)
+        m = self.opts_menu
 
         def _act(label, checked, tip):
             a = m.addAction(label)
@@ -691,6 +696,23 @@ class MaxGafferDock(QtWidgets.QWidget):
             return ""
         secs = int(self._elapsed.elapsed() / 1000)
         return "%d:%02d" % (secs // 60, secs % 60)
+
+    @staticmethod
+    def _opt(action, default: bool) -> bool:
+        """Read a checkable action, surviving a wrapper whose C++ object has gone.
+
+        PySide6 raises RuntimeError("Internal C++ object ... already deleted") when the Qt
+        side of a widget has been destroyed while Python still holds the shell. Measured
+        on-box 2026-07-26: reading one of these in the match handler raised, and because
+        that read sat between taking the busy flag and the try that releases it, the whole
+        dock locked with an emptied transcript. The ownership hole is fixed above; this is
+        the belt to that braces, because an OPTION CHECKBOX must never be able to take a
+        match down — falling back to its default is always better than not running at all.
+        """
+        try:
+            return bool(action.isChecked())
+        except (RuntimeError, AttributeError):
+            return bool(default)
 
     def _show_log(self):
         self.log.setVisible(True)
@@ -1276,7 +1298,7 @@ class MaxGafferDock(QtWidgets.QWidget):
             self._log(f"✗ {err}")
 
     def _on_slider(self, key: str, value: float):
-        if not self.act_live.isChecked() or self._busy:
+        if not self._opt(self.act_live, True) or self._busy:
             return
         st = LightingState()
         if key.startswith(GROUP_PREFIX):
@@ -1321,8 +1343,10 @@ class MaxGafferDock(QtWidgets.QWidget):
                 b.setEnabled(False)
             self.btn_cancel.setEnabled(True)
             mode = self.cmb_mode.currentIndex()   # 0 standard 1 hero 2 loop-only 3 fast
-            self.cfg.auto_execute_plan = self.act_autoexec.isChecked()
-            self.cfg.draft_sampler = self.act_draft.isChecked()
+            self.cfg.auto_execute_plan = self._opt(
+                self.act_autoexec, bool(self.cfg.auto_execute_plan))
+            self.cfg.draft_sampler = self._opt(
+                self.act_draft, bool(self.cfg.draft_sampler))
             self.log.clear()
             self._progress_begin("reading the reference")
             self._log(f"— match: {cam} —")
@@ -1340,8 +1364,9 @@ class MaxGafferDock(QtWidgets.QWidget):
                 ops, lines, meta = plan[:3] if plan is not None else ([], [], {})
                 if not ops:
                     self._log("plan: no operations proposed — continuing to the match loop")
-                elif self.act_autoexec.isChecked() or PlanPreviewDialog(
-                        lines, meta, self).exec():
+                elif (self._opt(self.act_autoexec,
+                                bool(self.cfg.auto_execute_plan))
+                      or PlanPreviewDialog(lines, meta, self).exec()):
                     self._log(f"— executing plan ({len(ops)} ops) —")
                     plan_report = self.ctrl.execute_plan(ops, cam, log=self._log)
                 else:
@@ -1353,7 +1378,7 @@ class MaxGafferDock(QtWidgets.QWidget):
                 on_progress=lambda st, d, t, p: self._relay.match_progress.emit(
                     st, d, t, p),
                 locks=self._locks(),
-                do_sweep=self.act_sweep.isChecked(),
+                do_sweep=self._opt(self.act_sweep, True),
                 deep=(mode == 1),
                 quality_profile=("fast" if mode == 3 else
                                  "hero" if mode == 1 else "standard"))
@@ -1369,7 +1394,7 @@ class MaxGafferDock(QtWidgets.QWidget):
             self._set_match_thumb(result.best_render)
             headline = f"{cam} — {result.stop_reason}, score {score}"
             self._fill_changes(plan_report, self.ctrl.state_change_rows(cam), headline)
-            if self.act_popup.isChecked():
+            if self._opt(self.act_popup, bool(self.cfg.show_report_popup)):
                 self._log("· showing the change report…")   # crash breadcrumb
                 ChangeReportDialog(plan_report, self.ctrl.state_change_rows(cam),
                                    headline, self).exec()
@@ -1398,7 +1423,7 @@ class MaxGafferDock(QtWidgets.QWidget):
             self._log("no cameras have references bound — bind references first")
             return
         est = len(queue) * (int(self.cfg.max_iterations)
-                            + (self.cfg.sweep_count if self.act_sweep.isChecked() else 0))
+                            + (self.cfg.sweep_count if self._opt(self.act_sweep, True) else 0))
         if QtWidgets.QMessageBox.question(
                 self, "Match ALL",
                 f"Match {len(queue)} camera(s) sequentially (~{est} loop renders total)?\n"
@@ -1416,13 +1441,14 @@ class MaxGafferDock(QtWidgets.QWidget):
                       self.btn_board):
                 b.setEnabled(False)
             self.btn_cancel.setEnabled(True)
-            self.cfg.draft_sampler = self.act_draft.isChecked()
+            self.cfg.draft_sampler = self._opt(
+                self.act_draft, bool(self.cfg.draft_sampler))
             self.log.clear()
             self._progress_begin("matching every camera")
             self._log(f"— batch match: {len(queue)} cameras —")
             results = self.ctrl.match_all(log=self._log,
                                           should_cancel=lambda: self._cancel,
-                                          do_sweep=self.act_sweep.isChecked())
+                                          do_sweep=self._opt(self.act_sweep, True))
             self._log("— batch summary —")
             for cam, status in results.items():
                 self._log(f"  {cam}: {status}")
@@ -1529,7 +1555,7 @@ class MaxGafferDock(QtWidgets.QWidget):
             headline = f"{cam} — refined to {score}"
             self._fill_changes(None, self.ctrl.state_change_rows(cam), headline)
             self.cmb_note.setCurrentText("")
-            if self.act_popup.isChecked():
+            if self._opt(self.act_popup, bool(self.cfg.show_report_popup)):
                 ChangeReportDialog(None, self.ctrl.state_change_rows(cam),
                                    headline, self).exec()
         except (OmegaError, RuntimeError) as err:
@@ -2020,6 +2046,16 @@ def show_dock():
             _dock_wrapper = None             # — fall through and rebuild cleanly
             _dock_instance = None
     if parent is not None:
+        # Close any ORPHAN from an earlier load before making another. The module globals
+        # are the only handle on the previous panel, and a reload that replaces this module
+        # loses them — leaving a live dock nobody tracks. Measured on-box 2026-07-26: the
+        # transcript logged the same failure twice from two instances answering one click.
+        for old in parent.findChildren(QtWidgets.QDockWidget, "MaxGafferDock"):
+            try:
+                old.close()
+                old.deleteLater()
+            except RuntimeError:
+                pass
         dock = QtWidgets.QDockWidget("MaxGaffer", parent)
         dock.setObjectName("MaxGafferDock")
         widget = MaxGafferDock(dock)
