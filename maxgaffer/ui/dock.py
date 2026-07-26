@@ -272,6 +272,17 @@ class MaxGafferDock(QtWidgets.QWidget):
         btn_refresh_cams.setToolTip("Refresh cameras after adding, deleting or renaming shots.")
         btn_refresh_cams.clicked.connect(self.refresh_cameras)
         head.addWidget(btn_refresh_cams)
+        # RESET is not the camera re-scan beside it and must not be mistaken for it: that
+        # one is cheap and idempotent, this one throws work away. Neutral, never signal —
+        # signal means go, and this is the opposite of go.
+        self.btn_reset = QtWidgets.QPushButton("RESET")
+        self.btn_reset.setFixedWidth(62)
+        self.btn_reset.setToolTip(
+            "Start fresh — put every camera's light back the way it was, remove the "
+            "exposure control MaxGaffer created, and forget all references, readings, "
+            "notes and locks. Asks first.")
+        self.btn_reset.clicked.connect(self._on_reset)
+        head.addWidget(self.btn_reset)
         self.lbl_score = QtWidgets.QLabel("—")
         self.lbl_score.setObjectName("dim")
         self.lbl_score.setToolTip("Last match score for this camera.")
@@ -602,6 +613,69 @@ class MaxGafferDock(QtWidgets.QWidget):
         top.setExpanded(True)
 
     # ================================================================= helpers
+    def _on_reset(self):
+        """Undo everything MaxGaffer did and forget everything it learned."""
+        if self._busy:
+            self._log("busy — reset ignored until the current run finishes")
+            return
+        cams = list(getattr(self.ctrl.session, "cameras", {}) or {})
+        refs = sum(1 for e in (getattr(self.ctrl.session, "cameras", {}) or {}).values()
+                   if getattr(e, "reference", ""))
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Start fresh")
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setText("Put the scene back and forget everything?")
+        # Spell out both halves. "Reset" means nothing on its own, and the scene half is
+        # the one an artist would be upset to discover afterwards.
+        box.setInformativeText("\n".join([
+            "This will:",
+            "  · restore each camera's light to the snapshot taken before its first match",
+            "  · remove the exposure control MaxGaffer created, and undo any dome seed",
+            f"  · forget {len(cams)} camera record(s), {refs} bound reference(s), and every",
+            "    cached reading, note, lock and score",
+            "",
+            "Your scene geometry, materials and cameras are untouched, and the light "
+            "multipliers MaxGaffer measured from your own rig are kept.",
+            "",
+            "This cannot be undone from inside MaxGaffer.",
+        ]))
+        box.setStandardButtons(QtWidgets.QMessageBox.Cancel | QtWidgets.QMessageBox.Reset)
+        box.setDefaultButton(QtWidgets.QMessageBox.Cancel)
+        if box.exec() != QtWidgets.QMessageBox.Reset:
+            self._log("reset cancelled — nothing changed")
+            return
+        self.log.setVisible(True)
+        self._log("— reset —")
+        try:
+            out = self.ctrl.start_fresh(log=self._log)
+        except Exception as err:  # noqa: BLE001 — report, never take the dock down
+            self._log(f"⚠ reset failed: {err}")
+            return
+        for cam in out.get("restored", []):
+            self._log(f"restored {cam}")
+        for cam, why in out.get("failed", []):
+            self._log(f"⚠ {cam} NOT restored ({why}) — its snapshot was kept, try again")
+        self._clear_after_reset()
+        self._log("✓ fresh — bind a reference and match when ready")
+
+    def _clear_after_reset(self):
+        """Empty the panels too. Leaving a stale thumbnail or change list beside an emptied
+        session is how an artist ends up trusting a reading that no longer exists."""
+        self.changes_tree.clear()
+        self.progress_row.setVisible(False)
+        self.bar.setValue(0)
+        self.lbl_stage.setText("IDLE")
+        self.lbl_pct.setText("")
+        for attr in ("thumb_ref", "thumb_match"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                try:
+                    w.clear()
+                except Exception:  # noqa: BLE001
+                    pass
+        self.refresh_cameras()
+        self._refresh_reference_panel(self._current_camera())
+
     def _on_match_progress(self, stage: str, done: int, total: int, pct: float):
         """Main-thread slot. Qt widgets are never touched from the worker."""
         self.lbl_stage.setText(str(stage).upper())

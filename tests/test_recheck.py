@@ -519,3 +519,49 @@ def test_the_match_reports_progress_from_the_single_render_seam():
     # and a broken readout must never take a match down with it
     tick_at = src.index("def _tick(")
     assert "except Exception" in src[tick_at:tick_at + 1200]
+
+
+def test_start_fresh_restores_the_scene_before_it_forgets_anything():
+    """A reset has two halves and both are needed or "fresh" is a lie: put the artist's
+    light back, THEN forget. Order matters — pre_match is the only record of the light
+    before MaxGaffer touched it, so a camera whose restore FAILS must keep its entry rather
+    than have that snapshot dropped along with everything else."""
+    import inspect
+
+    from maxgaffer.maxbridge.controller import Controller
+
+    assert hasattr(Controller, "start_fresh")
+    src = inspect.getsource(Controller.start_fresh)
+    restore_at = src.index("restore_pre_match")
+    clear_at = src.index("self.session.cameras = keep")
+    assert restore_at < clear_at, "it forgets before it restores"
+    assert "summary[\"failed\"]" in src and "keep = {" in src, (
+        "a failed restore must keep its snapshot for a second attempt")
+    # baselines are the artist's own authored multipliers, not ours to discard
+    assert "self._baselines = dict(self.session.baselines)" in src
+    # one bad camera cannot strand the others
+    assert "except Exception" in src[:clear_at]
+
+
+def test_the_reset_button_asks_first_and_says_what_it_will_do():
+    """RESET sits beside the camera re-scan, which is cheap and idempotent — this one throws
+    work away, so it must not be confusable with it, and the confirm has to name the SCENE
+    half too. That is the part an artist would be upset to discover afterwards."""
+    import inspect
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6.QtWidgets")     # the box's Max python has Qt; CI may not
+
+    from maxgaffer.ui import dock as dockmod
+
+    src = inspect.getsource(dockmod.MaxGafferDock._on_reset)
+    assert "QMessageBox" in src and "setInformativeText" in src
+    assert "restore each camera's light" in src, "the confirm hides the scene half"
+    assert "exposure control MaxGaffer created" in src
+    assert "StandardButtons" in src and "Cancel" in src
+    assert "setDefaultButton" in src and "QMessageBox.Cancel" in src, (
+        "the safe choice must be the default")
+    assert "if self._busy" in src, "a reset mid-match would race the worker"
+    # and the panels are emptied, or a stale reading outlives the session that produced it
+    assert "_clear_after_reset" in src

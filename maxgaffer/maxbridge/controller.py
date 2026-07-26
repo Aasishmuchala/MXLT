@@ -1970,6 +1970,49 @@ class Controller:
             return contextlib.nullcontext()
 
     # ------------------------------------------------------------------ restore
+    def start_fresh(self, log: Callable[[str], None] = lambda _m: None) -> Dict:
+        """Undo everything MaxGaffer did and forget everything it learned. → a summary.
+
+        Two halves, and both are needed or "fresh" is a lie. The SCENE half puts each
+        camera's light back to the snapshot taken before its first match, removes the
+        exposure control we auto-created, and undoes a dome seed — that is
+        restore_pre_match, per camera. The SESSION half then drops the bound references,
+        the cached ANALYZE readings, the notes, the locks, the scorecards and the match
+        history, and writes the emptied sidecar.
+
+        Restoring is attempted for EVERY camera before anything is cleared: a camera whose
+        restore fails must not have its snapshot thrown away, because that snapshot is the
+        only record of the artist's original light. Failures are reported and the entry is
+        kept, so a second attempt is possible. Everything else is cleared regardless.
+
+        Baselines are deliberately KEPT. They are a reading of the artist's own authored
+        light multipliers, not something MaxGaffer authored, and re-deriving them is the
+        one thing this cannot do from inside a reset."""
+        summary = {"restored": [], "nothing_to_restore": [], "failed": [], "cleared": 0}
+        for name in list(self.session.cameras.keys()):
+            entry = self.session.cameras.get(name)
+            label = getattr(entry, "camera_name", "") or name
+            try:
+                if self.restore_pre_match(label, log=log):
+                    summary["restored"].append(label)
+                else:
+                    summary["nothing_to_restore"].append(label)
+            except Exception as err:  # noqa: BLE001 — one bad camera must not strand the rest
+                summary["failed"].append((label, str(err)))
+                log(f"⚠ could not restore {label}: {err} — its snapshot is being KEPT")
+        keep = {n: e for n, e in self.session.cameras.items()
+                if any(lbl == (getattr(e, "camera_name", "") or n)
+                       for lbl, _why in summary["failed"])}
+        summary["cleared"] = len(self.session.cameras) - len(keep)
+        self.session.cameras = keep
+        self._baselines = dict(self.session.baselines)   # baselines survive, see docstring
+        self.save_session()
+        log("reset: %d camera(s) restored, %d cleared%s"
+            % (len(summary["restored"]), summary["cleared"],
+               ", %d KEPT after a failed restore" % len(summary["failed"])
+               if summary["failed"] else ""))
+        return summary
+
     def restore_pre_match(self, camera_name: str,
                           log: Callable[[str], None] = lambda _m: None) -> bool:
         """Restore what MaxGaffer changed: the pre-match light (when one was snapped),
