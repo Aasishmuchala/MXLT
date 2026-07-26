@@ -163,3 +163,49 @@ def test_the_solve_renders_at_sweep_size_not_loop_size():
     hook = src[src.index("def render_hook("):src.index("def apply_hook(")]
     assert 'tag.startswith(("sweep", "sunsolve"))' in hook
     assert "profile.sweep_width" in hook
+
+
+def test_a_reference_from_another_building_is_ranked_on_side_not_layout():
+    """Patch PLACEMENT only carries direction when the reference shares the scene's
+    geometry — the patches land on the same walls. Against a photograph of a different
+    building those positions encode THAT building, so matching them is worse than
+    uninformative: measured on-box 2026-07-26, a real dawn plate onto the CG room settled at
+    azimuth 348 with the transfer reading calling the bearing 169 degrees out.
+
+    The tell needs no knowledge of the reference: if the BEST achievable agreement is low,
+    the scene cannot reproduce that layout at any sun angle."""
+    applied = {"az": 0.0}
+    # the reference's light lands HIGH on a right-hand wall — that building's geometry
+    ref_grid = [0.0] * 25
+    ref_grid[4] = ref_grid[9] = 0.5
+    ref = {"hot_frac": 0.03, "hot_grid": ref_grid}
+
+    def apply(state):
+        applied["az"] = state.get("sun.azimuth_deg")
+
+    def stats(path):
+        # OUR room puts its patches low on the floor — no cell is ever shared, so placement
+        # agreement is 0 at every angle. The SIDE still tracks the sun, and that is the one
+        # thing that survives a change of building.
+        col = 0 if applied["az"] < 180 else 4
+        grid = [0.0] * 25
+        grid[15 + col] = grid[20 + col] = 0.5
+        return {"hot_frac": 0.028, "hot_grid": grid}
+
+    out = sunsolve.solve_sun_angles(rig(), ref, apply, lambda t: f"/tmp/{t}.png", stats,
+                                    log=lambda m: None)
+    assert out is not None
+    assert out["cross_domain"] is True, out["score"]
+    # it must pick the half-turn whose light is on the reference's side...
+    assert out["azimuth_deg"] >= 180.0, out
+    # ...and never claim a confident answer from a coarser question on weaker evidence
+    assert out["confidence"] <= 0.45
+
+
+def test_a_same_scene_solve_is_untouched_by_the_fallback():
+    """The fallback must not fire when placement genuinely works — row 4 solved to 2.5
+    degrees on it."""
+    apply, render, stats, _ = world(true_az=105.0)
+    out = sunsolve.solve_sun_angles(rig(), REF, apply, render, stats)
+    assert out["cross_domain"] is False
+    assert out["confidence"] > 0.45

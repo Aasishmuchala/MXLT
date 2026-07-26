@@ -363,8 +363,18 @@ def highlight_similarity(ref: Dict, cur: Dict) -> Optional[float]:
     # presence, in octaves — 3x more or less sun patch is a different photograph
     octaves = abs(math.log2(fr / fc))
     presence = max(0.0, 1.0 - octaves / 2.0)
-    # placement: where the patches landed
-    placement = (cosine(ref.get("hot_grid") or [], cur.get("hot_grid") or []) + 1.0) / 2.0
+    # placement: where the patches landed. TOTAL VARIATION, not a cosine — hot_grid is a
+    # non-negative distribution, so a cosine can never fall below 0, its mapped placement
+    # can never fall below 0.5, and half the metric's range is unreachable. Measured on the
+    # session's own plates: cosine placed a real photograph of a DIFFERENT building at
+    # 0.842 against 0.896 for a genuinely good match — 5 points apart at the top of the
+    # scale. Total variation, which is a proper distance on distributions and spans the
+    # full range, places the same pair at 0.499 against 0.661.
+    ga = [max(0.0, float(v)) for v in (ref.get("hot_grid") or [])]
+    gb = [max(0.0, float(v)) for v in (cur.get("hot_grid") or [])]
+    if len(ga) != len(gb) or not ga:
+        return round(presence, 4)
+    placement = max(0.0, 1.0 - 0.5 * sum(abs(x - y) for x, y in zip(ga, gb)))
     return round(0.5 * presence + 0.5 * placement, 4)
 
 

@@ -29,6 +29,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from .genome import LightingState
 from .metrics import highlight_similarity
+from .patchgeom import bearing_agreement
 
 #: Coarse grid. 12 azimuths is 30-degree resolution — half a step is 15 degrees, which is
 #: inside a lighting artist's own margin and is where the fine pass takes over. Three
@@ -40,6 +41,15 @@ COARSE_ALTITUDES = (8.0, 26.0, 52.0)
 #: space without a gap. Resolution after refinement is ~7 degrees of azimuth.
 FINE_AZIMUTH_OFFSETS = (-15.0, -7.0, 7.0, 15.0)
 FINE_ALTITUDE_OFFSETS = (-12.0, -5.0, 5.0, 12.0)
+
+#: Best achievable patch agreement below which the scene evidently cannot reproduce the
+#: reference's patch LAYOUT at any sun angle — a photograph of a different building, most
+#: often. Placement is then not just uninformative but misleading, because those patches
+#: encode that building's geometry: measured on-box 2026-07-26, a real dawn plate matched
+#: onto the CG room settled at azimuth 348 with the transfer reading calling the bearing
+#: 169 degrees out. Below this the solve re-ranks on the LATERAL centroid alone, which
+#: claims only "the light comes from that side" and needs no shared geometry.
+CROSS_DOMAIN_AGREEMENT = 0.65
 
 #: A solve is only worth trusting if the winner actually stood out. Same idea as the
 #: sweep's margin: a flat landscape means every direction lights this scene alike, and the
@@ -88,6 +98,7 @@ def solve_sun_angles(
                     and "sun.altitude_deg" not in locks)
     probes = 0
     table: List[Tuple[float, float, float]] = []
+    lateral: Dict[Tuple[float, float], Optional[float]] = {}
 
     def probe(azimuth: float, altitude: Optional[float], tag: str) -> Optional[float]:
         nonlocal probes
@@ -108,8 +119,11 @@ def solve_sun_angles(
         value = highlight_similarity(ref_stats, cur)
         if value is None:
             return None
-        table.append((float(azimuth) % 360.0,
-                      float(altitude) if altitude is not None else -999.0, value))
+        az_key = float(azimuth) % 360.0
+        alt_key = float(altitude) if altitude is not None else -999.0
+        table.append((az_key, alt_key, value))
+        # kept beside it, unused unless the placement evidence turns out to be worthless
+        lateral[(az_key, alt_key)] = bearing_agreement(ref_stats, cur)
         return value
 
     # ---- coarse pass over the whole sphere of plausible sun positions
@@ -142,11 +156,32 @@ def solve_sun_angles(
             if got is not None and got > best[2]:
                 best = (az1, _clamp_altitude((alt1 or 0.0) + d_alt), got)
 
+    # ---- CROSS-DOMAIN fallback. If nothing reproduced the reference's patch layout, the
+    # layout was never ours to match and ranking on it picked a direction for reasons that
+    # do not transfer. Re-rank on the lateral centroid, which survives a change of building.
+    cross_domain = best[2] < CROSS_DOMAIN_AGREEMENT
+    if cross_domain:
+        ranked = [(lateral.get((a, e)), a, e) for a, e, _v in table]
+        ranked = [r for r in ranked if r[0] is not None]
+        if ranked:
+            top = max(ranked, key=lambda r: r[0])
+            log(f"sun solve: nothing reproduced the reference's patch LAYOUT (best "
+                f"{best[2]:.2f}) — that layout belongs to another scene. Re-ranking on "
+                f"which SIDE the light comes from, which does transfer: azimuth "
+                f"{top[1]:.0f}°")
+            best = (top[1], (top[2] if top[2] != -999.0 else best[1]), best[2])
+            # a coarser question answered on weaker evidence is never a confident answer
+            result_confidence_cap = 0.45
+        else:
+            result_confidence_cap = 0.45
+    else:
+        result_confidence_cap = 1.0
+
     # ---- how decisive was it? A flat table is a finding, not a failure.
     rivals = [v for az, alt, v in table
               if abs((az - best[0] + 180.0) % 360.0 - 180.0) > 25.0]
     margin = best[2] - max(rivals) if rivals else best[2]
-    confidence = max(0.0, min(1.0, margin / DECISIVE_MARGIN))
+    confidence = max(0.0, min(result_confidence_cap, margin / DECISIVE_MARGIN))
     result = {
         "azimuth_deg": round(best[0], 2),
         "altitude_deg": (round(best[1], 2) if best[1] is not None else None),
@@ -154,6 +189,7 @@ def solve_sun_angles(
         "margin": round(margin, 4),
         "confidence": round(confidence, 3),
         "probes": probes,
+        "cross_domain": cross_domain,
         "table": [(round(a, 1), round(e, 1), round(v, 4)) for a, e, v in table],
     }
     if confidence < 0.5:
