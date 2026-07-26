@@ -85,12 +85,18 @@ WIDTH_SOFT_PX = 16.0
 #: highlight_similarity already score multiplicative quantities. 3 octaves span 2→16 px.
 _WIDTH_OCTAVES = math.log(WIDTH_SOFT_PX / EDGE_OPERATOR_FLOOR_PX, 2.0)
 
-#: Label bands. 0.62 is a width of 4.4 px, 0.35 is 7.7 px — so an edge that resolves inside
-#: ~1.7% of the frame reads hard, one that takes more than ~3% reads soft, and the band
-#: between them is where a source of intermediate size (a big window, a bright overcast
-#: patch) genuinely sits. Chosen on the width geometry above, NOT fitted to a plate.
-HARD_LABEL = 0.62
-SOFT_LABEL = 0.35
+#: Label bands, CALIBRATED against generated ground truth. One scene was rendered five times
+#: in 3ds Max with nothing varying but V-Ray's sun size, giving a monotonic truth series
+#: rather than a handful of anecdotes (2026-07-26):
+#:      sun.size  1 → 0.984      sun.size 16 → 0.152
+#:      sun.size  3 → 0.776      sun.size 30 → 0.148
+#:      sun.size  8 → 0.356
+#: Sizes 1 and 3 are unambiguously hard, 16 and 30 unambiguously soft, and 8 is genuinely in
+#: between. The thresholds are the midpoints of the two gaps that separate those groups —
+#: (0.776 + 0.356)/2 and (0.356 + 0.152)/2 — so each band is centred on measured truth
+#: rather than on a guess about pixel widths.
+HARD_LABEL = 0.57
+SOFT_LABEL = 0.25
 
 #: Where the plateaus are sampled, either side of the boundary, along the gradient normal.
 #: The NEAR pair sets the level difference Δ; the FAR pair only has to agree that the
@@ -166,19 +172,24 @@ SUSTAIN_FRAC = 0.6
 #: inside it. A cone of this half-angle covers ~1.4% of the sphere of unit directions.
 RATIO_INLIER_DEG = 12.0
 
-#: Below this share of candidates agreeing, the frame's boundaries are too incoherent to be
-#: one scene's shadows and the answer is None.
+#: How many ratio clusters to enumerate before giving up on finding a sun population. The
+#: search stops early the moment a red-weighted one appears — clusters come out largest
+#: first, so the first warm one IS the largest warm one — so this bound is only ever paid in
+#: full by a frame that has no sun in it, which is exactly the frame that should pay for
+#: being sure.
+MAX_CLUSTERS = 6
+
+#: THE SHARE OF THE FRAME IS NOT EVIDENCE, and this is deliberately not a gate.
 #:
-#: A WEAK GATE, and the measurement says so plainly. Eight random albedo patchworks with no
-#: shadow anywhere in them (2026-07-26): four declined, and the other four reached 0.41,
-#: 0.45, 0.50 and 0.73 — that last one HIGHER than any of the three real plates, which sit
-#: at 0.52 (golden hour), 0.52 (dawn landscape) and 0.68 (dome-only). So the inlier fraction
-#: does not separate "has shadows" from "has none", and no threshold on it could: raising
-#: this floor far enough to reject the noise would reject real photographs first. It is kept
-#: at a level that catches only the outright incoherent frames, and the work of not
-#: believing a bad reading is done by `confidence`, which stayed at or under 0.30 for every
-#: one of those patchworks.
-MIN_INLIER_FRAC = 0.35
+#: An earlier version required the chosen cluster to hold a minimum share of candidates. Two
+#: measurements killed it. First, share does not separate signal from noise: eight random
+#: albedo patchworks with no shadow anywhere in them reached shares of 0.41, 0.45, 0.50 and
+#: 0.73 (2026-07-26) — that last one HIGHER than any of the three real plates, which sit at
+#: 0.52, 0.52 and 0.68. Second, and decisively, the share of the RIGHT answer is small: on
+#: the golden-hour interior the actual sun-shadow cluster is 10% of candidates while 53% is
+#: ambient occlusion. A floor on share would have rejected the one correct population in the
+#: frame for being outnumbered by the wrong one. What gates instead is an ABSOLUTE sample
+#: count, because a hundred boundaries are a hundred boundaries however much else is going on.
 
 #: Hypotheses tested in the consensus. Every sample's own direction is a candidate axis, but
 #: scoring all of them is O(k²) and k runs to ~1500 on a detailed plate. An evenly-strided
@@ -197,16 +208,29 @@ RATIO_NEG_SLACK = 0.06
 #: numerically meaningless — the denominator is quantisation.
 MIN_SHADOW_LINEAR = 0.002
 
-#: A SUN-vs-ambient ratio is warm by construction: the key is a 2000–5500 K sun and the fill
-#: is 10000 K+ skylight, so s/a is red-weighted in every daylight scene. A consensus axis
-#: that is BLUE-weighted is therefore not a sun/shade population — it is ambient occlusion
-#: (more skylight against less skylight), which is a real illumination change that passes the
-#: invariant honestly but says nothing about how big the SUN is. Measured 2026-07-26 on the
-#: dome-only archetype, where there is no sun at all: every one of its three ratio clusters
-#: came back blue-weighted. Used to CAP confidence, never to change the label — the width
-#: was still measured, it just is not evidence about a source that is not in the frame.
+#: WHICH CLUSTER IS THE SUN'S. A sun-vs-ambient ratio is warm by construction — the key is a
+#: 2000–6500 K sun and the fill is cooler skylight — so s/a is red-weighted in every daylight
+#: scene, while an albedo ratio has no reason to be. The threshold is r ≥ b in the normalised
+#: direction, i.e. a margin of exactly 1.0, and it is a physical dividing line rather than a
+#: fitted one. Pushing the repo's own `colortemp.kelvin_to_rgb` across the whole plausible
+#: daylight range (2026-07-26) puts every sun/sky pairing above it, with the LEAST warm case
+#: — a 6500 K sun against a 7000 K sky, which is daylight barely distinguishable from its own
+#: fill — at r/b = 1.07, and the warmest (2000 K against 20000 K) at 27.4. Measured material
+#: pairs sit far below: grey/brick 0.10, plaster/wood 0.19, sky/foliage 0.62. Nothing here is
+#: tuned to an image; 1.0 is simply where "the ratio is warm" stops being true.
+#:
+#: KNOWN FALSE NEGATIVE, and it is a real one: an interior whose ambient is warm BOUNCE
+#: rather than blue sky inverts this. A 4500 K sun against 3000 K bounce gives r/b = 0.59, so
+#: its sun cluster reads cool and is declined. Measured across that family the ratio runs
+#: 0.39–0.89 — always below the line. Such a frame returns None (no sun found) rather than a
+#: wrong hardness, which is the safe direction but is still a miss.
 SUN_WARMTH_MIN = 1.0
-UNLIT_CONSENSUS_CONFIDENCE = 0.30
+
+#: Warmth margin at which the choice is unambiguous, for confidence. r/b of 1.5 is a clearly
+#: warm key against a cool fill; 1.07 is the edge of the daylight range and must be held
+#: loosely, because at that point sun and sky are nearly the same colour and the two
+#: populations are not really separable.
+CONFIDENT_WARMTH = 1.5
 
 #: sRGB→linear as a 256-entry table. The decode is a pow() per channel per pixel otherwise,
 #: and there are only 256 possible 8-bit inputs, so the whole transfer function is a lookup.
@@ -219,12 +243,23 @@ _LIN_LUT = tuple(
 
 #: Fewer boundary samples than this and the median is an anecdote → None.
 MIN_SAMPLES = 40
-#: ...and this many is a population; below it, confidence is scaled by what was found.
-CONFIDENT_SAMPLES = 400
+#: ...and this many is a settled median. Lowered from 400 when share stopped being a
+#: confidence term: the quantity that matters is how many boundaries the CHOSEN cluster
+#: holds, not how much of the frame it covers, and a hundred-odd boundary samples pin a
+#: median perfectly well. Adjacent samples along one edge are not independent, so this is
+#: counting evidence generously — hence a floor set well above the 40 that merely permits.
+CONFIDENT_SAMPLES = 150
 
-#: Both populations at least this large ⇒ "mixed" regardless of where the median landed.
-#: A shaft of sun crossing a softly-filled room genuinely has both, and its median is an
-#: average of two things that are not present in the middle.
+#: Both populations at least this large ⇒ the frame is BIMODAL: it carries a hard population
+#: and a soft one rather than one typical boundary width. Reported as a diagnostic, and it
+#: no longer overrides the label.
+#:
+#: It used to. The override was removed when the ladder arrived, on the ladder's evidence:
+#: the calibrated, monotonic quantity is the MEDIAN, and the override let a population count
+#: contradict it — the golden-hour reference measures a median of 0.947, as hard as anything
+#: in the truth series, and was being labelled "mixed" because its boundaries split 54/46.
+#: Not one of the five ladder rungs triggers the override, so it was never exercised by
+#: ground truth while it was overruling the one quantity that was.
 MIXED_MINORITY = 0.30
 
 
@@ -333,38 +368,41 @@ def _shadow_direction(lit, shade) -> Optional[Tuple[float, float, float]]:
     return clamped[0] / norm, clamped[1] / norm, clamped[2] / norm
 
 
-def _consensus(directions: List[Tuple[float, float, float]],
-               tol_deg: float = RATIO_INLIER_DEG):
-    """The one illuminant change the frame's boundaries agree on. → (axis, inlier flags,
-    mean cosine) or None.
+def _is_warm(axis) -> bool:
+    """Is this ratio direction a SUN-over-ambient one? See SUN_WARMTH_MIN."""
+    return axis[0] >= SUN_WARMTH_MIN * axis[2]
 
-    Strided-hypothesis consensus: every sample's own direction is a candidate axis, each
-    scored by how many samples fall inside a cone of ``tol_deg`` about it, and the best wins.
-    A spherical MEAN would be pulled off the cluster by the outliers this exists to reject —
-    on the dawn plate the outliers are the majority — so the estimator has to be a vote, not
-    an average. One refinement pass re-centres the winning axis on the mean of its own
-    inliers and re-counts, which recovers the precision a discrete hypothesis set gives up."""
-    k = len(directions)
-    if k == 0:
+
+def _one_cluster(directions, members, tol_cos):
+    """Largest cone of ``tol_cos`` over the given member indices → (axis, [indices], mean
+    cosine) or None.
+
+    Strided-hypothesis vote: every sample's own direction is a candidate axis, each scored by
+    how many samples fall inside a cone about it, and the most-populated wins. A spherical
+    MEAN would be pulled off the cluster by the outliers this exists to reject — on the dawn
+    plate the outliers are the majority — so the estimator has to be a vote, not an average.
+    Two refinement passes re-centre the winner on the mean of its own inliers, recovering the
+    precision a discrete hypothesis set gives up."""
+    if not members:
         return None
-    tol_cos = math.cos(math.radians(tol_deg))
-    stride = max(1, k // CONSENSUS_HYPOTHESES)
+    stride = max(1, len(members) // CONSENSUS_HYPOTHESES)
     best_axis, best_count = None, -1
-    for hi in range(0, k, stride):
+    for hi in members[::stride]:
         ax, ay, az = directions[hi]
         count = 0
-        for dx, dy, dz in directions:
+        for j in members:
+            dx, dy, dz = directions[j]
             if dx * ax + dy * ay + dz * az >= tol_cos:
                 count += 1
         if count > best_count:
             best_axis, best_count = directions[hi], count
     if best_axis is None:
         return None
-    # refine: re-centre on the mean of the inliers, then take the final membership from it
     for _ in range(2):
         ax, ay, az = best_axis
         sx = sy = sz = 0.0
-        for dx, dy, dz in directions:
+        for j in members:
+            dx, dy, dz = directions[j]
             if dx * ax + dy * ay + dz * az >= tol_cos:
                 sx += dx
                 sy += dy
@@ -374,18 +412,55 @@ def _consensus(directions: List[Tuple[float, float, float]],
             break
         best_axis = (sx / norm, sy / norm, sz / norm)
     ax, ay, az = best_axis
-    flags = []
-    dot_sum = 0.0
-    for dx, dy, dz in directions:
+    kept, dot_sum = [], 0.0
+    for j in members:
+        dx, dy, dz = directions[j]
         dot = dx * ax + dy * ay + dz * az
-        inlier = dot >= tol_cos
-        flags.append(inlier)
-        if inlier:
+        if dot >= tol_cos:
+            kept.append(j)
             dot_sum += dot
-    hits = sum(1 for f in flags if f)
-    if not hits:
+    if not kept:
         return None
-    return best_axis, flags, dot_sum / hits
+    return best_axis, kept, dot_sum / len(kept)
+
+
+def _sun_cluster(directions: List[Tuple[float, float, float]],
+                 tol_deg: float = RATIO_INLIER_DEG):
+    """The frame's SUN-shadow population. → (axis, [indices], mean cosine, rank) or None.
+
+    Clusters are peeled off largest-first and the first RED-WEIGHTED one wins — not the
+    largest one. That distinction is the whole point of this function and it was learned the
+    hard way: the invariant is symmetric. A shadow edge's ratio is albedo-independent, but a
+    material edge's ratio is illumination-independent — the same two surfaces meeting in sun
+    and in shade give the same albedo ratio both times — so a material pair that REPEATS
+    across a frame forms a cluster every bit as tight as the shadows do, and taking the
+    majority just takes whichever population is bigger. Measured 2026-07-26, the majority was
+    never the sun's: 53% ambient occlusion against a 10% sun cluster on the golden-hour
+    interior, and on the dawn landscape a 52% cluster that was 88% tree canopy.
+
+    Warmth breaks the tie on physics rather than on size (see SUN_WARMTH_MIN). ``rank`` is
+    which cluster it turned out to be — 0 means the sun also happened to be the biggest thing
+    in frame, which on real plates it usually is not.
+
+    None when no cluster is warm, which is the right answer for a scene lit only by a dome:
+    there is no sun whose size a width could be evidence about."""
+    k = len(directions)
+    if k == 0:
+        return None
+    tol_cos = math.cos(math.radians(tol_deg))
+    remaining = list(range(k))
+    for rank in range(MAX_CLUSTERS):
+        if len(remaining) < MIN_SAMPLES:
+            return None                  # nothing left that could support a median
+        found = _one_cluster(directions, remaining, tol_cos)
+        if found is None:
+            return None
+        axis, members, mean_cos = found
+        if _is_warm(axis):
+            return axis, members, mean_cos, rank
+        drop = set(members)
+        remaining = [j for j in remaining if j not in drop]
+    return None
 
 
 def _hardness_from_width(width_px: float) -> float:
@@ -454,9 +529,34 @@ def edge_hardness(source) -> Optional[Dict]:
     no sun population to have measured — which is why that case caps confidence.
 
     The failure is ONE-SIDED and that is the useful part: nothing here makes a genuinely
-    hard-lit frame read soft. A "soft" reading is therefore strong evidence. A "hard"
-    reading is weak whenever ``ratio_is_warm`` is False or ``inlier_frac`` is near the floor,
-    and ``hard_frac`` beside a low ``confidence`` is the tell.
+    hard-lit frame read soft. A "soft" reading is therefore strong evidence.
+
+    WHAT ``confidence`` MEANS, exactly, because it does not mean what it looks like. It is
+    *how well determined this width measurement is, GIVEN that the warm cluster really is
+    the sun's* — support, cluster tightness, coherence with the frame's other warm evidence,
+    and how closely the chosen boundaries agree on a width. It is NOT the probability that
+    the warm cluster is the sun. Those are different questions and only the first one is
+    answerable from a single frame. On the rendered sun-size ladder, where every rung is a
+    correct reading, it sits in a narrow 0.41–0.58 band, which is the honest report: all five
+    are usable and none is certain. It does not rank a good reading above a bad one — see the
+    tension below — so treat a high value as "this number is stable", never as "this number
+    is right".
+
+    THE UNRESOLVED TENSION IN ``confidence``, stated because it is load-bearing. Cluster
+    SHARE is deliberately not a confidence term, because the share of the RIGHT answer is
+    small — the golden-hour plate's genuine sun cluster is 10% of candidates, outnumbered
+    five to one by ambient occlusion — and scoring on share reported the one correct
+    population in the frame at low confidence for being outnumbered. Removing it fixed that
+    and cost something real: measured over twelve random albedo patchworks with no shadow in
+    them at all (2026-07-26), five were refused outright but the worst of the rest scored
+    0.841, ABOVE the 0.358 this gives the golden-hour sun. Random albedo pairs skew warm
+    often enough to form a coherent warm cluster by chance, and within a single frame that
+    is not distinguishable from a sun population. Share-in suppresses noise but buries the
+    right answer; share-out lets the right answer score but lets noise score too. This
+    implementation chose share-out. Until that is resolved, a high confidence from this
+    function is not by itself grounds to overrule a reading from elsewhere — check
+    ``cluster_rank``, ``inlier_frac`` and ``warmth_ratio``, which are reported for exactly
+    this purpose.
 
     Diagonal boundaries are measured on a ramp, where the central-difference magnitude is
     exact at any orientation; only true steps (already clamped at the operator floor) carry
@@ -589,18 +689,20 @@ def _edge_hardness(source) -> Optional[Dict]:
     candidates = len(hardnesses)
     if candidates < MIN_SAMPLES:
         return None
-    agreed = _consensus(directions)
-    if agreed is None:
+    chosen = _sun_cluster(directions)
+    if chosen is None:
+        # No warm cluster anywhere ⇒ no sun-shadow population in this frame. A width
+        # measured on ambient occlusion is not evidence about the size of a sun, so the
+        # answer is absence rather than a number with a caveat attached.
         return None
-    axis, flags, mean_cos = agreed
-    inlier_frac = sum(1 for f in flags if f) / float(candidates)
-    if inlier_frac < MIN_INLIER_FRAC:
-        # No shared illuminant change ⇒ these are not shadow boundaries. Reporting a
-        # hardness here is exactly the confidently-wrong reading this consensus exists to
-        # stop, so the answer is absence, not a low-confidence number.
-        return None
-    hardnesses = [v for v, keep in zip(hardnesses, flags) if keep]
-    widths = [v for v, keep in zip(widths, flags) if keep]
+    axis, members, mean_cos, rank = chosen
+    inlier_frac = len(members) / float(candidates)
+    # how much OTHER warm evidence disagreed with the chosen cone — the sun population
+    # should be one cluster, not several pointing different ways
+    rival_warm = sum(1 for j, d in enumerate(directions)
+                     if _is_warm(d) and j not in set(members))
+    hardnesses = [hardnesses[j] for j in members]
+    widths = [widths[j] for j in members]
     samples = len(hardnesses)
     if samples < MIN_SAMPLES:
         return None
@@ -609,34 +711,52 @@ def _edge_hardness(source) -> Optional[Dict]:
     median = hardnesses[samples // 2]
     hard_frac = sum(1 for v in hardnesses if v >= HARD_LABEL) / samples
     soft_frac = sum(1 for v in hardnesses if v <= SOFT_LABEL) / samples
-    if hard_frac >= MIXED_MINORITY and soft_frac >= MIXED_MINORITY:
-        label = "mixed"                      # both populations are really present
-    elif median >= HARD_LABEL:
+    # the label rides on the MEDIAN alone — the quantity the ladder showed monotonic. See
+    # MIXED_MINORITY for why a population count no longer gets to overrule it.
+    bimodal = hard_frac >= MIXED_MINORITY and soft_frac >= MIXED_MINORITY
+    if median >= HARD_LABEL:
         label = "hard"
     elif median <= SOFT_LABEL:
         label = "soft"
     else:
         label = "mixed"
-    # CONFIDENCE IS THE CONSENSUS, not the sample count. The failure this replaced was a
-    # reading of 1.00 at confidence 1.00 taken off tree canopies: hundreds of samples, all
-    # agreeing they were sharp, none of them a shadow. Agreement about sharpness is worth
-    # nothing; agreement about the ILLUMINANT is the thing that says these are shadows. So
-    # the dominant term is how much of the frame joined the consensus, and the cluster's own
-    # tightness scales it — a cone filled to its edge is a weaker claim than a tight core.
-    consensus = (inlier_frac - MIN_INLIER_FRAC) / (1.0 - MIN_INLIER_FRAC)
-    tightness = max(0.0, min(1.0, (mean_cos - math.cos(math.radians(RATIO_INLIER_DEG)))
-                             / (1.0 - math.cos(math.radians(RATIO_INLIER_DEG)))))
+    # CONFIDENCE = how much do I believe this width is the SUN's penumbra. Share of frame is
+    # deliberately absent from it. The share of the right answer is small — the golden-hour
+    # interior's sun cluster is 10% of candidates — so scoring on share would report the one
+    # correct population in the frame at low confidence for being outnumbered by ambient
+    # occlusion, which is the mistake this whole selection exists to undo. What is left is:
+    #   support    enough boundaries to settle a median, counted ABSOLUTELY
+    #   warmth     how decisively the axis is a sun-over-ambient ratio rather than a coin toss
+    #   tightness  how concentrated the cluster is inside its cone
+    #   coherent   whether the other warm evidence joined this cluster or contradicted it
+    #   agreement  how closely the chosen boundaries agree on a WIDTH — the direct statement
+    #              of whether this median is well determined
+    #
+    # DISTANCE FROM A LABEL BOUNDARY IS NOT ONE OF THEM, and used to be. It measured the
+    # wrong thing: a frame whose median lands mid-scale has an ambiguous LABEL but a
+    # perfectly well determined NUMBER, and the number is what drives sun.size. Measured on
+    # the ladder, that term reported the sun.size 8 rung — a correct mid reading, dead centre
+    # of a monotonic series — at confidence 0.047, purely for landing near a threshold.
+    # Label ambiguity is now reported separately as `label_margin`, where a caller who cares
+    # about the category rather than the quantity can see it.
     support = min(1.0, samples / float(CONFIDENT_SAMPLES))
-    gap = min(abs(median - HARD_LABEL), abs(median - SOFT_LABEL))
-    decisive = min(1.0, gap / 0.12)
+    warmth_ratio = axis[0] / axis[2] if axis[2] > 1e-9 else float("inf")
+    warmth = min(1.0, max(0.0, (warmth_ratio - SUN_WARMTH_MIN)
+                          / (CONFIDENT_WARMTH - SUN_WARMTH_MIN)))
+    floor_cos = math.cos(math.radians(RATIO_INLIER_DEG))
+    tightness = max(0.0, min(1.0, (mean_cos - floor_cos) / (1.0 - floor_cos)))
+    coherent = samples / float(samples + rival_warm)
+    # how closely the chosen boundaries agree on a width, as an inter-quartile range of their
+    # hardnesses. Robust to the tails a real frame always has; a spread of half the scale is
+    # where the median stops describing anything.
+    spread = hardnesses[(3 * samples) // 4] - hardnesses[samples // 4]
+    agreement = max(0.0, 1.0 - spread / 0.5)
+    label_margin = min(abs(median - HARD_LABEL), abs(median - SOFT_LABEL))
     # the WORST factor wins, the posture patchgeom.bearing_hint takes: a confident sub-measure
     # must not paper over a weak one
-    confidence = min(max(0.0, consensus), 0.35 + 0.65 * tightness, support, decisive)
-    # ...and a blue-weighted axis means the population is ambient occlusion, not sun/shade,
-    # so whatever width it has is not evidence about the size of a sun
-    warm = axis[0] >= SUN_WARMTH_MIN * axis[2]
-    if not warm:
-        confidence = min(confidence, UNLIT_CONSENSUS_CONFIDENCE)
+    confidence = min(support, 0.35 + 0.65 * warmth, 0.35 + 0.65 * tightness,
+                     coherent, 0.25 + 0.75 * agreement)
+    warm = True                     # a returned reading is warm by construction — see above
     widths.sort()
     return {
         "hardness": round(median, 4),
@@ -645,13 +765,25 @@ def _edge_hardness(source) -> Optional[Dict]:
         "samples": samples,
         "candidates": candidates,
         "inlier_frac": round(inlier_frac, 4),
+        # True on every returned reading now — a cool cluster is declined outright rather
+        # than reported with a caveat. Kept because it names the gate that was crossed.
         "ratio_is_warm": warm,
+        # which cluster the sun turned out to be, largest first. 0 means the sun population
+        # was also the biggest thing in frame; on real plates it usually is not, and a high
+        # rank is the honest signal that most of this frame is not shadows at all.
+        "cluster_rank": rank,
+        "warmth_ratio": round(warmth_ratio, 3) if math.isfinite(warmth_ratio) else None,
         # the recovered sun-to-ambient spectral ratio, unit linear RGB — a by-product, but
         # a physically meaningful one: it is what separates the key from the fill
         "ratio_rgb": [round(c, 4) for c in axis],
         "width_px": round(widths[samples // 2], 2),
         "hard_frac": round(hard_frac, 4),
         "soft_frac": round(soft_frac, 4),
+        # this frame carries a hard population AND a soft one rather than one typical width
+        "bimodal": bimodal,
+        # how far the median sits from the nearest label boundary. Deliberately NOT part of
+        # confidence — it describes the categorical answer, not the measured one.
+        "label_margin": round(label_margin, 4),
     }
 
 
