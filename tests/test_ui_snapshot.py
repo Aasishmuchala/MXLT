@@ -51,8 +51,19 @@ def test_snapshot_dock_mid_session(monkeypatch, tmp_path):
     d.plate._split = 0.55
     d._progress_begin("sun solve")
     d._on_match_progress("sun solve", 27, 44, 34.8)
+    for line in ("— match: StreetCam —",
+                 "analyze: exterior · golden_hour · clear · sun bearing -60°",
+                 "multi-start: golden_low → 71.2",
+                 "sun solve: azimuth 210° — patch agreement 0.68 (confidence 74%)",
+                 "polish: exposure.ev 12.40→9.96 · 84.1→86.3 ✓"):
+        d._log(line)
+    d._fill_changes(None, [{"prop": "sun.azimuth_deg", "before": "135.94",
+                            "after": "30.00"},
+                           {"prop": "exposure.ev", "before": "13.00",
+                            "after": "9.96"}],
+                    "StreetCam — max_iterations, score 87.7")
 
-    d.resize(1060, 1240)
+    d.resize(1060, 1720)
     d.show()
     app.processEvents()
     os.makedirs(OUT, exist_ok=True)
