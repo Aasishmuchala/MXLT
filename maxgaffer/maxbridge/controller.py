@@ -457,7 +457,8 @@ class Controller:
         try:
             return refread.fuse(
                 semantics,
-                refread.measure(self.ref_stats(ref_path), reading=semantics))
+                refread.measure(self.ref_stats(ref_path), reading=semantics,
+                                path=ref_path))
         except Exception:  # noqa: BLE001 — a measurement must never sink an analysis
             return semantics
 

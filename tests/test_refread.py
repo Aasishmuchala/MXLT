@@ -204,3 +204,27 @@ def test_measure_still_works_without_the_model_s_reading():
     exactly as it did."""
     assert "wb_kelvin_estimate" in refread.measure(_warm_lit_stats())
     assert refread.measure(_warm_lit_stats(), reading=None).get("_wb_withheld") is None
+
+
+# ------------------------------------- shadow hardness: calibrated, and still withheld
+def test_hardness_is_not_fused_because_its_confidence_cannot_rank_itself():
+    """I shipped a 0.40 gate on the strength of the ladder — every calibrated-correct rung
+    reported 0.41 to 0.58 and both doubtful plates reported 0.25 — and it was wrong.
+    shadowedge's confidence measures how well-DETERMINED a width is GIVEN the warm cluster
+    is the sun's, and cannot answer whether it is, because one frame cannot. Measured: an
+    adversarial noise frame scores 0.841 while golden hour's CORRECT reading scores 0.250.
+    A number that cannot rank its good cases above its bad ones is not a gate.
+
+    What the ladder DOES license is driving sun.size inside the polish loop, which compares
+    against a render of the same scene. Different question; only that one was tested."""
+    assert refread.HARDNESS_TRUST is None
+    got = refread.measure({"hot_frac": 0.03}, path="anything.png")
+    assert "light_quality" not in got
+
+
+def test_hardness_stays_available_as_a_diagnostic():
+    """Withheld from the reading is not the same as unavailable — the ladder proved it
+    monotonic, and the polish loop is entitled to it."""
+    from maxgaffer.core import shadowedge
+
+    assert hasattr(shadowedge, "edge_hardness")

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Callable, Dict, Optional
 
-from . import cct
+from . import cct, shadowedge
 
 #: Share of frame in locally-contrasty bright patches below which a frame carries no
 #: directional light worth speaking of. Measured across every reference this session:
@@ -52,15 +52,34 @@ AWB_NEUTRAL_LO, AWB_NEUTRAL_HI = 5900.0, 7100.0
 NON_NEUTRAL_TIMES = ("golden_hour", "blue_hour", "sunrise", "sunset", "dawn", "dusk",
                      "night")
 
+#: WITHDRAWN, and the reason is worth more than the gate was. I set this to 0.40 on the
+#: strength of the ladder — every calibrated-correct rung reported 0.41 to 0.58 and both
+#: doubtful plates reported 0.25, so the bar appeared to separate good readings from bad.
+#: It does not. shadowedge's confidence measures how well-DETERMINED a width is GIVEN the
+#: warm cluster really is the sun's; it cannot answer whether it is, because one frame
+#: cannot. Measured: an adversarial noise frame scores 0.841 while golden hour's CORRECT
+#: reading scores 0.250. A number that cannot rank its own good cases above its bad ones is
+#: not a gate, and building one out of it is how a confidently wrong measurement gets
+#: authority — the exact failure this module exists to avoid.
+#:
+#: The ladder licenses a different use and it is a real one: WITHIN a scene, with geometry
+#: and content fixed and only sun size varying, the response is strictly monotonic across a
+#: 0.836 spread. That is enough to DRIVE sun.size in the polish loop, which is a comparison
+#: against a render of the same scene. It is not enough to overrule a reading taken off a
+#: photograph of somewhere else. Those are different questions and only one has been tested.
+HARDNESS_TRUST = None
 
-def measure(stats: Optional[Dict], reading: Optional[Dict] = None) -> Dict:
+
+def measure(stats: Optional[Dict], reading: Optional[Dict] = None,
+            path: Optional[str] = None) -> Dict:
     """→ {field: {"value", "confidence", "why"}} for everything the pixels can answer.
 
     Only fields with real evidence appear. An empty dict means the image told us nothing,
     which is a fine answer and quite different from telling us something uncertain.
 
     ``reading`` is the model's own report, used ONLY to catch the one failure the pixels
-    cannot see for themselves — see AWB_NEUTRAL_LO."""
+    cannot see for themselves — see AWB_NEUTRAL_LO. ``path`` enables the measurements that
+    need the image rather than its statistics."""
     out: Dict[str, Dict] = {}
     if not isinstance(stats, dict):
         return out
