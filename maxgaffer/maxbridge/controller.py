@@ -23,7 +23,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from ..core import (animation, consensus, critic, domeseed, expose, fairness, feedback,
                     transfer,
                     metrics, omega, planner, profiles, prompts, providers, rules,
-                    scenedigest, sunsolve, scenarios as scen)
+                    scenedigest, sunsolve, refread, scenarios as scen)
 from ..core.director import (Hooks, MatchConfig, MatchResult, TRANSFER_WEIGHT,
                              blend_transfer, run_match, run_sun_sweep)
 from ..core.genome import LightingState
@@ -448,7 +448,16 @@ class Controller:
         self._last_analyze_agreement = agreement if agreement < 1.0 else None
         e.semantics = semantics
         self.save_session()
-        return semantics
+        # MEASURE what the model was guessing at. ANALYZE is the least reliable component
+        # in the plugin — four reads of one reference gave sun bearings 130 degrees apart —
+        # and a good deal of what it reports is sitting in the pixels: whether there is any
+        # directional light at all, what colour the illuminant is, how sharply shadows end.
+        # The cached e.semantics stays exactly as the model said it; the measurements ride
+        # on top of the copy the match actually uses, and only where they are confident.
+        try:
+            return refread.fuse(semantics, refread.measure(self.ref_stats(ref_path)))
+        except Exception:  # noqa: BLE001 — a measurement must never sink an analysis
+            return semantics
 
     def _analyze_samples(self, path: str) -> Dict:
         """N-sample self-consistency ANALYZE of ONE image → a consolidated semantics dict
