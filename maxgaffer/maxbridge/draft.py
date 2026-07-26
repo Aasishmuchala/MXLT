@@ -40,9 +40,15 @@ DRAFT_PROPS: Tuple[Tuple[Tuple[str, ...], float], ...] = (
     # samples per pixel budget (default 6) — the single biggest cost knob
     (("imageSampler_shadingRate",), 2.0),
     (("options_progressiveMaxSubdivs", "progressive_maxSubdivs"), 12),
-    (("progressive_max_render_time", "options_progressiveTimeLimit",
-      "progressive_timeLimit"), 1.0),          # minutes per frame cap
 )
+
+#: Per-frame time cap, applied separately because its value comes from config rather than
+#: being fixed. At the old hardcoded 1.0 minutes it never bound on frames taking ~6s, which
+#: is why the draft sampler measured nearly inert. It is the one lever that does not scale
+#: with scene size, so it is what makes a heavy scene affordable at all.
+TIME_CAP_PROPS: Tuple[str, ...] = ("progressive_max_render_time",
+                                   "options_progressiveTimeLimit",
+                                   "progressive_timeLimit")
 
 SNAPSHOT_PATH = os.path.join(os.path.dirname(cfgmod.CONFIG_PATH), "draft_snapshot.json")
 
@@ -84,7 +90,12 @@ def apply_draft() -> List[str]:
     # pass 1 — collect originals, no mutation
     originals: Dict[str, float] = {}
     planned: List[Tuple[str, float]] = []     # (name, coerced draft value)
-    for candidates, draft_value in DRAFT_PROPS:
+    seconds = float(getattr(cfgmod.load(), "probe_max_seconds", 0.0) or 0.0)
+    props = list(DRAFT_PROPS)
+    if seconds > 0:
+        # V-Ray states this one in MINUTES
+        props.append((TIME_CAP_PROPS, round(seconds / 60.0, 5)))
+    for candidates, draft_value in props:
         for name in candidates:
             original = get_prop(r, (name,))
             if original is None:

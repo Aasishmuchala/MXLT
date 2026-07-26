@@ -712,6 +712,34 @@ def test_apply_draft_no_renderer_and_no_known_props(max_rt, monkeypatch, tmp_pat
     assert max_rt.sets(bare) == []
 
 
+def test_the_probe_time_cap_is_applied_only_when_the_artist_asks(max_rt, draft_env,
+                                                                 monkeypatch):
+    """The one cost lever that does not scale with scene size, so it is what makes a heavy
+    scene affordable — and it is off unless configured, because it changes what every probe
+    render IS. V-Ray states it in MINUTES; the config is in seconds, which is the unit an
+    artist thinks in for "how long may one probe take"."""
+    renderer, _snap = draft_env
+    cfg = df.cfgmod.load()
+
+    # the scene already HAS a time limit — leaving it alone is the whole point of the
+    # default, so "no cap imposed" means UNCHANGED, not absent
+    before = renderer.get_raw("options_progressiveTimeLimit")
+    assert before == pytest.approx(2.0)
+    cfg.probe_max_seconds = 0.0
+    monkeypatch.setattr(df.cfgmod, "load", lambda: cfg)
+    df.apply_draft()
+    assert renderer.get_raw("options_progressiveTimeLimit") == pytest.approx(before), (
+        "the scene's own time limit was overwritten without being asked")
+
+    df.restore_draft()
+    cfg.probe_max_seconds = 6.0
+    df.apply_draft()
+    got = [renderer.get_raw(n) for n in df.TIME_CAP_PROPS
+           if renderer.get_raw(n) is not None]
+    assert got, "the configured budget never reached the renderer"
+    assert got[0] == pytest.approx(0.1), "6 seconds must be written as 0.1 MINUTES"
+
+
 def test_apply_draft_snapshot_written_before_any_mutation(max_rt, draft_env,
                                                           monkeypatch):
     renderer, snap = draft_env
@@ -725,7 +753,12 @@ def test_apply_draft_snapshot_written_before_any_mutation(max_rt, draft_env,
 
     monkeypatch.setattr(df, "set_prop", guarded_set)
     lines = df.apply_draft()
-    assert len(seen) == 4                        # all four sampler rows applied
+    # every sampler row this fake renderer actually supports was applied. Counting a magic
+    # number here couples the test to the contents of DRAFT_PROPS, which is tuning data —
+    # it broke the moment the per-frame time cap moved out into its own configurable row.
+    assert seen, "no draft property was applied at all"
+    assert len(seen) == len(set(seen)), "a property was written twice"
+    assert "options_progressiveNoiseThreshold" in seen
     saved = json.loads(snap.read_text(encoding="utf-8"))
     assert saved["options_progressiveNoiseThreshold"] == pytest.approx(0.01)
     assert saved["options_progressiveMaxSubdivs"] == 24

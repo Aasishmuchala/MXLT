@@ -818,3 +818,32 @@ def test_half_res_agrees_on_the_DIRECTION_of_a_polish_nudge():
         assert pw < p.loop_width, "polish must be cheaper than the loop"
         assert pw >= p.loop_width // 3, (
             "quarter resolution drifted 1.33 points — too coarse for a 0.03 gain gate")
+
+
+def test_a_probe_time_budget_exists_and_is_off_by_default():
+    """The only cost lever that does not scale with the scene. Resolution and sample counts
+    all scale WITH it — a ten-times-heavier scene is still ten times slower after halving
+    resolution — so on a big scene a match is priced by V-Ray's per-frame time and nothing
+    else. Measured: plugin overhead is about zero, and 180 probes at 60s a frame is three
+    hours.
+
+    A time budget inverts that: "render for four seconds and give me what you have" costs
+    four seconds whether the scene is a teapot or eighteen million triangles. What changes
+    is noise, and noise is what a probe can afford, because it needs a RANKING not an
+    accurate picture — the same argument that made half-resolution safe, applied to the axis
+    that actually scales with scene size.
+
+    Off by default: it changes what every render IS, and that is the artist's call."""
+    from maxgaffer.maxbridge import draft
+    from maxgaffer.maxbridge.config import Config
+
+    assert Config().probe_max_seconds == 0.0, "a cap must never be imposed unasked"
+    assert draft.TIME_CAP_PROPS, "no property to write the budget to"
+    # the old value was a dead rail: 1.0 MINUTES against frames taking ~6s, so it never
+    # bound and the draft sampler measured nearly inert
+    for _cands, value in draft.DRAFT_PROPS:
+        assert value != 1.0 or _cands[0] != "progressive_max_render_time", (
+            "the hardcoded 1-minute cap is back")
+    src = open("maxgaffer/maxbridge/draft.py", encoding="utf-8").read()
+    assert "seconds / 60.0" in src, "V-Ray states this cap in MINUTES"
+    assert "probe_max_seconds" in src

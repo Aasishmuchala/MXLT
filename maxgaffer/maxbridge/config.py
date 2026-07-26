@@ -80,6 +80,20 @@ class Config:
     # (measured on-box 2026-07-25 at ~10 s/frame with up to 500 polish probes). Turn it on
     # in Settings for heavy scenes; V-Ray GPU was the fastest renderer measured.
     draft_sampler: bool = False
+    #: Seconds a single PROBE render may take. 0 leaves V-Ray's own settings alone.
+    #:
+    #: This is the only knob whose cost does not scale with the scene. Resolution and
+    #: sample counts all scale WITH it — a ten-times-heavier scene is still ten times
+    #: slower after halving resolution — so on a big scene a match is priced by V-Ray's
+    #: per-frame time and nothing else: measured, plugin overhead is about zero, and 180
+    #: probes at 60s a frame is three hours. A time budget inverts that. "Render for four
+    #: seconds and give me what you have" costs four seconds whether the scene is a teapot
+    #: or eighteen million triangles; what changes is how noisy the frame is, and noise is
+    #: what a probe can afford, because it needs a RANKING and not an accurate picture.
+    #:
+    #: Binds only under the PROGRESSIVE image sampler — the bucket sampler has no
+    #: equivalent, and apply_draft says so rather than failing quietly.
+    probe_max_seconds: float = 0.0
     # apply-only mode: MaxGaffer never fires a render. MATCH = analyze → first guess →
     # apply as ONE undoable change → read-back verification → change report. The loop,
     # sun sweep, board probes, plan effect measurement and V-Ray finals are all off.
