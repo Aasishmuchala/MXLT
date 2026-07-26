@@ -760,3 +760,36 @@ def test_show_dock_closes_an_orphan_panel_before_making_another():
     src = inspect.getsource(dockmod.show_dock)
     assert 'findChildren(QtWidgets.QDockWidget, "MaxGafferDock")' in src
     assert "old.close()" in src
+
+
+def test_polish_renders_cheap_but_the_answer_is_verified_full_size():
+    """Polish is ~82% of a match: 120 renders of "nudge one parameter, did that help". That
+    is a comparison, not a verdict, and the cheaper render answers it just as well —
+    measured on-box 2026-07-26 across eight states spanning exposure, dome, azimuth,
+    turbidity and altitude, half-resolution scored within 0.63 of full and ranked all eight
+    IDENTICALLY, at half the render time.
+
+    Quarter also preserved the ranking but drifted up to 1.33 points, which is too coarse:
+    polish accepts a move on a 0.03 gain, so a shift that size would have it chasing
+    measurement error instead of light. Half is the tier the evidence supports.
+
+    The saving must not be paid for in honesty, so the state polish lands on is re-rendered
+    at FULL size before it is scored or shown — one render against 120 saved."""
+    import inspect
+
+    from maxgaffer.core.profiles import resolve_profile
+    from maxgaffer.maxbridge.controller import Controller
+
+    p = resolve_profile("standard", loop_width=400, loop_height=600,
+                        max_iterations=10, sweep_count=8, target_score=95.0)
+    assert p.polish_size == (200, 300)
+    assert p.polish_size[0] < p.loop_width and p.polish_size[1] < p.loop_height
+
+    src = inspect.getsource(Controller.run_match)
+    hook = src[src.index("def render_hook("):src.index("def apply_hook(")]
+    assert 'tag.startswith("polish")' in hook and "profile.polish_size" in hook
+    # ...and the delivered plate is re-rendered full size before anyone sees a number
+    assert "final_full.png" in src
+    verify_at = src.index("final_full.png")
+    score_at = src.index("honest = self.stats_for(")
+    assert verify_at < score_at, "the reported score would come from a cheap frame"

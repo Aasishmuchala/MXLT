@@ -1058,8 +1058,18 @@ class Controller:
                 # size because its tags start with "sunsolve" rather than "sweep", which
                 # turned a two-minute stage into most of a fifty-minute match.
                 is_sweep = tag.startswith(("sweep", "sunsolve"))
-                width = profile.sweep_width if is_sweep else profile.loop_width
-                height = profile.sweep_height if is_sweep else profile.loop_height
+                if is_sweep:
+                    width, height = profile.sweep_width, profile.sweep_height
+                elif tag.startswith("polish"):
+                    # POLISH renders half-size. It is 82% of a match and asks only "did that
+                    # nudge help" — a comparison, not a verdict. Measured on-box 2026-07-26:
+                    # half-resolution ranked eight varied states identically to full and
+                    # scored within 0.63 of it, at half the render time. The state it lands
+                    # on is re-rendered and re-scored at FULL size afterwards, so nothing
+                    # the artist is shown or told comes from a cheap frame.
+                    width, height = profile.polish_size
+                else:
+                    width, height = profile.loop_width, profile.loop_height
                 path = self._render_exposed(
                     cam, os.path.join(run_dir, f"{tag}.png"),
                     width, height,
@@ -1333,6 +1343,20 @@ class Controller:
             # 171 degrees from the reference reported 86.27 while its best plate scored
             # 77.21 against that reference. The artist is owed the 77.
             try:
+                # Polish probes render half-size, so its winning plate is a CHEAP frame.
+                # Re-render the state it landed on at full loop size before scoring or
+                # showing anything: the reported number and the plate the artist sees must
+                # both come from a full render, or the speed-up would be paid for in
+                # honesty. One render, at the end, against 120 saved during polish.
+                if result.best_state is not None and result.best_render:
+                    full = os.path.join(run_dir, "final_full.png")
+                    ap.apply_state(rig, self._baselines, result.best_state, cam,
+                                   undo=False)
+                    shot = self._render_exposed(cam, full, profile.loop_width,
+                                                profile.loop_height,
+                                                state=result.best_state, entry=e, log=log)
+                    if shot:
+                        result.best_render = shot
                 honest = self.stats_for(result.best_render) if result.best_render else None
                 if honest is not None and ref_stats is not None:
                     verdict = critic.score(ref_stats, honest, self._critic_weights())
