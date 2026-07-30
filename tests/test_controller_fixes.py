@@ -137,7 +137,7 @@ def test_draft_restored_when_exposure_check_raises(ctrl, monkeypatch):
     ctrl.cfg.draft_sampler = True
     bound(ctrl)
     restored = []
-    monkeypatch.setattr(ctl.df, "apply_draft", lambda: ["draft: on"])
+    monkeypatch.setattr(ctl.df, "apply_draft", lambda seconds=0.0: ["draft: on"])
     monkeypatch.setattr(ctl.df, "pending_snapshot", lambda: True)
     monkeypatch.setattr(ctl.df, "restore_draft",
                         lambda: restored.append(True) or ["draft: off"])
@@ -156,7 +156,7 @@ def test_draft_restored_when_sweep_raises(ctrl, monkeypatch):
     ctrl.cfg.draft_sampler = True
     bound(ctrl)
     restored = []
-    monkeypatch.setattr(ctl.df, "apply_draft", lambda: ["draft: on"])
+    monkeypatch.setattr(ctl.df, "apply_draft", lambda seconds=0.0: ["draft: on"])
     monkeypatch.setattr(ctl.df, "pending_snapshot", lambda: True)
     monkeypatch.setattr(ctl.df, "restore_draft",
                         lambda: restored.append(True) or ["draft: off"])
@@ -445,3 +445,311 @@ def test_refs_pruning_disabled_at_zero(ctrl):
             f.write(b"x")
     ctrl._ensure_run_dir("refs")
     assert len(os.listdir(refs)) == 4
+
+
+# ------------------------------------------- (l) the draft gate says which way it is set
+def test_draft_off_is_stated_in_the_transcript(ctrl, monkeypatch):
+    """The 2026-07-30 bug was UNFALSIFIABLE from the log: draft_sampler:true and a 20 s
+    probe cap sat in config.json from 15:27, the Options menu wrote false over them at
+    match time, and not one line said the branch was False. apply_draft always emits at
+    least one line on every path, so silence was the one state nobody could read."""
+    ctrl.cfg.no_renders = False
+    ctrl.cfg.draft_sampler = False
+    ctrl.cfg.probe_max_seconds = 20.0
+    bound(ctrl)
+    monkeypatch.setattr(ctl, "run_match", lambda *a, **k: MatchResult(
+        best_state=make_state(), best_score=90.0, best_render=None,
+        stop_reason="target_reached"))
+    logs = []
+    ctrl.run_match("CamA", logs.append)
+    off = [ln for ln in logs if ln.startswith("draft: OFF")]
+    assert off, "a closed gate must say so"
+    assert "20" in off[0] and "NOT in effect" in off[0]
+
+
+def test_draft_on_hands_apply_draft_the_configured_cap(ctrl, monkeypatch):
+    """One source of truth: the CAP travels with the gate, from the same cfg object."""
+    ctrl.cfg.no_renders = False
+    ctrl.cfg.draft_sampler = True
+    ctrl.cfg.probe_max_seconds = 20.0
+    bound(ctrl)
+    seen = []
+    monkeypatch.setattr(ctl.df, "apply_draft",
+                        lambda seconds=None: seen.append(seconds) or ["draft: on"])
+    monkeypatch.setattr(ctl.df, "pending_snapshot", lambda: False)
+    monkeypatch.setattr(ctl, "run_match", lambda *a, **k: MatchResult(
+        best_state=make_state(), best_score=90.0, best_render=None,
+        stop_reason="target_reached"))
+    ctrl.run_match("CamA", lambda ln: None)
+    assert seen == [20.0]
+
+
+# ------------------------------------------- (m) the Vantage probe backend
+def test_vantage_plate_is_never_software_exposed(ctrl, monkeypatch):
+    """A Vantage plate ALREADY carries its exposure and its own tonemap. Software
+    exposure assumes a PRE-exposure buffer, so applying it here would multiply the same
+    EV delta in twice, the solver would measure the residual and ask for another step,
+    and the loop would overshoot ~2x -- the failure _plate_linear documents."""
+    ctrl.cfg.software_exposure = True
+    ctrl._plate_linear = True
+    ctrl._probe_backend = "vantage"
+    touched = []
+    monkeypatch.setattr(ctl.expose, "display_encode_png",
+                        lambda *a, **k: touched.append("encode") or "p")
+    monkeypatch.setattr(ctl.expose, "expose_image_file",
+                        lambda *a, **k: touched.append("expose") or "p")
+    monkeypatch.setattr(ctl.rd, "render_probe", lambda *a, **k: ("p", "vantage"))
+    st = make_state()
+
+    assert ctrl._render_exposed(object(), "p.png", 8, 8, state=st, probe=True) == "p"
+    assert touched == []
+
+    # ...and the same call on a V-Ray plate is exposed exactly as before
+    ctrl._probe_backend = "vray"
+    monkeypatch.setattr(ctl.rd, "render_frame", lambda cam, out, w, h: "p")
+    ctrl._render_exposed(object(), "p.png", 8, 8, state=st, probe=True)
+    assert touched == ["encode", "expose"]
+
+
+def test_one_refused_grab_disarms_the_run(ctrl, monkeypatch):
+    """An armed-but-broken backend costs a log line per probe; disarm it once, loudly."""
+    ctrl._probe_backend = "vantage"
+    monkeypatch.setattr(ctl.rd, "render_probe", lambda *a, **k: ("p", "vray"))
+    assert ctrl._render_exposed(object(), "p.png", 8, 8, probe=True) == "p"
+    assert ctrl._probe_backend == "vray"
+
+
+def test_only_the_sun_solve_uses_the_probe_backend(ctrl, monkeypatch):
+    """Named by PREFIX, not by exception. The global sun solve is the one stage whose
+    probes exist purely to be RANKED against each other and whose output is an angle, and
+    it is 44 of the 133 probes in a standard profile. Its neighbours are excluded because
+    each of them compares ACROSS sources: sunsolve_tonealign sets the artist's EXPOSURE
+    via solve_ev; sweep_basin_* scores on the FULL weighted critic (min over every
+    measured component) and caps the whole run; and sweep### is cosined against the
+    reference PHOTO's 3x3 grid and uploaded to the model by llm_pick."""
+    ctrl.cfg.no_renders = False
+    bound(ctrl)
+    monkeypatch.setattr(ctrl, "ref_stats", lambda p: None)   # no tone-align / sun solve
+    seen = []
+    monkeypatch.setattr(ctrl, "_render_exposed",
+                        lambda cam, out, w, h, **kw: seen.append(
+                            (os.path.basename(out)[:-4], bool(kw.get("probe")))) or out)
+
+    def fake(start, ref, sem, hooks, cfg, locks, **kw):
+        for tag in ("sunsolve_a007", "sunsolve_fine_a012", "sunsolve_tonealign",
+                    "sweep090", "sweep_basin_dusk", "iter00", "polish_a"):
+            hooks.render(tag)
+        return MatchResult(best_state=make_state(), best_score=90.0,
+                           best_render=None, stop_reason="target_reached")
+
+    monkeypatch.setattr(ctl, "run_match", fake)
+    ctrl.run_match("CamA", lambda ln: None, multi_start=False)
+    assert dict(seen) == {"sunsolve_a007": True, "sunsolve_fine_a012": True,
+                          "sunsolve_tonealign": False, "sweep090": False,
+                          "sweep_basin_dusk": False,
+                          "iter00": False, "polish_a": False}
+
+
+def test_arming_needs_a_live_link_and_a_window_and_clears_the_settle_baseline(
+        ctrl, monkeypatch):
+    """An unarmed backend costs nothing; an armed-but-broken one costs a log line per
+    probe. And the freshness chain is inductive, so a new run must not inherit the last
+    run's final frame as the thing its first probe has to differ from."""
+    from maxgaffer.maxbridge import vgrab
+
+    ctrl.cfg.probe_backend = "vantage"
+    vgrab._LAST_SIGNATURE = [1.0] * 48
+    monkeypatch.setattr(ctl.vt, "link_running", lambda *a, **k: 20701)
+    monkeypatch.setattr(vgrab, "find_window", lambda *a, **k: 4242)
+    logs = []
+    ctrl._arm_probe_backend(logs.append)
+    assert ctrl._probe_backend == "vantage"
+    assert vgrab._LAST_SIGNATURE is None
+    assert any("VANTAGE" in ln for ln in logs)
+
+    # ...and every way of not being ready degrades to V-Ray, out loud
+    for port, hwnd in ((None, 4242), (20701, None)):
+        monkeypatch.setattr(ctl.vt, "link_running", lambda *a, **k: port)
+        monkeypatch.setattr(vgrab, "find_window", lambda *a, **k: hwnd)
+        logs = []
+        ctrl._arm_probe_backend(logs.append)
+        assert ctrl._probe_backend == "vray"
+        assert any("rendering every probe in V-Ray" in ln for ln in logs)
+
+    ctrl.cfg.probe_backend = "vray"
+    monkeypatch.setattr(vgrab, "find_window",
+                        lambda *a, **k: pytest.fail("nothing may be probed for"))
+    ctrl._arm_probe_backend(lambda ln: pytest.fail("and nothing may be said"))
+    assert ctrl._probe_backend == "vray"
+
+
+def test_plan_probe_and_final_stay_on_vray(ctrl, monkeypatch, tmp_path):
+    """The hard requirement: the plan-effect measurement and the DELIVERED render never
+    move off V-Ray, whatever the probe backend is armed to."""
+    ctrl.cfg.no_renders = False
+    ctrl._probe_backend = "vantage"
+    bound(ctrl)
+    used = []
+    monkeypatch.setattr(ctl.rd, "render_frame",
+                        lambda cam, out, w, h: used.append(out) or out)
+    monkeypatch.setattr(ctl.rd, "render_probe",
+                        lambda *a, **k: pytest.fail("this render must never reach Vantage"))
+    monkeypatch.setattr(ctrl, "stats_for", lambda p: {"log_key": 0.2})
+    monkeypatch.setattr(ctl.critic, "score",
+                        lambda ref, cur, w: types.SimpleNamespace(score=77.0))
+    assert ctrl.probe_score("CamA", "preplan") == 77.0
+
+    ctrl.session.record_match("CamA", make_state(), 90.0)
+    assert ctrl.render_finals_vray(["CamA"], str(tmp_path / "out"),
+                                   lambda n, s: None) == {"CamA": "ok"}
+    assert len(used) == 2
+
+
+# ------------------------------------------- (n) the black-frame guard
+_BLACK = {"mean_rgb": [0.0, 0.0, 0.0], "p": {"95": 0.0}, "log_key": 1e-6}
+
+
+def _black_probe_harness(ctrl, monkeypatch, stats):
+    ctrl.cfg.no_renders = False
+    ctrl.cfg.draft_sampler = True
+    bound(ctrl)
+    monkeypatch.setattr(ctrl, "ref_stats", lambda p: None)
+    rendered = []
+    monkeypatch.setattr(ctrl, "_render_exposed",
+                        lambda cam, out, w, h, **kw: rendered.append(out) or out)
+    monkeypatch.setattr(ctrl, "stats_for", lambda p: dict(stats))
+    restored = []
+    monkeypatch.setattr(ctl.df, "apply_draft", lambda seconds=0.0: ["draft: on"])
+    monkeypatch.setattr(ctl.df, "pending_snapshot", lambda: True)
+    monkeypatch.setattr(ctl.df, "restore_draft",
+                        lambda: restored.append(True) or ["draft: off"])
+    return rendered, restored
+
+
+def test_black_first_probe_aborts_the_match(ctrl, monkeypatch):
+    """The abort must be STICKY, not merely an exception: sunsolve.probe swallows every
+    exception per probe by design, so a bare raise would be caught 44 times and each
+    catch would fire another 60-second render. The second hooks.render below mirrors that
+    swallow -- and must cost nothing."""
+    rendered, restored = _black_probe_harness(ctrl, monkeypatch, _BLACK)
+    caught = []
+
+    def fake(start, ref, sem, hooks, cfg, locks, **kw):
+        for tag in ("iter00", "iter01"):
+            try:
+                hooks.render(tag)
+            except RuntimeError as err:          # exactly what sunsolve.probe does
+                caught.append(err)
+        raise caught[-1]
+
+    monkeypatch.setattr(ctl, "run_match", fake)
+    logs = []
+    with pytest.raises(RuntimeError, match="BLACK"):
+        ctrl.run_match("CamA", logs.append)
+    assert len(rendered) == 1, "the sticky flag must short-circuit before rendering"
+    assert len(caught) == 2                      # both probes refused, one render fired
+    assert any("distributed rendering" in ln for ln in logs)
+    assert restored == [True]                    # the artist's sampler still came back
+
+
+def test_a_vantage_grab_does_not_spend_the_black_guard(ctrl, monkeypatch):
+    """vgrab REFUSES a black grab, so a Vantage plate can never fail this check -- and
+    letting it consume the one-shot guard leaves every V-Ray plate after it (the tone
+    stages, the basin, the loop, polish, the finals) unchecked. That is the 2026-07-30
+    failure with the guard installed and inert."""
+    rendered, _restored = _black_probe_harness(ctrl, monkeypatch, _BLACK)
+    backends = iter(("vantage", "vray"))
+    monkeypatch.setattr(
+        ctrl, "_render_exposed",
+        lambda cam, out, w, h, **kw: rendered.append(out)
+        or setattr(ctrl, "_last_render_backend", next(backends)) or out)
+    caught = []
+
+    def fake(start, ref, sem, hooks, cfg, locks, **kw):
+        for tag in ("sunsolve_a000", "iter00"):
+            try:
+                hooks.render(tag)
+            except RuntimeError as err:
+                caught.append(err)
+        if caught:
+            raise caught[-1]
+        return MatchResult(best_state=make_state(), best_score=90.0,
+                           best_render=None, stop_reason="target_reached")
+
+    monkeypatch.setattr(ctl, "run_match", fake)
+    with pytest.raises(RuntimeError, match="BLACK"):
+        ctrl.run_match("CamA", lambda ln: None)
+    assert len(rendered) == 2         # the grab was let through, the V-Ray plate was not
+
+
+def test_an_unmeasurable_first_plate_does_not_spend_the_black_guard(ctrl, monkeypatch):
+    """Absence of evidence is not evidence: a frame whose stats would not compute has not
+    been checked, so the next one still has to be."""
+    rendered, _restored = _black_probe_harness(ctrl, monkeypatch, _BLACK)
+    stats = iter((None, dict(_BLACK)))
+    monkeypatch.setattr(ctrl, "stats_for", lambda p: next(stats))
+    caught = []
+
+    def fake(start, ref, sem, hooks, cfg, locks, **kw):
+        for tag in ("iter00", "iter01"):
+            try:
+                hooks.render(tag)
+            except RuntimeError as err:
+                caught.append(err)
+        raise caught[-1]
+
+    monkeypatch.setattr(ctl, "run_match", fake)
+    with pytest.raises(RuntimeError, match="BLACK"):
+        ctrl.run_match("CamA", lambda ln: None)
+    assert len(rendered) == 2
+
+
+def test_black_guard_ignores_a_dark_but_lit_frame(ctrl, monkeypatch):
+    """A moonlit interior is not a dead render -- one lit pixel in 576 lifts the mean."""
+    dark = {"mean_rgb": [0.002, 0.002, 0.002], "p": {"95": 0.01}, "log_key": 0.001}
+    rendered, _restored = _black_probe_harness(ctrl, monkeypatch, dark)
+
+    def fake(start, ref, sem, hooks, cfg, locks, **kw):
+        hooks.render("iter00")
+        hooks.render("iter01")
+        return MatchResult(best_state=make_state(), best_score=90.0,
+                           best_render=None, stop_reason="target_reached")
+
+    monkeypatch.setattr(ctl, "run_match", fake)
+    result = ctrl.run_match("CamA", lambda ln: None)
+    assert result.stop_reason == "target_reached"
+    assert len(rendered) == 2
+
+
+def test_exposure_host_check_ignores_black_probes_and_says_so(ctrl, monkeypatch,
+                                                              tmp_path):
+    """Two black plates give moved == 0.0, i.e. "this host is display-stage only", which
+    switches software_exposure ON for the session off a dead render. And these are the
+    EARLIEST two V-Ray plates of the run, so a gate that closes in silence here is the
+    same unfalsifiable-transcript failure the draft-OFF line was added to fix. It reports
+    rather than aborts: nothing has been applied yet, so a scene the artist left unlit is
+    legitimately black at this point and the post-apply probe guard is the one that can
+    tell those apart."""
+    ctrl.cfg.no_renders = False
+    ctrl.cfg.software_exposure = False
+    monkeypatch.setattr(ctl.rd, "render_frame", lambda cam, out, w, h: out)
+    monkeypatch.setattr(ctl.metrics, "compute_stats", lambda p, **kw: dict(_BLACK))
+
+    class _Host:
+        def __init__(self, cam):
+            pass
+
+        def read_ev(self):
+            return 10.0
+
+        def write_ev(self, value):
+            pass
+
+    from maxgaffer.maxbridge import exposure as exmod
+
+    monkeypatch.setattr(exmod, "ExposureHost", _Host)
+    logs = []
+    ctrl._verify_exposure_host(object(), str(tmp_path), logs.append)
+    assert ctrl.cfg.software_exposure is False
+    assert any("BLACK" in ln and "distributed rendering" in ln for ln in logs)
+    assert not getattr(ctrl, "_probe_abort", "")     # reports, never aborts, from here

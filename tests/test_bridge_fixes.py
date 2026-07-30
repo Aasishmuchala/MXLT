@@ -217,6 +217,36 @@ def test_restore_removes_unreadable_snapshot(draft_env):
     assert not os.path.exists(df.SNAPSHOT_PATH)
 
 
+def test_probe_cap_comes_from_the_caller_not_the_disk(draft_env, monkeypatch):
+    """The GATE (draft_sampler) lives in the controller's in-memory cfg and the CAP was
+    re-read from config.json — two sources of truth for one setting. An injected config
+    (api.get_controller({"probe_max_seconds": …})) was silently ignored, and a Settings
+    edit that failed to persist silently reverted the cap while the log said draft was on.
+    """
+    df, renderer = draft_env
+    renderer.progressive_max_render_time = 0.0    # a FLOAT on the TULA build (2026-07-30)
+
+    def boom():
+        raise AssertionError("apply_draft must not re-read config.json")
+
+    monkeypatch.setattr(df.cfgmod, "load", boom)
+    lines = df.apply_draft(20.0)
+    assert renderer.progressive_max_render_time == pytest.approx(0.33333)  # 20s in MINUTES
+    assert any("progressive_max_render_time" in ln for ln in lines)
+    df.restore_draft()
+
+
+def test_integer_minute_cap_is_refused_not_zeroed(draft_env):
+    """int(20/60) == 0, and V-Ray reads 0 as NO limit — the exact opposite of a 20 s cap,
+    reported as a cheerful "0 → 0". Refuse loudly instead of uncapping the probe."""
+    df, renderer = draft_env
+    renderer.options_progressiveTimeLimit = 5     # whole MINUTES on this build
+    lines = df.apply_draft(20.0)
+    assert renderer.options_progressiveTimeLimit == 5          # untouched, not zeroed
+    assert any("no limit" in ln for ln in lines)
+    df.restore_draft()
+
+
 # --------------------------------------------------------------------- apply.py
 def test_authored_off_baseline_reads_and_writes_zero(rt):
     """Baseline-0 asymmetry: write pins 0 × factor = 0; read used a phantom 1.0."""

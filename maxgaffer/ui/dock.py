@@ -15,7 +15,7 @@ from __future__ import annotations
 import html as _html
 import os
 import traceback
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets  # type: ignore
 
@@ -95,7 +95,15 @@ STYLE = (
     f"font-family:{MONO};selection-background-color:{SIGNAL_SEL};selection-color:{TEXT};}}"
     f"QMenu{{background:{PANEL};border:{HAIR};border-radius:{RAD};padding:5px;"
     f"font-family:{MONO};}}"
-    f"QMenu::item{{padding:6px 24px;border-radius:{RAD};}}"
+    f"QMenu::item{{padding:6px 24px 6px 26px;border-radius:{RAD};}}"
+    # A checkable item that draws no check mark is a switch with no position. Styling
+    # QMenu::item without an indicator rule silences Qt's own check mark — measured
+    # 2026-07-30: "Draft sampler" looked identical on and off, so turning it "on"
+    # turned it off, and the config file's true was overwritten with false. (Also fixes
+    # the Locks ▾ menu, whose checkables were invisible the same way.)
+    f"QMenu::indicator{{width:11px;height:11px;left:7px;border:1px solid {LINE2};"
+    f"border-radius:{RAD};background:{INSET};}}"
+    f"QMenu::indicator:checked{{background:{SIGNAL};border-color:{SIGNAL};}}"
     f"QMenu::item:selected{{background:{SIGNAL_SEL};color:{TEXT};}}"
     f"QTreeWidget,QListWidget{{background:{INSET};border:{WELLINE};border-radius:{RAD};"
     f"padding:3px;font-family:{MONO};selection-background-color:{SIGNAL_SEL};"
@@ -337,6 +345,9 @@ class MaxGafferDock(QtWidgets.QWidget):
         self._active_camera_id = ""
         self._camera_fingerprint = ()
         self._sliders: Dict[str, QtWidgets.QDoubleSpinBox] = {}
+        # (action, cfg field name) for every Options ▾ item that MIRRORS a config value —
+        # see _act/_sync_option_actions. Must exist before _build() fills it.
+        self._cfg_actions: List[Tuple[QtGui.QAction, str]] = []
         _reset_log_mirror()   # crash forensics: last_session.log starts fresh per dock
         self._build()
         self.refresh_cameras()
@@ -521,21 +532,33 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.opts_menu = QtWidgets.QMenu(self)
         m = self.opts_menu
 
-        def _act(label, checked, tip):
+        def _act(label, checked, tip, field=""):
             a = m.addAction(label)
             a.setCheckable(True)
             a.setChecked(checked)
             a.setToolTip(tip)
+            if field:
+                # THE MENU IS A MIRROR OF THE CONFIG, NOT A SECOND COPY OF IT. It used to
+                # be written back over cfg at the top of every match (below), so config.json
+                # never got a vote: on 2026-07-30 a hand-set draft_sampler:true + a 20 s
+                # probe cap were both thrown away by an item nobody could see the state of,
+                # and TULA ran 133 probes at ~60 s. The value moves only when the artist
+                # actually toggles it.
+                self._cfg_actions.append((a, field))
+                a.toggled.connect(lambda on, f=field: setattr(self.cfg, f, bool(on)))
             return a
 
         self.act_sweep = _act("Sun sweep first", True,
                               "Grid-solve the sun direction before iterating.")
         self.act_autoexec = _act("Auto-execute plan", bool(self.cfg.auto_execute_plan),
-                                 "Skip the plan preview dialog.")
+                                 "Skip the plan preview dialog.",
+                                 field="auto_execute_plan")
         self.act_draft = _act("Draft sampler", bool(self.cfg.draft_sampler),
-                              "Draft render settings during matches (crash-safe restore).")
+                              "Draft render settings during matches (crash-safe restore).",
+                              field="draft_sampler")
         self.act_popup = _act("Report popup", bool(self.cfg.show_report_popup),
-                              "Show the scene-changed popup after runs.")
+                              "Show the scene-changed popup after runs.",
+                              field="show_report_popup")
         self.act_live = _act("Live-apply sliders", True,
                              "Rig sliders write to the scene as you drag (Vantage mirrors).")
         self.act_apply_select = _act("Apply saved light on camera switch", True, "")
@@ -919,6 +942,17 @@ class MaxGafferDock(QtWidgets.QWidget):
             return bool(action.isChecked())
         except (RuntimeError, AttributeError):
             return bool(default)
+
+    def _sync_option_actions(self):
+        """Push cfg back onto the Options ▾ mirror after a Settings save. Two controls
+        for one value is only safe while they agree; disagreeing silently is the bug
+        that cost 2026-07-30. No blockSignals: the toggled slot would write back the
+        identical value."""
+        for action, field in getattr(self, "_cfg_actions", ()):
+            try:
+                action.setChecked(bool(getattr(self.cfg, field)))
+            except (RuntimeError, AttributeError):   # the C++ side is gone — see _opt
+                pass
 
     def _show_log(self):
         self.log.setVisible(True)
@@ -1641,10 +1675,6 @@ class MaxGafferDock(QtWidgets.QWidget):
                 b.setEnabled(False)
             self.btn_cancel.setEnabled(True)
             mode = self.cmb_mode.currentIndex()   # 0 standard 1 hero 2 loop-only 3 fast
-            self.cfg.auto_execute_plan = self._opt(
-                self.act_autoexec, bool(self.cfg.auto_execute_plan))
-            self.cfg.draft_sampler = self._opt(
-                self.act_draft, bool(self.cfg.draft_sampler))
             self.log.clear()
             self._progress_begin("reading the reference")
             self._log(f"— match: {cam} —")
@@ -1749,8 +1779,6 @@ class MaxGafferDock(QtWidgets.QWidget):
                       self.btn_board):
                 b.setEnabled(False)
             self.btn_cancel.setEnabled(True)
-            self.cfg.draft_sampler = self._opt(
-                self.act_draft, bool(self.cfg.draft_sampler))
             self.log.clear()
             self._progress_begin("matching every camera")
             self._log(f"— batch match: {len(queue)} cameras —")
@@ -2024,6 +2052,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         dlg = SettingsDialog(self.cfg, self)
         if dlg.exec():
             self.ctrl.cfg = self.cfg
+            self._sync_option_actions()   # Options ▾ mirrors the config, both directions
             try:
                 self.cfg.save()
                 self._log("settings saved")
@@ -2249,6 +2278,37 @@ class SettingsDialog(QtWidgets.QDialog):
             "apply EV/WB to frames in software (auto-detected; needed on V-Ray GPU)")
         self.cb_swexpose.setChecked(bool(getattr(cfg, "software_exposure", False)))
         form.addRow("software exposure", self.cb_swexpose)
+        probe = QtWidgets.QHBoxLayout()
+        self.cb_draft = QtWidgets.QCheckBox("draft sampler (crash-safe restore)")
+        self.cb_draft.setChecked(bool(getattr(cfg, "draft_sampler", False)))
+        self.cb_draft.setToolTip(
+            "Draft render settings during matches. A match's cost IS its render cost; "
+            "this and the budget beside it are the only knobs that do not scale with "
+            "the scene. Originals are snapshotted to disk before anything is touched.")
+        self.sp_probe_secs = QtWidgets.QDoubleSpinBox()
+        self.sp_probe_secs.setRange(0.0, 600.0)
+        self.sp_probe_secs.setDecimals(1)
+        self.sp_probe_secs.setSpecialValueText("off")     # 0 = leave V-Ray's own settings
+        self.sp_probe_secs.setValue(float(getattr(cfg, "probe_max_seconds", 0.0)))
+        self.sp_probe_secs.setToolTip(
+            "Seconds ONE probe render may take. Needs the draft sampler ON, and binds "
+            "only under the progressive image sampler. Under 60 s is ignored on builds "
+            "whose time limit is whole minutes (the match log says so).")
+        probe.addWidget(self.cb_draft, 1)
+        probe.addWidget(QtWidgets.QLabel("seconds/probe"))
+        probe.addWidget(self.sp_probe_secs)
+        form.addRow("probe budget", probe)
+        self.cmb_probe_backend = QtWidgets.QComboBox()
+        self.cmb_probe_backend.addItems(["vray", "vantage"])
+        self.cmb_probe_backend.setCurrentText(
+            getattr(cfg, "probe_backend", "vray") or "vray")
+        self.cmb_probe_backend.setToolTip(
+            "Where the SUN SOLVE's probes come from — 44 of the ~133 in a standard "
+            "match. 'vantage' grabs the live-link window instead of rendering; it falls "
+            "back to V-Ray, loudly, whenever the window is missing, covered, black or "
+            "has not caught up with the last change. The sweep, everything tonal, the "
+            "final render and the plan-effect measurement stay on V-Ray.")
+        form.addRow("probe backend", self.cmb_probe_backend)
         self.cmb_backend = QtWidgets.QComboBox()
         self.cmb_backend.addItems(["vray", "vantage_cli"])
         self.cmb_backend.setCurrentText(
@@ -2319,6 +2379,9 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cfg.target_score = float(self.sp_target.value())
         self.cfg.no_renders = bool(self.cb_norender.isChecked())
         self.cfg.software_exposure = bool(self.cb_swexpose.isChecked())
+        self.cfg.draft_sampler = bool(self.cb_draft.isChecked())
+        self.cfg.probe_max_seconds = float(self.sp_probe_secs.value())
+        self.cfg.probe_backend = self.cmb_probe_backend.currentText() or "vray"
         self.cfg.final_render_backend = self.cmb_backend.currentText() or "vray"
         self.cfg.artist_preference = self.cmb_preference.currentText() or "balanced"
         self.cfg.vantage_exe = self.ed_vantage_exe.text().strip()

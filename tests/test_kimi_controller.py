@@ -349,7 +349,7 @@ def _match_harness(monkeypatch, tmp_path, **cfg_over):
     c.ref_stats = lambda p: None
     c._image_block = lambda p: {"b": 1}
     restored = []
-    monkeypatch.setattr(cm.df, "apply_draft", lambda: ["draft on"])
+    monkeypatch.setattr(cm.df, "apply_draft", lambda seconds=0.0: ["draft on"])
     monkeypatch.setattr(cm.df, "pending_snapshot", lambda: True)
     monkeypatch.setattr(cm.df, "restore_draft", lambda: restored.append(1) or ["off"])
     return c, cm, restored

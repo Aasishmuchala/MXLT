@@ -321,6 +321,24 @@ def compute_stats(path: str, max_dim: int = 256) -> Optional[Dict]:
     }
 
 
+def is_black(stats: Optional[Dict]) -> bool:
+    """Is this frame 100% black — every pixel exactly 0? Measured, not inferred: a fully
+    black plate has mean_rgb [0,0,0] and p95 0.0, and a single lit pixel in 576 already
+    lifts the mean off zero, so this cannot fire on a legitimately dark render. Cheap:
+    it reads two keys the critic paid for anyway.
+
+    Why it exists: on 2026-07-30 a whole TULA run came back black — a dead Chaos Vantage
+    live link had left V-Ray's distributed_rendering ON, pointed at a dead port with the
+    local machine excluded — and the match spent its budget ranking black frames."""
+    if not stats:
+        return False
+    try:
+        return (max(stats.get("mean_rgb") or [1.0]) <= 0.0
+                and float((stats.get("p") or {}).get("95", 1.0)) <= 0.0)
+    except (TypeError, ValueError):   # a hand-made/partial stats dict is not evidence
+        return False
+
+
 #: A sun patch is bright RELATIVE TO ITS SURROUNDINGS — that is what makes it a patch and
 #: not just a bright room. An absolute threshold alone is satisfied by any globally
 #: brightened frame, which is precisely the metamer this codebase keeps meeting: measured

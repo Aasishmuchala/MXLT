@@ -478,3 +478,47 @@ def test_stock_vantage_queue_manifest_is_ordered_and_honest(tmp_path):
     assert [j["camera"] for j in data["jobs"]] == ["CamB", "CamA"]
     assert data["resolution"] == {"width": 1920, "height": 1080}
     assert (tmp_path / "vantage" / "VANTAGE_BATCH_INSTRUCTIONS.txt").exists()
+
+
+# ----------------------------------------------------------------- probe dispatcher
+# render_probe is a PEER of render_frame, not a wrapper around its callers: render_frame
+# is the single choke point for every render in the plugin (probes, the exposure-host
+# calibration, the loop, the delivered finals), so a config switch inside it would move
+# the deliverables onto Vantage too. These four tests are the whole contract.
+def test_render_probe_defaults_to_vray(monkeypatch):
+    calls = []
+    monkeypatch.setattr(rd, "render_frame",
+                        lambda cam, out, w, h: calls.append(out) or "p")
+    monkeypatch.setattr(rd.vgrab, "capture_window_png",
+                        lambda *a: pytest.fail("the default must never reach Vantage"))
+    assert rd.render_probe(None, "o.png", 8, 8) == ("p", "vray")
+    assert calls == ["o.png"]
+
+
+def test_render_probe_unknown_backend_is_vray(monkeypatch):
+    """A typo in config.json degrades to today's behaviour, not to a new failure mode."""
+    monkeypatch.setattr(rd, "render_frame", lambda cam, out, w, h: "p")
+    monkeypatch.setattr(rd.vgrab, "capture_window_png",
+                        lambda *a: pytest.fail("an unknown backend must not dispatch"))
+    assert rd.render_probe(None, "o.png", 8, 8, backend="vantge") == ("p", "vray")
+    assert rd.render_probe(None, "o.png", 8, 8, backend="") == ("p", "vray")
+
+
+def test_render_probe_falls_back_and_says_why(monkeypatch):
+    """Fails safe in ONE direction only — and never silently: the artist has to be able
+    to tell a Vantage run from a V-Ray run that is quietly costing 60 s a probe."""
+    monkeypatch.setattr(rd.vgrab, "capture_window_png", lambda *a: None)
+    monkeypatch.setattr(rd.vgrab, "last_error", lambda: "no live link is streaming")
+    monkeypatch.setattr(rd, "render_frame", lambda cam, out, w, h: "p")
+    logs = []
+    assert rd.render_probe(None, "o.png", 8, 8, backend="vantage",
+                           log=logs.append) == ("p", "vray")
+    assert any("no live link is streaming" in ln for ln in logs)
+
+
+def test_render_probe_vantage_success_skips_vray(monkeypatch):
+    monkeypatch.setattr(rd.vgrab, "capture_window_png", lambda *a: "grab.png")
+    monkeypatch.setattr(rd, "render_frame",
+                        lambda *a: pytest.fail("a successful grab must not also render"))
+    assert rd.render_probe(None, "grab.png", 8, 8,
+                           backend="vantage") == ("grab.png", "vantage")

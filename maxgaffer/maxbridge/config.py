@@ -94,6 +94,17 @@ class Config:
     #: Binds only under the PROGRESSIVE image sampler — the bucket sampler has no
     #: equivalent, and apply_draft says so rather than failing quietly.
     probe_max_seconds: float = 0.0
+    #: Where the SUN SOLVE's probes come from: "vray" (render) | "vantage" (grab the
+    #: live-link window). Vantage answers in ~50 ms what V-Ray answers in ~60 s (measured
+    #: on TULA 2026-07-30: 18M triangles, 460 lights, ~60 s a probe and 133 probes in a
+    #: standard profile), but it is a TONEMAPPED, non-deterministic picture, so only the
+    #: sun solve's own grid may use it — 44 of those 133 probes, ranked against each other
+    #: on the hot-patch map and answering with an ANGLE, the one thing that transfers
+    #: between renderers. The sweep, the basin picker, every tone stage, the plan probes
+    #: and the final all stay on V-Ray, and any failure falls back to it. Unknown values
+    #: read as "vray", so a typo degrades to today's behaviour rather than to a new
+    #: failure surface.
+    probe_backend: str = "vray"
     # apply-only mode: MaxGaffer never fires a render. MATCH = analyze → first guess →
     # apply as ONE undoable change → read-back verification → change report. The loop,
     # sun sweep, board probes, plan effect measurement and V-Ray finals are all off.
@@ -164,8 +175,17 @@ def load() -> Config:
                         _warn(f"'{k}' is {type(v).__name__}, expected "
                               f"{type(getattr(defaults, k)).__name__} — keeping default "
                               f"{getattr(defaults, k)!r}")
-    except (OSError, ValueError, RecursionError):
-        pass
+    except (OSError, ValueError, RecursionError) as e:
+        # A first run has no file — that is normal and silent. A file that EXISTS and
+        # will not load means every setting on this box (key, target, draft, cap) just
+        # reverted to defaults; every other rejection in this function is loud, and this
+        # one being mute is how "my config has no effect" becomes unfalsifiable. It was
+        # one of the three hypotheses that would have looked IDENTICAL from the
+        # 2026-07-30 TULA transcript, where draft_sampler:true and a 20 s probe cap sat
+        # on disk and neither reached the run.
+        if os.path.exists(CONFIG_PATH):
+            _warn(f"{CONFIG_PATH} could not be read ({e}) — using DEFAULTS for every "
+                  "setting this session")
     if not cfg.api_key:
         cfg.api_key = _borrow_maxdirector_key()
     return cfg

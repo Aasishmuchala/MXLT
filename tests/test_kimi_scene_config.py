@@ -145,6 +145,25 @@ def _cfg_file(tmp_path, payload):
     return str(p)
 
 
+def test_unreadable_existing_config_is_loud(tmp_path, monkeypatch, capsys):
+    """Silent degradation to full defaults is one of the three hypotheses that looked
+    IDENTICAL from the 2026-07-30 TULA transcript, where a hand-set draft_sampler:true
+    and a 20 s probe cap sat on disk and neither reached the run. Every other rejection
+    in load() is loud; this one being mute is how "my config has no effect" becomes
+    unfalsifiable. A MISSING file is a first run — normal, and still silent."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    path = tmp_path / "config.json"
+    path.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(cfgmod, "CONFIG_PATH", str(path))
+    cfg = cfgmod.load()
+    assert cfg.max_iterations == 5 and cfg.draft_sampler is False   # full defaults
+    assert "using DEFAULTS" in capsys.readouterr().out
+
+    monkeypatch.setattr(cfgmod, "CONFIG_PATH", str(tmp_path / "never_written.json"))
+    assert cfgmod.load().max_iterations == 5
+    assert "using DEFAULTS" not in capsys.readouterr().out          # no first-run noise
+
+
 @pytest.mark.parametrize("payload", [None, [], "str", 42])
 def test_load_non_dict_json_is_empty_and_loud(tmp_path, monkeypatch, capsys, payload):
     """P0: valid JSON that is not an object must not AttributeError out of load()."""

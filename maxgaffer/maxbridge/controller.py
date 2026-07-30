@@ -645,12 +645,35 @@ class Controller:
         return base_ev, base_wb
 
     def _render_exposed(self, cam, out_path: str, w: int, h: int, state=None,
-                        entry=None, log: Optional[Callable[[str], None]] = None):
+                        entry=None, log: Optional[Callable[[str], None]] = None,
+                        probe: bool = False):
         """``render_frame`` + software exposure when enabled — the ONE render path
         every probe/loop/board/final goes through, so the EV/WB the plugin sets always
         reach the scored (and delivered) pixels, even on renderers whose exposure host
-        is display-stage only (V-Ray GPU)."""
-        path = rd.render_frame(cam, out_path, w, h)
+        is display-stage only (V-Ray GPU).
+
+        ``probe=True`` marks a THROWAWAY direction probe and is the only thing that lets
+        the Vantage window-grab backend answer instead of V-Ray. Everything that does not
+        pass it — the plan-effect probes, the loop, the board, refine, the finals — stays
+        on V-Ray by DEFAULT, which is the safe direction for a default to fail in."""
+        if probe and getattr(self, "_probe_backend", "vray") == "vantage":
+            path, used = rd.render_probe(cam, out_path, w, h, backend="vantage", log=log)
+            if used != "vantage":
+                self._probe_backend = "vray"   # one refusal disarms the run, once, loudly
+        else:
+            path, used = rd.render_frame(cam, out_path, w, h), "vray"
+        # PROVENANCE, recorded rather than inferred: a caller that asked for a probe may
+        # still have been handed a V-Ray render (the grab refuses more often than it
+        # succeeds), and the black-frame guard is only meaningful on a plate V-Ray made.
+        self._last_render_backend = used
+        if used == "vantage":
+            # A Vantage plate ALREADY carries its exposure and its own tonemap. The
+            # software-exposure transform below assumes the renderer handed back the
+            # PRE-exposure buffer (core/expose.py:1-14); applied here it would multiply
+            # the same EV delta in a second time, the solver would measure the residual
+            # and ask for another step, and the loop would overshoot ~2× — bit for bit
+            # the failure the _plate_linear branch documents. Same for display_encode.
+            return path
         if path and getattr(self, "_plate_linear", False):
             # OCIO/ACES raw save measured (see _verify_exposure_host): the buffer is
             # LINEAR, but metrics decodes sRGB→linear and the LLM is shown the file —
@@ -695,6 +718,10 @@ class Controller:
         if ev0 is None:
             return
         try:
+            # DELIBERATELY rd.render_frame and NOT the probe dispatcher: this measures the
+            # HOST — whether THIS renderer bakes EV into the saved buffer — and measuring
+            # it through a tonemapped Vantage grab is precisely how software_exposure gets
+            # switched on by mistake, which then double-applies EV to every later frame.
             p1 = rd.render_frame(cam, os.path.join(run_dir, "evcheck_a.png"), 160, 90)
             s1 = metrics.compute_stats(p1) if p1 else None
             host.write_ev(ev0 + 2.0)
@@ -702,7 +729,24 @@ class Controller:
             s2 = metrics.compute_stats(p2) if p2 else None
         finally:
             host.write_ev(ev0)
-        if not (s1 and s2):
+        # Two BLACK plates give moved == 0.0, i.e. "this host is display-stage only", and
+        # would switch software_exposure ON for the whole session off a dead render. This
+        # check runs BEFORE the first render_hook probe, so without the black gate the
+        # session is mis-flagged even though the black-frame guard aborts a moment later.
+        if metrics.is_black(s1) and metrics.is_black(s2):
+            # SAY SO. These are the two earliest and cheapest V-Ray plates of the run and
+            # they are the exact evidence the 2026-07-30 post-mortem wanted; a gate that
+            # says nothing when it closes is the same failure as the silent draft branch.
+            # It reports rather than aborts on purpose: nothing has been APPLIED yet, so a
+            # scene whose lights the artist has left off is legitimately black here and is
+            # about to be lit by the first guess. The probe guard below sees a plate that
+            # was rendered AFTER an apply, which is the one that can tell those apart.
+            log("⚠ " + self._black_probe_message(
+                "the exposure-host check rendered two 100% BLACK plates before the match "
+                "began — software exposure left alone rather than mis-flagged off a dead "
+                "render"))
+            return
+        if not (s1 and s2) or metrics.is_black(s1) or metrics.is_black(s2):
             return
         import math
 
@@ -725,6 +769,64 @@ class Controller:
             log(f"⚠ measured: +2 EV moved the render {moved:.2f} stops (expected ~2) — "
                 f"the saved plate is linear (color management: {cs or 'unknown'}). "
                 "Loop plates will be sRGB-encoded in software before scoring.")
+
+    def _arm_probe_backend(self, log) -> None:
+        """Decide ONCE per run where direction probes come from, and say so. Armed only
+        when the live link is actually streaming AND the window is actually findable —
+        an unarmed backend costs nothing, an armed-but-broken one costs a log line per
+        probe."""
+        self._probe_backend = "vray"
+        if str(getattr(self.cfg, "probe_backend", "vray")).lower() != "vantage":
+            return
+        from . import vgrab
+
+        # the freshness chain is inductive (vgrab.SETTLE_LIMIT_S) — a new run must not
+        # inherit the last run's final frame as its baseline
+        vgrab.reset_settle()
+        port = vt.link_running()
+        hwnd = vgrab.find_window(vgrab.VANTAGE_TITLE) if port else None
+        if port and hwnd:
+            self._probe_backend = "vantage"
+            log(f"probe backend: VANTAGE window grab for the sun solve's 44 probes "
+                f"(live link on {port}) — the sweep, the tone stages, the basin, polish, "
+                f"the plan probes and the final all stay on V-Ray")
+        else:
+            log("probe backend: vantage requested but " +
+                ("no live link is streaming" if not port
+                 else f"the window was not found ({vgrab.last_error()})") +
+                " — rendering every probe in V-Ray")
+
+    def _black_probe_message(self, head: str = "") -> str:
+        """Name the cause instead of guessing at it. On 2026-07-30 a whole run came back
+        black because a dead Chaos Vantage live link left V-Ray's distributed_rendering
+        ON, pointed at a dead port with the local machine excluded — and the flag is
+        saved WITH the scene, so it recurs on every open (plugcfg/vrayrt_dr.cfg's
+        'restore' path writes it back true). Candidates-based read (checklist #15).
+
+        ``head`` names WHICH render came back black; the diagnosis after it is the same
+        one wherever the black plate was measured.
+
+        Reporting is where this stops: clearing a render setting behind the artist's back
+        is the same house rule that keeps draft_sampler opt-in."""
+        dr = None
+        try:
+            dr = sc.get_prop(sc._rt().renderers.current,
+                             ("distributed_rendering", "system_distributedRendering",
+                              "distributed_rendering_on"))
+        except Exception:  # noqa: BLE001 — a diagnostic must never outrank the diagnosis
+            pass
+        head = head or ("first probe rendered 100% BLACK — stopping now instead of "
+                        "ranking black frames for hours (that is exactly what happened "
+                        "on 2026-07-30)")
+        if dr:
+            return (head + ". MEASURED: this renderer's distributed rendering is ON — a "
+                    "dead Vantage live link leaves it pointed at 127.0.0.1:20701 with no "
+                    "local server. Set renderers.production.distributed_rendering = false "
+                    "and re-run.")
+        return (head + ". Likeliest causes: distributed rendering left ON by a closed "
+                "Vantage live link (check renderers.production.distributed_rendering), "
+                "or the renderer is producing no pixels at all — wrong/hidden camera, an "
+                "empty render region, or a failed GPU device.")
 
     def probe_score(self, camera_name: str, tag: str) -> Optional[float]:
         """One loop-res render of the current scene scored against the camera's reference
@@ -962,11 +1064,27 @@ class Controller:
             return self._apply_only(camera_name, e, rig, cam, start, run_dir,
                                     semantics, log)
 
+        self._arm_probe_backend(log)
+
         draft_applied = False
         if self.cfg.draft_sampler:
-            for line in df.apply_draft():
+            for line in df.apply_draft(getattr(self.cfg, "probe_max_seconds", 0.0)):
                 log(line)
             draft_applied = df.pending_snapshot()
+        else:
+            # A gate that says nothing when it is CLOSED cost three hours on TULA
+            # (2026-07-30): draft_sampler:true and a 20 s cap sat in config.json from
+            # 15:27, the Options menu wrote false over them at match time, and not one
+            # line in the transcript said the branch was False. apply_draft always
+            # returns at least one line on every path, so silence here is the only
+            # state the artist could not tell apart from "it ran and did nothing".
+            msg = ("draft: OFF — probes render at your own settings "
+                   "(Options ▾ → Draft sampler, or Settings)")
+            secs = float(getattr(self.cfg, "probe_max_seconds", 0.0) or 0.0)
+            if secs > 0:
+                msg += (f"; the {secs:g}s probe cap is gated by this flag and is "
+                        "NOT in effect")
+            log(msg)
 
         # the restoring finally opens IMMEDIATELY after the draft is applied: a gateway
         # error in the exposure check, the sweep or the MatchConfig build must never
@@ -996,6 +1114,10 @@ class Controller:
             # anchor probes/board/finals use, so all exposed pixels stay consistent)
             self._sw_state = start
             self._sw_warned = False
+            # black-frame guard, armed per run: the FIRST probe that comes back is checked
+            # once, and the abort is STICKY (see render_hook / _black_probe_message)
+            self._probe_abort = ""
+            self._first_probe_checked = False
             if getattr(self.cfg, "software_exposure", False) \
                     and "exposure.ev" in start.values:
                 log("software exposure ON — EV/WB applied to loop frames before scoring "
@@ -1051,6 +1173,8 @@ class Controller:
                 # without threading a callback through the solver, the sweep, the loop and
                 # polish separately. A match can run for many minutes; without this the
                 # artist has no way to tell a working run from a hung one.
+                if self._probe_abort:      # STICKY — see the black guard below
+                    raise RuntimeError(self._probe_abort)
                 _tick(tag)
                 # DIRECTION-solving stages render small. They are comparing where the light
                 # falls, not judging tone, and there are dozens of them: the global sun
@@ -1070,10 +1194,65 @@ class Controller:
                     width, height = profile.polish_size
                 else:
                     width, height = profile.loop_width, profile.loop_height
+                # Geometry-only, and named by PREFIX rather than by exception. The global
+                # sun solve is the one stage whose probes exist purely to be RANKED
+                # against each other on the hot-patch map and whose output is an angle —
+                # the one thing that transfers between renderers — and it is also 44 of
+                # the 133 probes in a standard profile, so it is where the saving is.
+                # Three neighbours that look like they qualify do not:
+                #   * sunsolve_tonealign exists to set the artist's EXPOSURE via solve_ev,
+                #     so it must be measured on the renderer that owns that exposure;
+                #   * sweep_basin_* is the multi-start picker (_stage_of already calls it
+                #     its own stage). It scores on the FULL weighted critic, which takes
+                #     min(comps.values()) across every measured component (critic.py:299-
+                #     314) — a cross-renderer key/colour collapse costs up to 33 points
+                #     there and would drag the pixel term down against the state-derived
+                #     transfer term, choosing the basin on the wrong evidence. The basin
+                #     caps the whole run (polish is a basin-finisher);
+                #   * sweep### (8 probes) is scored on cosine(ref_grid, probe_grid) —
+                #     the reference PHOTO's 3x3 luminance grid against the probe's — and
+                #     its contrastive table subtracts the probes' mean grid FROM the
+                #     reference's (director.py:1290-1315), which only means anything while
+                #     both sides come off the same tone curve. Its plates are also the
+                #     ones uploaded to the model by llm_pick, and a screenshot of another
+                #     renderer is not what that prompt describes. Eight probes is not
+                #     worth a second cross-source path.
+                use_vantage = tag.startswith(("sunsolve_a", "sunsolve_fine"))
                 path = self._render_exposed(
                     cam, os.path.join(run_dir, f"{tag}.png"),
                     width, height,
-                    state=getattr(self, "_sw_state", None) or start, entry=e, log=log)
+                    state=getattr(self, "_sw_state", None) or start, entry=e, log=log,
+                    probe=use_vantage)
+                if path and not self._first_probe_checked \
+                        and getattr(self, "_last_render_backend", "vray") == "vray":
+                    # ONE extra compute_stats per run (~0.1 s on a 256px thumbnail) buys
+                    # the whole diagnosis: on 2026-07-30 an entire TULA run was spent
+                    # ranking 100% black frames before anyone noticed.
+                    #
+                    # The guard is spent on a V-RAY plate or not at all. A Vantage grab is
+                    # already guaranteed non-black by vgrab (it refuses one), so letting
+                    # it consume the check would burn it on a plate that cannot fail —
+                    # and every V-Ray plate afterwards (tone stages, the basin, the loop,
+                    # polish, the finals) would go unchecked, which is the 2026-07-30
+                    # failure with the guard installed and inert. Same for a plate whose
+                    # stats could not be computed: an unmeasured frame is not evidence.
+                    #
+                    # The abort is a STICKY FLAG and not merely an exception, because
+                    # sunsolve.probe catches every exception per probe by design
+                    # (sunsolve.py:117-124), as do the tone-align and sun-solve blocks —
+                    # a bare raise would be swallowed 44 times, and each swallow would
+                    # fire another 60-second render. With the flag, every later probe
+                    # raises before rendering (microseconds), the surviving stages
+                    # degrade the way they already know how, and the RuntimeError finally
+                    # escapes through iter00 (director.py:351, unguarded) and the
+                    # draft-restoring finally into the dock's "✗ …".
+                    first_stats = self.stats_for(path)
+                    if first_stats is not None:
+                        self._first_probe_checked = True
+                        if metrics.is_black(first_stats):
+                            self._probe_abort = self._black_probe_message()
+                            log("✗ " + self._probe_abort)
+                            raise RuntimeError(self._probe_abort)
                 if path:
                     log(f"THUMB::{path}")   # UI renders these markers as inline thumbnails
                 return path

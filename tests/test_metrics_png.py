@@ -118,3 +118,26 @@ def test_hist_helpers():
     assert abs(metrics.cosine([1, 2, 3], [1, 2, 3]) - 1.0) < 1e-9
     assert metrics.cosine([1, 0], [0, 1]) == 0.0
     assert metrics.cosine([0, 0], [0, 0]) == 1.0  # two hue-less images are "the same"
+
+
+def test_is_black_detects_a_dead_plate(tmp_path):
+    """A dead render is not a dark render, and the difference has to be measured rather
+    than inferred: on 2026-07-30 a whole TULA run was spent ranking 100% black frames
+    (a dead Vantage live link had left V-Ray's distributed_rendering ON). A single lit
+    pixel in 576 already lifts mean_rgb off zero, so this cannot fire on a moonlit shot."""
+    black = str(tmp_path / "black.png")
+    png_min.write_png_rgb(black, [[(0, 0, 0)] * 24 for _ in range(24)])
+    stats = metrics.compute_stats(black)
+    assert stats["mean_rgb"] == [0.0, 0.0, 0.0] and stats["p"]["95"] == 0.0
+    assert metrics.is_black(stats) is True
+
+    rows = [[(0, 0, 0)] * 24 for _ in range(24)]
+    rows[12][12] = (255, 255, 255)                 # one lit pixel out of 576
+    lit = str(tmp_path / "lit.png")
+    png_min.write_png_rgb(lit, rows)
+    assert metrics.is_black(metrics.compute_stats(lit)) is False
+
+    # absence of evidence is not evidence: a missing or partial stats dict is not black
+    assert metrics.is_black(None) is False
+    assert metrics.is_black({}) is False
+    assert metrics.is_black({"mean_rgb": "nonsense"}) is False

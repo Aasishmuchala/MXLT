@@ -195,3 +195,98 @@ def test_double_junk_plan_proceeds_planless(dock, monkeypatch):
     assert "execute_plan" not in names
     assert "run_match" in names                     # the match still ran
     assert "no operations proposed" in dock.log.toPlainText()
+
+
+# ------------------------------------------------------------------ options ▾ vs config
+def _dock_on(cfg, monkeypatch, tmp_path):
+    """A dock built on a SPECIFIC config — the 2026-07-30 one, on purpose."""
+    from maxgaffer.ui import dock as dockmod
+
+    monkeypatch.setattr(dockmod, "Controller", FakeController)
+    monkeypatch.setattr(dockmod.cfgmod, "load", lambda: cfg)
+    monkeypatch.setattr(dockmod.PlanPreviewDialog, "exec", lambda self: True)
+    monkeypatch.setattr(dockmod.ChangeReportDialog, "exec", lambda self: True)
+    d = dockmod.MaxGafferDock()
+    ref = tmp_path / "ref.png"
+    ref.write_bytes(b"")
+    d.ctrl.session.set_reference("CamA", str(ref))
+    d.refresh_cameras()
+    return d
+
+
+def test_options_menu_no_longer_overwrites_the_config_file(app, monkeypatch, tmp_path):
+    """THE 2026-07-30 BUG, exactly. config.json carried draft_sampler:true and a 20 s
+    probe cap, written at 15:27; the dock was launched fresh at ~16:30 and a match ran
+    with neither in effect, because _start_match copied the Options ▾ item's state over
+    cfg before every run — and that item drew no check mark, so nobody could see it was
+    off. The menu is a MIRROR of the config now, not a second copy of it."""
+    cfg = Config(api_key="oc_test", draft_sampler=True, probe_max_seconds=20.0)
+    d = _dock_on(cfg, monkeypatch, tmp_path)
+    assert d.act_draft.isChecked() is True         # the file seeded the menu
+    d._start_match()
+    assert d.cfg.draft_sampler is True             # ...and the match did not undo it
+    assert d.cfg.probe_max_seconds == 20.0
+    assert d.act_draft.isChecked() is True
+
+
+def test_toggling_the_menu_item_is_the_only_thing_that_moves_the_flag(dock):
+    """The binding REPLACES the clobber: the value moves when the artist toggles it."""
+    dock.act_draft.setChecked(False)
+    assert dock.cfg.draft_sampler is False
+    dock.act_draft.setChecked(True)
+    assert dock.cfg.draft_sampler is True
+    dock.act_autoexec.setChecked(True)
+    assert dock.cfg.auto_execute_plan is True
+
+
+def test_checkable_menu_items_render_their_state():
+    """The affordance bug underneath the config bug: styling QMenu::item without an
+    indicator rule silences Qt's own check mark, so a checkable item becomes a switch
+    with no position — the artist clicked "Draft sampler" to turn it ON. Only assertable
+    statically headless; worth two minutes of on-box eyeballing after this lands."""
+    from maxgaffer.ui import dock as dockmod
+
+    assert "QMenu::indicator" in dockmod.STYLE
+    assert "QMenu::indicator:checked" in dockmod.STYLE
+
+
+# ------------------------------------------------------------------ settings ↔ menu
+def test_settings_round_trips_the_probe_budget(app):
+    """The two knobs that do not scale with the scene had no UI at all — they were
+    hand-edited into config.json, which is how they came to be silently discarded."""
+    from maxgaffer.ui import dock as dockmod
+
+    cfg = Config()
+    dlg = dockmod.SettingsDialog(cfg)
+    dlg.cb_draft.setChecked(True)
+    dlg.sp_probe_secs.setValue(20.0)
+    dlg.cmb_probe_backend.setCurrentText("vantage")
+    dlg._save()
+    assert cfg.draft_sampler is True
+    assert cfg.probe_max_seconds == 20.0
+    assert cfg.probe_backend == "vantage"
+
+    again = dockmod.SettingsDialog(cfg)
+    assert again.cb_draft.isChecked() is True
+    assert again.sp_probe_secs.value() == 20.0
+    assert again.cmb_probe_backend.currentText() == "vantage"
+
+
+def test_settings_save_resyncs_the_options_menu(dock, monkeypatch):
+    """Two controls for one value is only safe while they agree; disagreeing silently is
+    the bug that cost 2026-07-30."""
+    from maxgaffer.ui import dock as dockmod
+
+    dock.act_draft.setChecked(False)
+    assert dock.cfg.draft_sampler is False
+    saves = []
+    monkeypatch.setattr(type(dock.cfg), "save", lambda self: saves.append(1))
+
+    def fake_exec(self):
+        self.cfg.draft_sampler = True              # what SettingsDialog._save does
+        return True
+
+    monkeypatch.setattr(dockmod.SettingsDialog, "exec", fake_exec)
+    dock._open_settings()
+    assert dock.act_draft.isChecked() is True      # the menu followed the file
+    assert saves == [1]

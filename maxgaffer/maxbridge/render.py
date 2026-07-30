@@ -13,7 +13,9 @@ path when neither Pillow nor a sidecar python exists.
 from __future__ import annotations
 
 import os
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
+
+from . import vgrab
 
 
 def _rt():
@@ -89,6 +91,38 @@ def render_frame(camera, out_path: str, width: int, height: int) -> Optional[str
                 rt.renderWidth, rt.renderHeight = old_w, old_h
         except Exception:
             pass
+
+
+def render_probe(camera, out_path: str, width: int, height: int,
+                 backend: str = "vray",
+                 log: Optional[Callable[[str], None]] = None,
+                 ) -> Tuple[Optional[str], str]:
+    """A PROBE frame — ``render_frame``, or a Vantage live-link window grab.
+
+    → (path or None, the backend that actually produced it). The second element is not
+    decoration: the caller must know, because a Vantage plate is tonemapped and must
+    NOT be software-exposed, and one failed grab should disarm the backend for the run.
+
+    A PEER of ``render_frame``, never a wrapper around its callers. ``render_frame`` is
+    the single choke point for EVERY render in the plugin — probes, the exposure-host
+    calibration, the loop, and the delivered finals — so switching on a config value
+    inside it would move the deliverables onto Vantage too, and would let the host
+    calibration set ``software_exposure`` off a tonemapped measurement (double-applying
+    EV on every later frame). Only a caller that knows a given render is a throwaway
+    direction probe may ask for this.
+
+    Fails SAFE in one direction only: Vantage down, window missing, window covered, or
+    a black grab all fall through to V-Ray with the reason logged. It never returns a
+    picture whose provenance it cannot name — a wrongly-attributed frame is worse than
+    a slow one, because the critic will happily rank it."""
+    if str(backend).lower() == "vantage":
+        path = vgrab.capture_window_png(vgrab.VANTAGE_TITLE, out_path, width, height)
+        if path:
+            return path, "vantage"
+        if log:
+            log(f"probe: Vantage grab unavailable ({vgrab.last_error()}) — "
+                "this probe and the rest of the run render in V-Ray")
+    return render_frame(camera, out_path, width, height), "vray"
 
 
 def transcode_to_png(src_path: str, dst_png: str, max_dim: int = 1024) -> Optional[str]:

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from . import config as cfgmod
 from .scene import get_prop, set_prop
@@ -71,10 +71,18 @@ def pending_snapshot() -> bool:
     return os.path.exists(SNAPSHOT_PATH)
 
 
-def apply_draft() -> List[str]:
+def apply_draft(seconds: Optional[float] = None) -> List[str]:
     """Snapshot originals to disk FIRST, then apply draft values. Returns log lines.
     A pre-existing snapshot means a crashed session — it is NOT overwritten (the oldest
     snapshot is the true original); we restore it first, then re-apply.
+
+    THE CALLER OWNS THE PROBE CAP. ``seconds`` is the per-probe time budget; None means
+    "no caller value" (crash recovery, a bare listener call) and only then is the disk
+    config consulted. The gate that decides whether draft mode runs at all lives in the
+    controller's in-memory ``cfg``, so re-reading the cap from disk here made two sources
+    of truth out of one setting: ``api.get_controller({"probe_max_seconds": …})`` was
+    silently ignored, and a Settings edit that failed to persist silently reverted the
+    cap while the transcript still said draft was on.
 
     Two passes, strictly ordered: collect every original → write the crash-safe file →
     only THEN mutate the renderer. A crash before the write leaves the scene untouched;
@@ -90,22 +98,37 @@ def apply_draft() -> List[str]:
     # pass 1 — collect originals, no mutation
     originals: Dict[str, float] = {}
     planned: List[Tuple[str, float]] = []     # (name, coerced draft value)
-    seconds = float(getattr(cfgmod.load(), "probe_max_seconds", 0.0) or 0.0)
+    if seconds is None:      # no caller value (crash-recovery, a bare listener call) —
+        seconds = getattr(cfgmod.load(), "probe_max_seconds", 0.0)   # fall back to disk
+    seconds = float(seconds or 0.0)
     props = list(DRAFT_PROPS)
+    cap_names: Tuple[str, ...] = ()
     if seconds > 0:
-        # V-Ray states this one in MINUTES
-        props.append((TIME_CAP_PROPS, round(seconds / 60.0, 5)))
+        props.append((TIME_CAP_PROPS, round(seconds / 60.0, 5)))   # V-Ray states it in MINUTES
+        cap_names = TIME_CAP_PROPS
     for candidates, draft_value in props:
         for name in candidates:
             original = get_prop(r, (name,))
             if original is None:
                 continue
+            value = (type(original)(draft_value) if isinstance(original, int)
+                     else float(draft_value))
+            if candidates is cap_names and draft_value > 0 and value <= 0:
+                # An INT minutes field truncates a 20 s cap to 0 — and V-Ray reads 0 as
+                # NO limit, i.e. the exact opposite of what was asked, logged as a
+                # cheerful "0 → 0". Refuse loudly rather than uncap the probe. (On the
+                # TULA build 2026-07-30 progressive_max_render_time read back as 0.0, a
+                # FLOAT, so 20 s binds there — but this varies across V-Ray builds.)
+                lines.append(f"draft: {name} is whole MINUTES on this build — a "
+                             f"{seconds:g}s cap truncates to 0, which V-Ray reads as no "
+                             f"limit; left alone (use probe_max_seconds ≥ 60, or the "
+                             f"progressive noise threshold does the work)")
+                break
             try:
                 originals[name] = float(original)
             except (TypeError, ValueError):
                 break
-            planned.append((name, type(original)(draft_value)
-                            if isinstance(original, int) else float(draft_value)))
+            planned.append((name, value))
             break
     if not originals:
         return lines + ["draft: no known sampler properties on this renderer — "
