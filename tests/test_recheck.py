@@ -670,7 +670,11 @@ def test_progress_never_starts_for_a_run_that_was_refused():
     for fn in ("_start_match", "_start_match_all", "_start_refine"):
         body = re.search(r"\n    def %s\(self\):\n(.*?)(?=\n    def )" % fn, src, re.S)
         assert body, fn
-        guard = body.group(1).find("if self._busy")
+        # _run_blocked() is the guard now (2026-07-31): it refuses a busy dock AND a dock
+        # whose previous run was DETACHED but has not returned, which is the re-entrancy
+        # hazard _force_release used to open — two run_matches interleaving over one
+        # Controller, sharing its abort flag, plate history, draft snapshot and pre_match.
+        guard = body.group(1).find("if self._run_blocked()")
         begin = body.group(1).find("_progress_begin")
         assert guard != -1, f"{fn} lost its busy guard"
         assert begin == -1 or guard < begin, f"{fn} starts progress before it commits"

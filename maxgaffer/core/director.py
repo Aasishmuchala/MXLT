@@ -69,6 +69,11 @@ class MatchConfig:
     #: pixels alone the search settled on uniformly-decent but structurally WRONG rigs
     #: (sun 64 degrees out) because no pixel component punishes it enough.
     transfer_weight: float = 0.0
+    #: True when the CALLER already priced this run from a real timed probe (I2). The
+    #: loop's own iter00 estimate is then suppressed rather than printed after the fact:
+    #: two different numbers for the same run is how "133 renders" came to be quoted for a
+    #: 190-render match. (2026-07-31)
+    cost_reported: bool = False
 
 
 def _anneal(best_score: Optional[float]) -> float:
@@ -270,6 +275,16 @@ class MatchResult:
                                         # (two low-gain rounds; finer steps untested)
     best_components: Dict[str, float] = field(default_factory=dict)
     scorecard: Dict = field(default_factory=dict)
+    #: I6 — the headline honesty verdict. True when two or three INDEPENDENT measures
+    #: agree that the delivered frame is not the reference's light. On 2026-07-30 the
+    #: delivered image was a cool sunless dusk courtyard against a warm golden-hour
+    #: reference and no stage of the pipeline ever said "this does not look like it".
+    unlike_reference: bool = False
+    unlike_reasons: List[str] = field(default_factory=list)
+    #: every fallback, degradation and skipped stage of the run, in order
+    degradations: List[str] = field(default_factory=list)
+    #: every question the run put to the artist (or to the policy), and what was answered
+    decisions: List[Dict] = field(default_factory=list)
 
     def to_summary(self) -> Dict:
         """JSON-safe run record — the controller writes it to the run dir as run.json.
@@ -285,6 +300,10 @@ class MatchResult:
             "ceiling_proven": self.ceiling_proven,
             "best_components": self.best_components,
             "scorecard": self.scorecard,
+            "unlike_reference": self.unlike_reference,
+            "unlike_reasons": list(self.unlike_reasons),
+            "degradations": list(self.degradations),
+            "decisions": list(self.decisions),
             "best_state": self.best_state.to_dict(),
             "iterations": [
                 {"index": r.index, "score": r.score, "render": r.render_path,
@@ -349,11 +368,17 @@ def run_match(
             live = state
             _t0 = _time.time()
             path = hooks.render(f"iter{i:02d}")
-            if i == 0 and path is not None:
+            if i == 0 and path is not None and not cfg.cost_reported:
+                # SUPPRESSED when the controller already priced the run. This line fires
+                # at iter00, which is preceded by the basin (≤6), tone-align (≤2), the sun
+                # solve (≤44) and the sweep (≤8) — on a heavy scene it reaches the artist
+                # roughly an hour and sixty renders into the run it is supposed to be
+                # pricing, and it counts only iterations + polish (125 of 190). The
+                # controller's estimate fires after ~1 render of 190. (2026-07-31)
                 _dt = _time.time() - _t0
                 worst = cfg.max_iterations + (cfg.polish_max_probes if cfg.polish else 0)
-                hooks.log(f"~{_dt:.1f}s/render — worst case ≈ "
-                          f"{_dt * worst / 60.0:.0f} min for this run")
+                hooks.log(f"~{_dt:.1f}s/render — the loop and polish alone are ≈ "
+                          f"{_dt * worst / 60.0:.0f} min from here")
             rec.render_path = path
             if path is None:
                 hooks.log(f"iter {i}: render failed — stopping")
@@ -419,6 +444,14 @@ def run_match(
                 # unscored iteration (LLM-visual mode, or one flaky stats read): while no
                 # score exists to rank by, LATEST is best — a once-only assignment here
                 # left the UI showing iteration 0's *before* frame as the final result
+                #
+                # AND IT SAYS SO. Repeated stats failures produce a full match at
+                # best_score None with stop_reason "max_iterations", which the controller
+                # does not treat as a failed run — so it records the match, applies the
+                # final state, and hands the artist "best score n/a" with no statement
+                # anywhere that NO FRAME IN THE RUN WAS EVER MEASURED. (2026-07-31)
+                hooks.log(f"iter {i}: the plate could not be measured — this iteration is "
+                          "UNSCORED and nothing in it was compared to the reference")
                 if best_score is None or best_render is None:
                     best_state, best_render = state.copy(), path
 
@@ -1014,7 +1047,13 @@ def run_polish(
                             # ride the valley: accelerate along the winning diagonal
                             # exactly like the single-axis climb does (stride ×1.6)
                             mult = 1.6
+                            # should_cancel BELONGS HERE. Its sibling single-axis climb
+                            # checks it; this ride did not, so a ✕ pressed during a valley
+                            # ride was not noticed until the ride ran out of budget. The
+                            # controller's render latch bounds it to one probe regardless,
+                            # but the explicit check saves that last probe. (2026-07-31)
                             while best_score < cfg.polish_stop_at \
+                                    and not hooks.should_cancel() \
                                     and probes < cfg.polish_max_probes:
                                 got2 = _diag_probe(ka, kb, sa, sb, mult)
                                 if got2 is None:

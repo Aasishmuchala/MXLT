@@ -123,7 +123,24 @@ def apply_draft(seconds: Optional[float] = None) -> List[str]:
                              f"{seconds:g}s cap truncates to 0, which V-Ray reads as no "
                              f"limit; left alone (use probe_max_seconds ≥ 60, or the "
                              f"progressive noise threshold does the work)")
-                break
+                # CONTINUE, not break. A refused int-typed candidate used to abandon the
+                # whole row, so if progressive_max_render_time is int-typed here then
+                # options_progressiveTimeLimit was never tried — even on a build where it
+                # is a float and would have taken the exact value asked for. (2026-07-31)
+                continue
+            if candidates is cap_names and draft_value > 0:
+                # ROUNDING, not just truncation-to-zero. probe_max_seconds 110 becomes
+                # int(1.833) = 1 = a SIXTY-second cap: a 45% shortfall, logged as
+                # "0 → 1" with no unit and no mention that the request was rounded — and
+                # the "0 →" side is equally opaque, because 0 means "no limit", not "zero
+                # minutes". Same class of bug the sub-minute fix was written to kill,
+                # moved above the 60 s boundary. (2026-07-31)
+                effective = float(value) * 60.0
+                if abs(effective - seconds) > 0.5:
+                    lines.append(
+                        f"draft: {name} stores whole MINUTES on this build — you asked "
+                        f"for a {seconds:g}s probe cap and it will bind at "
+                        f"{effective:g}s")
             try:
                 originals[name] = float(original)
             except (TypeError, ValueError):
@@ -148,7 +165,14 @@ def apply_draft(seconds: Optional[float] = None) -> List[str]:
         except Exception:  # noqa: BLE001
             applied = None
         if applied:
-            lines.append(f"draft: {name} {originals[name]:g} → {draft_value:g}")
+            unit = ""
+            if name in TIME_CAP_PROPS:
+                # "progressive_max_render_time 0 → 1" says nothing an artist can act on:
+                # the unit is missing and 0 means NO LIMIT, not zero minutes.
+                unit = (f"  (minutes — was {'no limit' if originals[name] <= 0 else ''}"
+                        f"{'' if originals[name] <= 0 else f'{originals[name] * 60:g}s'}"
+                        f", now {float(draft_value) * 60.0:g}s per probe)")
+            lines.append(f"draft: {name} {originals[name]:g} → {draft_value:g}{unit}")
         else:
             # leave the snapshot: it still covers every prop that DID change
             lines.append(f"draft: {name} would not take the draft value — left at "

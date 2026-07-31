@@ -41,6 +41,13 @@ DEFAULT_SEMANTICS: Dict = {
     # semantics, so every key run_match logs or prompts with must exist
     "key_notes": "neutral base — no reference analysis available",
     "confidence": 0.0,
+    # ABSENT EVIDENCE, stated. This dict is also the gateway-down fallback, and the
+    # -60° bearing above is an INVENTION, not a reading. Without these keys the
+    # controller's `.get("sun_bearing_agreement", 1.0)` read the invention at FULL trust
+    # and gave it a quarter of the match objective, then printed "sun mid @ bearing -60°"
+    # in the same sentence shape it uses for a real measurement. (2026-07-31)
+    "sun_bearing_agreement": 0.0,
+    "sun_bearing_spread_deg": None,
 }
 
 # (key, label, why, semantics overrides) — bearing convention matches ANALYZE:

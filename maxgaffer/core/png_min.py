@@ -70,6 +70,40 @@ def write_png_rgb(path: str, rows: List[List[Tuple[int, int, int]]]) -> Optional
     return path
 
 
+def read_png_size(path: str) -> Optional[Tuple[int, int]]:
+    """(width, height) from the IHDR chunk alone — NO zlib, no unfiltering, microseconds.
+
+    Added 2026-07-31. ``compute_stats`` reports no dimensions at all, so until now nothing
+    in the plugin could tell a 240×135 probe from a full-resolution frame that was saved
+    at scene resolution because all three of ``render_frame``'s size spellings fell
+    through (render.py:57-73). ``compute_stats`` downsamples to 256 px, so the stats of a
+    wrong-sized plate look entirely normal and the critic ranks it happily — the same
+    class of blindness as scoring a black frame.
+
+    → None on a non-PNG, a truncated header, or an unreadable file. None reads as "could
+    not verify" upstream (plate.validate WARNs and proceeds), never as "wrong size":
+    plenty of fixtures and Max builds write formats this reader does not claim to know.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(len(_SIG) + 8 + 13)
+    except OSError:
+        return None
+    if not head.startswith(_SIG) or len(head) < len(_SIG) + 8 + 13:
+        return None
+    pos = len(_SIG)
+    (length,) = struct.unpack(">I", head[pos:pos + 4])
+    if head[pos + 4:pos + 8] != b"IHDR" or length != 13:
+        return None
+    try:
+        width, height = struct.unpack(">II", head[pos + 8:pos + 16])
+    except struct.error:                    # unreachable after the length gate — belt
+        return None
+    if width <= 0 or height <= 0 or width > _MAX_DIM or height > _MAX_DIM:
+        return None
+    return int(width), int(height)
+
+
 def read_png_rgb(path: str, max_dim: int = 160) -> Optional[List[List[Tuple[int, int, int]]]]:
     try:
         with open(path, "rb") as f:

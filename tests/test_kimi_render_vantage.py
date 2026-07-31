@@ -490,7 +490,7 @@ def test_render_probe_defaults_to_vray(monkeypatch):
     monkeypatch.setattr(rd, "render_frame",
                         lambda cam, out, w, h: calls.append(out) or "p")
     monkeypatch.setattr(rd.vgrab, "capture_window_png",
-                        lambda *a: pytest.fail("the default must never reach Vantage"))
+                        lambda *a, **k: pytest.fail("the default must never reach Vantage"))
     assert rd.render_probe(None, "o.png", 8, 8) == ("p", "vray")
     assert calls == ["o.png"]
 
@@ -499,7 +499,7 @@ def test_render_probe_unknown_backend_is_vray(monkeypatch):
     """A typo in config.json degrades to today's behaviour, not to a new failure mode."""
     monkeypatch.setattr(rd, "render_frame", lambda cam, out, w, h: "p")
     monkeypatch.setattr(rd.vgrab, "capture_window_png",
-                        lambda *a: pytest.fail("an unknown backend must not dispatch"))
+                        lambda *a, **k: pytest.fail("an unknown backend must not dispatch"))
     assert rd.render_probe(None, "o.png", 8, 8, backend="vantge") == ("p", "vray")
     assert rd.render_probe(None, "o.png", 8, 8, backend="") == ("p", "vray")
 
@@ -507,7 +507,7 @@ def test_render_probe_unknown_backend_is_vray(monkeypatch):
 def test_render_probe_falls_back_and_says_why(monkeypatch):
     """Fails safe in ONE direction only — and never silently: the artist has to be able
     to tell a Vantage run from a V-Ray run that is quietly costing 60 s a probe."""
-    monkeypatch.setattr(rd.vgrab, "capture_window_png", lambda *a: None)
+    monkeypatch.setattr(rd.vgrab, "capture_window_png", lambda *a, **k: None)
     monkeypatch.setattr(rd.vgrab, "last_error", lambda: "no live link is streaming")
     monkeypatch.setattr(rd, "render_frame", lambda cam, out, w, h: "p")
     logs = []
@@ -517,7 +517,7 @@ def test_render_probe_falls_back_and_says_why(monkeypatch):
 
 
 def test_render_probe_vantage_success_skips_vray(monkeypatch):
-    monkeypatch.setattr(rd.vgrab, "capture_window_png", lambda *a: "grab.png")
+    monkeypatch.setattr(rd.vgrab, "capture_window_png", lambda *a, **k: "grab.png")
     monkeypatch.setattr(rd, "render_frame",
                         lambda *a: pytest.fail("a successful grab must not also render"))
     assert rd.render_probe(None, "grab.png", 8, 8,

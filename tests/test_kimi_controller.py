@@ -341,7 +341,12 @@ def _match_harness(monkeypatch, tmp_path, **cfg_over):
     _stub_scene(monkeypatch, cm, rig={"sun": object(), "dome": None,
                                       "groups": {}, "notes": []})
     e = c.session.entry("Cam")
-    e.reference = "ref.png"
+    # a REAL file: preflight's REFERENCE_PRESENT blocks a run whose reference is not on
+    # disk, because matching against a file that is not there produces numbers rather
+    # than measurements (2026-07-31)
+    ref = tmp_path / "ref.png"
+    ref.write_bytes(b"\x89PNG\r\n\x1a\nnot-a-real-png-but-it-exists")
+    e.reference = str(ref)
     e.semantics = _semantics()
     monkeypatch.setattr(cm.ap, "read_state", lambda *a, **k: LightingState())
     monkeypatch.setattr(cm.ap, "apply_state", lambda *a, **k: [])

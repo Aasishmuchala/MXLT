@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 from PySide6 import QtCore, QtGui, QtWidgets  # type: ignore
 
 from ..core.genome import GROUP_PREFIX, LightingState, spec_for
-from ..core import providers
+from ..core import profiles, providers
 from ..core.omega import OmegaError, ping
 from ..maxbridge import config as cfgmod
 from ..maxbridge.controller import Controller
@@ -334,10 +334,28 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.cfg = cfgmod.load()
         self.ctrl = Controller(self.cfg)
         self.ctrl.io = self._run_blocking_io   # gateway waits run off-thread, Max stays alive
+        # I5 — the escalation seam, wired exactly like io. run_match runs on the MAIN
+        # thread (it is a direct call; only io goes off-thread), so this can exec() a
+        # dialog with no relay. Headless callers leave ctrl.ask alone and
+        # cfg.uncertainty_policy decides. (2026-07-31)
+        self.ctrl.ask = self._ask_question
         self._relay = _ProgressRelay(self)
         self._relay.match_progress.connect(self._on_match_progress)
         self._workers: List[_Worker] = []
+        # THREE flags, not one. _force_release used to set self._cancel = False, so the
+        # zombie run's next checkpoint read False and RESUMED as if ✕ had never been
+        # pressed — with the cancel button now disabled, so the artist could not re-arm
+        # it. That is the reported symptom, in code. (2026-07-31)
+        #
+        #: ONE-WAY within a run. Cleared only when a NEW run starts, and only after the
+        #: previous one has actually returned.
         self._cancel = False
+        #: the UI stopped waiting; the run has NOT stopped. A new run is refused while
+        #: this is true, which also kills the re-entrancy hazard: _force_release used to
+        #: re-enable MATCH while the zombie was suspended inside processEvents(), so a
+        #: second run_match could interleave over ONE Controller and corrupt its abort
+        #: flag, its plate history, e.pre_match, e.locks and the draft snapshot.
+        self._detached = False
         self._busy = False
         self._beat = None
         self._last_tick = ""
@@ -578,7 +596,18 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.btn_board.clicked.connect(self._open_scenarios)
         bar.addWidget(self.btn_board)
         self.btn_cancel = QtWidgets.QPushButton("✕")
-        self.btn_cancel.setToolTip("Cancel after the current step.")
+        # The honest tooltip. A V-Ray frame in flight cannot be interrupted from Python:
+        # rt.render() is a synchronous C++ call and no Python runs until it returns, so
+        # cancel latency cannot be shorter than one probe and no design in this plugin
+        # pretends otherwise. The measured probe time is written in here at run time by
+        # _set_cancel_cost, so the artist knows the number BEFORE they need it.
+        # ESC is offered as "try", not promised: every probe renders vfb:false quiet:true
+        # precisely so it does not steal focus, and whether ESC still reaches V-Ray under
+        # that is an on-box calibration item. (2026-07-31)
+        self.btn_cancel.setToolTip(
+            "Cancel after the current render.\n"
+            "A V-Ray frame cannot be interrupted once it has started — try pressing ESC "
+            "on the Max window to abort the frame itself.")
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.clicked.connect(self._cancel_match)
         bar.addWidget(self.btn_cancel)
@@ -917,8 +946,25 @@ class MaxGafferDock(QtWidgets.QWidget):
         """Main-thread slot. Qt widgets are never touched from the worker."""
         self.lbl_stage.setText(str(stage).upper())
         self._last_tick = "%d/%d   %3d%%   " % (done, total, int(pct))
-        self.lbl_pct.setText(self._last_tick + self._clock())
+        self.lbl_pct.setText(self._last_tick + self._clock() + self._eta(pct))
         self.bar.setValue(int(round(pct * 10)))
+
+    def _eta(self, pct: float) -> str:
+        """Remaining time from the SAME measured model that priced the run (I2).
+
+        The clock already tells the artist how long they have waited. What they are
+        actually deciding is whether to keep waiting, and that needs the other number —
+        priced from real timed probes of this scene, never from a guess."""
+        try:
+            est = self.ctrl.cost_estimate()
+        except Exception:  # noqa: BLE001 — a readout must never sink a match
+            return ""
+        if not est or pct <= 1.0:
+            return ""
+        remaining = est["minutes"] * max(0.0, 100.0 - float(pct)) / 100.0
+        if remaining < 1.0:
+            return ""
+        return "   ~%d min left" % int(round(remaining))
 
     def _clock(self) -> str:
         if not hasattr(self, "_elapsed"):
@@ -1558,7 +1604,7 @@ class MaxGafferDock(QtWidgets.QWidget):
 
     # ================================================================= scenario board
     def _open_scenarios(self):
-        if self._busy:
+        if self._run_blocked():
             return
         cam = self._current_camera()
         if not cam:
@@ -1581,8 +1627,17 @@ class MaxGafferDock(QtWidgets.QWidget):
             self._log(f"✗ board: {err}")
         finally:
             self._busy = False
+            # the zombie has RETURNED — a new run may start again. Only the run itself
+            # can clear this; _force_release only ever sets it. This block was the one
+            # of the four that forgot, so a single force-release taken during the board
+            # left _detached True with nothing able to clear it: MATCH, MATCH ALL,
+            # REFINE and BOARD were all blocked by _run_blocked for the life of the dock,
+            # and reload_dock.py was the only way out. (2026-07-31)
+            self._detached = False
+            self._ab_on_pre = False
             for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
                 b.setEnabled(True)
+                b.setToolTip("")
             self.btn_cancel.setEnabled(False)
         if not results:
             return
@@ -1644,7 +1699,7 @@ class MaxGafferDock(QtWidgets.QWidget):
 
     # ================================================================= match
     def _start_match(self):
-        if self._busy:
+        if self._run_blocked():
             return
         cam = self._current_camera()
         if not cam:
@@ -1674,6 +1729,7 @@ class MaxGafferDock(QtWidgets.QWidget):
                       self.btn_board):
                 b.setEnabled(False)
             self.btn_cancel.setEnabled(True)
+            self.btn_cancel.setText("✕")
             mode = self.cmb_mode.currentIndex()   # 0 standard 1 hero 2 loop-only 3 fast
             self.log.clear()
             self._progress_begin("reading the reference")
@@ -1696,7 +1752,9 @@ class MaxGafferDock(QtWidgets.QWidget):
                                 bool(self.cfg.auto_execute_plan))
                       or PlanPreviewDialog(lines, meta, self).exec()):
                     self._log(f"— executing plan ({len(ops)} ops) —")
-                    plan_report = self.ctrl.execute_plan(ops, cam, log=self._log)
+                    plan_report = self.ctrl.execute_plan(
+                        ops, cam, log=self._log,
+                        should_cancel=lambda: self._cancel)
                 else:
                     self._log("plan declined — continuing with the match loop only")
             self._progress_stage("matching")
@@ -1726,9 +1784,18 @@ class MaxGafferDock(QtWidgets.QWidget):
                               f"this, your eyes can")
             if getattr(result, "ceiling_proven", False) and (result.best_score or 0) < 95:
                 vflags.append("ceiling proven — the remaining gap is content, not lighting")
+            # I6 — the headline the artist needed on 2026-07-30 and never got. It goes
+            # FIRST in the flag list, because "this does not look like your reference" is
+            # not a footnote to a score, it outranks it.
+            if getattr(result, "unlike_reference", False):
+                vflags[:0] = ["THIS DOES NOT LOOK LIKE YOUR REFERENCE — "
+                              + "; ".join(result.unlike_reasons)]
             self._set_verdict(result.best_score,
                               getattr(result, "best_components", None), vflags)
-            self._log(f"✓ done ({result.stop_reason}) — best {score}{ceiling}")
+            self._log(("✗ done (%s) — %s but it DOES NOT LOOK LIKE YOUR REFERENCE"
+                       % (result.stop_reason, score))
+                      if getattr(result, "unlike_reference", False)
+                      else f"✓ done ({result.stop_reason}) — best {score}{ceiling}")
             self._set_match_thumb(result.best_render)
             headline = f"{cam} — {result.stop_reason}, score {score}"
             self._fill_changes(plan_report, self.ctrl.state_change_rows(cam), headline)
@@ -1746,25 +1813,47 @@ class MaxGafferDock(QtWidgets.QWidget):
                 self._log("   " + line)
         finally:
             self._busy = False
+            # the zombie has RETURNED — a new run may start again. Only the run itself
+            # can clear this; _force_release only ever sets it. (2026-07-31)
+            self._detached = False
             self._ab_on_pre = False
             for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
                 b.setEnabled(True)
+                b.setToolTip("")
             self.btn_cancel.setEnabled(False)
             self.refresh_cameras()
             self._show_reference(cam)
             self._log("· match UI settled")   # crash breadcrumb: last healthy step
     def _start_match_all(self):
-        if self._busy:
+        if self._run_blocked():
             return
         queue = [n for n, e in self.ctrl.session.cameras.items() if e.reference]
         if not queue:
             self._log("no cameras have references bound — bind references first")
             return
-        est = len(queue) * (int(self.cfg.max_iterations)
-                            + (self.cfg.sweep_count if self._opt(self.act_sweep, True) else 0))
+        # ONE budget, and priced in the artist's units where a price exists. This used to
+        # be max_iterations + sweep_count — 13 renders per camera against a real 190, in
+        # RENDERS rather than minutes, with polish omitted entirely. A 45-camera queue was
+        # quoted 585 renders for what is nearer 8,550. (2026-07-31)
+        per_cam = sum(s.count for s in profiles.planned_renders(
+            profiles.resolve_profile(
+                "standard", loop_width=self.cfg.loop_width,
+                loop_height=self.cfg.loop_height,
+                max_iterations=self.cfg.max_iterations,
+                sweep_count=self.cfg.sweep_count, target_score=self.cfg.target_score),
+            do_sweep=self._opt(self.act_sweep, True)))
+        est = len(queue) * per_cam
+        seconds = self._cancel_wait_seconds()
+        cost = (f"\n≈ {est * seconds / 3600.0:.1f} hours at this scene's measured "
+                f"{seconds:.0f} s a render." if seconds else
+                "\nNo render has been timed on this scene yet, so there is no honest "
+                "time estimate — the first camera's first probe will produce one.")
         if QtWidgets.QMessageBox.question(
                 self, "Match ALL",
-                f"Match {len(queue)} camera(s) sequentially (~{est} loop renders total)?\n"
+                f"Match {len(queue)} camera(s) sequentially?\n"
+                f"Up to {est} renders total ({per_cam} per camera).{cost}\n"
+                f"Questions will be answered from their defaults and logged — an "
+                f"unattended queue cannot wait for you.\n\n"
                 f"{', '.join(queue)}",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
         ) != QtWidgets.QMessageBox.Yes:
@@ -1792,9 +1881,13 @@ class MaxGafferDock(QtWidgets.QWidget):
             self._log(f"✗ batch: {err}")
         finally:
             self._busy = False
+            # the zombie has RETURNED — a new run may start again. Only the run itself
+            # can clear this; _force_release only ever sets it. (2026-07-31)
+            self._detached = False
             self._ab_on_pre = False
             for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
                 b.setEnabled(True)
+                b.setToolTip("")
             self.btn_cancel.setEnabled(False)
             self.refresh_cameras()
     def _cancel_match(self):
@@ -1812,8 +1905,19 @@ class MaxGafferDock(QtWidgets.QWidget):
         kind of lie."""
         if not self._cancel:
             self._cancel = True
-            self._log("cancelling after the current step… (press ✕ again to force the "
-                      "controls back if it does not respond)")
+            # ACKNOWLEDGE THE PRESS BEFORE THE NEXT RENDER. On 2026-07-30 the artist
+            # pressed ✕ repeatedly over many minutes and nothing happened — correctly,
+            # per the code, because the renders owned Max's main thread and the first
+            # event pump was inside _log, i.e. AFTER the probe. Repainting the button with
+            # the MEASURED bound is the difference between "it ignored me" and "it heard
+            # me and this is how long it takes". (2026-07-31)
+            self.btn_cancel.setText(self._cancel_cost_label())
+            wait = self._cancel_wait_seconds()
+            self._log("cancelling after the current render"
+                      + (f" — up to {wait:.0f} s, measured on this scene" if wait else "")
+                      + "… (press ✕ again to force the controls back if it does not "
+                        "respond)")
+            QtWidgets.QApplication.processEvents()
             return
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle("Release the controls?")
@@ -1836,7 +1940,21 @@ class MaxGafferDock(QtWidgets.QWidget):
 
     def _force_release(self, why: str):
         self._busy = False
-        self._cancel = False
+        # NOT self._cancel = False. That line is the bug: the zombie's next checkpoint
+        # read False and the run resumed as if ✕ had never been pressed. Detaching means
+        # the UI stops waiting; it does not mean the artist changed their mind.
+        self._detached = True
+        # …and the run's write-backs are void from here. The dialog promises the result
+        # "will be discarded"; before this only the DOCK's return value was, while the
+        # controller went on to apply state, record the match and save the session
+        # minutes later. Bumping the generation is what makes the promise true.
+        try:
+            self.ctrl._generation += 1
+        except Exception:  # noqa: BLE001 — releasing the UI must never fail
+            pass
+        for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
+            b.setToolTip("A previous run is still finishing — MaxGaffer will not start a "
+                         "second one over it.")
         if getattr(self, "_beat", None) is not None:
             self._beat.stop()
         for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
@@ -1845,6 +1963,64 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.lbl_stage.setText("RELEASED")
         self.lbl_pct.setText("")
         self._log("⚠ " + why)
+
+    def _cancel_wait_seconds(self) -> float:
+        """The MEASURED worst-case cancel latency: one probe at this scene's own cost.
+
+        Read from the controller's timing samples, which come from real renders of this
+        scene — never from a guess, and 0.0 when nothing has been timed yet."""
+        try:
+            est = self.ctrl.cost_estimate()
+        except Exception:  # noqa: BLE001
+            return 0.0
+        return float(est["seconds_each"]) if est else 0.0
+
+    def _cancel_cost_label(self) -> str:
+        wait = self._cancel_wait_seconds()
+        return f"CANCELLING — up to {wait:.0f} s" if wait else "CANCELLING…"
+
+    def _run_blocked(self) -> bool:
+        """True when a run must NOT be started: one is live, or one was detached.
+
+        The detached case is the important one. _force_release hands the buttons back
+        while the old run is still suspended inside processEvents(), so without this a
+        second run_match interleaves over ONE Controller — two runs sharing one sticky
+        abort flag, one plate history, one draft snapshot and one e.pre_match, with
+        prune_old_runs free to delete run 1's in-flight directory. (2026-07-31)"""
+        if self._busy:
+            return True
+        if self._detached:
+            self._log("⚠ RUN STILL FINISHING — the previous run was released but has not "
+                      "returned yet. Starting a second one would have both writing to the "
+                      "same scene and the same session. It will free up on its own; "
+                      "scripts/reload_dock.py is the escape hatch if it does not.")
+            return True
+        return False
+
+    def _ask_question(self, q) -> str:
+        """I5 — put a Question to the artist as a modal with one button per option.
+
+        Returns the chosen VALUE, or "" if the dialog was dismissed — which _escalate
+        reads as "no answer" and degrades to the question's own default, out loud. The
+        headline and the measured detail are already in the transcript by the time this
+        is called, so a dismissed dialog still leaves the evidence behind."""
+        try:
+            box = QtWidgets.QMessageBox(self)
+            box.setWindowTitle("MaxGaffer needs a decision")
+            box.setIcon(QtWidgets.QMessageBox.Question)
+            box.setText(str(q.headline))
+            box.setInformativeText(str(q.detail))
+            buttons = {}
+            for value, label in q.options:
+                role = (QtWidgets.QMessageBox.RejectRole if value == "stop"
+                        else QtWidgets.QMessageBox.AcceptRole)
+                buttons[box.addButton(str(label), role)] = value
+                if value == q.default:
+                    box.setDefaultButton(list(buttons)[-1])
+            box.exec()
+            return buttons.get(box.clickedButton(), "")
+        except Exception:  # noqa: BLE001 — a broken dialog degrades to the default
+            return ""
 
     def _set_match_thumb(self, path):
         if path and os.path.exists(path):
@@ -1856,7 +2032,7 @@ class MaxGafferDock(QtWidgets.QWidget):
         self.match_thumb.setText("no match yet")
 
     def _start_refine(self):
-        if self._busy:
+        if self._run_blocked():
             return
         cam = self._current_camera()
         note = self.cmb_note.currentText().strip()
@@ -1904,9 +2080,13 @@ class MaxGafferDock(QtWidgets.QWidget):
                 self._log("   " + line)
         finally:
             self._busy = False
+            # the zombie has RETURNED — a new run may start again. Only the run itself
+            # can clear this; _force_release only ever sets it. (2026-07-31)
+            self._detached = False
             self._ab_on_pre = False
             for b in (self.btn_match, self.btn_match_all, self.btn_refine, self.btn_board):
                 b.setEnabled(True)
+                b.setToolTip("")
             self.btn_cancel.setEnabled(False)
             self.refresh_cameras()
             self._show_reference(cam)
@@ -2307,8 +2487,49 @@ class SettingsDialog(QtWidgets.QDialog):
             "match. 'vantage' grabs the live-link window instead of rendering; it falls "
             "back to V-Ray, loudly, whenever the window is missing, covered, black or "
             "has not caught up with the last change. The sweep, everything tonal, the "
-            "final render and the plan-effect measurement stay on V-Ray.")
+            "final render and the plan-effect measurement stay on V-Ray.\n\n"
+            "It is NOT armed on V-Ray GPU: the grab path needs the live link up for the "
+            "whole match, and that combination can VRAM-starve one card and take Max "
+            "down (checklist #14).")
         form.addRow("probe backend", self.cmb_probe_backend)
+        # ---- the honesty layer's three settings (2026-07-31)
+        self.cmb_uncertainty = QtWidgets.QComboBox()
+        self.cmb_uncertainty.addItems(["ask", "assume", "abort"])
+        self.cmb_uncertainty.setCurrentText(
+            getattr(cfg, "uncertainty_policy", "ask") or "ask")
+        self.cmb_uncertainty.setToolTip(
+            "What happens when MaxGaffer does not know and it matters.\n"
+            "ask — it stops and asks you (a quadrant for the sun takes five seconds and "
+            "saves ~45 minutes of probing).\n"
+            "assume — it logs the safe default and carries on; this is what batch runs "
+            "use.\n"
+            "abort — it refuses rather than guess.")
+        form.addRow("when unsure", self.cmb_uncertainty)
+        self.sp_cost_ask = QtWidgets.QDoubleSpinBox()
+        self.sp_cost_ask.setRange(0.0, 600.0)
+        self.sp_cost_ask.setDecimals(0)
+        self.sp_cost_ask.setSpecialValueText("never ask")
+        self.sp_cost_ask.setValue(float(getattr(cfg, "cost_ask_minutes", 20.0)))
+        self.sp_cost_ask.setToolTip(
+            "Estimated MINUTES above which a match stops and asks before spending. The "
+            "estimate is priced from ONE real timed probe of your scene, so it is "
+            "measured rather than assumed. 0 disables the question (the estimate is "
+            "still always logged).")
+        form.addRow("ask above", self.sp_cost_ask)
+        self.cmb_preflight = QtWidgets.QComboBox()
+        self.cmb_preflight.addItems(["block", "warn", "off"])
+        self.cmb_preflight.setCurrentText(
+            getattr(cfg, "preflight_level", "block") or "block")
+        self.cmb_preflight.setToolTip(
+            "Preflight runs ~20 read-only checks in about 40 ms before any render: "
+            "distributed rendering pointed at a dead port, a reference that is gone, "
+            "whether the sun being steered is even switched on, an exposure host that "
+            "will not respond.\n"
+            "block — stop when continuing could only produce numbers that are not "
+            "measurements (six conditions).\n"
+            "warn — report everything, stop for nothing, and say that it did.\n"
+            "off — skip it, and say that too.")
+        form.addRow("preflight", self.cmb_preflight)
         self.cmb_backend = QtWidgets.QComboBox()
         self.cmb_backend.addItems(["vray", "vantage_cli"])
         self.cmb_backend.setCurrentText(
@@ -2382,6 +2603,9 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cfg.draft_sampler = bool(self.cb_draft.isChecked())
         self.cfg.probe_max_seconds = float(self.sp_probe_secs.value())
         self.cfg.probe_backend = self.cmb_probe_backend.currentText() or "vray"
+        self.cfg.uncertainty_policy = self.cmb_uncertainty.currentText() or "ask"
+        self.cfg.cost_ask_minutes = float(self.sp_cost_ask.value())
+        self.cfg.preflight_level = self.cmb_preflight.currentText() or "block"
         self.cfg.final_render_backend = self.cmb_backend.currentText() or "vray"
         self.cfg.artist_preference = self.cmb_preference.currentText() or "balanced"
         self.cfg.vantage_exe = self.ed_vantage_exe.text().strip()

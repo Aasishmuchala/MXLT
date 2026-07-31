@@ -119,7 +119,12 @@ def test_healthy_response_sets_neither_flag(monkeypatch, tmp_path):
     ctrl._verify_exposure_host(object(), str(tmp_path), log)
     assert getattr(ctrl, "_plate_linear", False) is False
     assert ctrl.cfg.software_exposure is False
-    assert log.lines == []
+    # A healthy host raises no WARNING — but the check is no longer silent either. Those
+    # two 160×90 renders were firing unannounced, which on TULA is ~2 minutes of silence
+    # right after "run dir: …", and the first of them is now this run's canary and its
+    # cost seed. (2026-07-31)
+    assert not any("⚠" in ln for ln in log.lines)
+    assert any("canary" in ln for ln in log.lines)
 
 
 def test_inert_response_still_turns_software_exposure_on(monkeypatch, tmp_path):

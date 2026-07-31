@@ -96,6 +96,8 @@ def render_frame(camera, out_path: str, width: int, height: int) -> Optional[str
 def render_probe(camera, out_path: str, width: int, height: int,
                  backend: str = "vray",
                  log: Optional[Callable[[str], None]] = None,
+                 fallback: bool = True,
+                 should_cancel: Optional[Callable[[], bool]] = None,
                  ) -> Tuple[Optional[str], str]:
     """A PROBE frame — ``render_frame``, or a Vantage live-link window grab.
 
@@ -114,14 +116,36 @@ def render_probe(camera, out_path: str, width: int, height: int,
     Fails SAFE in one direction only: Vantage down, window missing, window covered, or
     a black grab all fall through to V-Ray with the reason logged. It never returns a
     picture whose provenance it cannot name — a wrongly-attributed frame is worse than
-    a slow one, because the critic will happily rank it."""
+    a slow one, because the critic will happily rank it.
+
+    ``fallback=False`` makes a refused Vantage grab return ``(None, "vantage")`` instead
+    of a V-Ray plate. Added 2026-07-31 for the sun solve: its 44 probes are RANKED AGAINST
+    EACH OTHER on the hot-patch map, and ``highlight_similarity``'s presence half is gated
+    on the ABSOLUTE ``metrics.HOT_THRESHOLD``, so mixing a V-Ray plate into a table of
+    tonemapped Vantage grabs is a systematic offset between the two halves of one
+    comparison — and it also moves ``CROSS_DOMAIN_AGREEMENT`` and ``DECISIVE_MARGIN``,
+    which decide which branch of the solver runs and what confidence it reports.
+    ``sunsolve.probe`` treats None as a skip, so the grid loses a few samples of ONE
+    domain instead of gaining samples of a second.
+
+    ``should_cancel`` is forwarded to the settle poll. That poll sleeps up to
+    ``vgrab.SETTLE_LIMIT_S`` on Max's MAIN THREAD, and 44 probes of it is ~26 s of dock
+    that does not answer ✕ — main-thread blocking introduced by the very commit whose
+    motivation was an artist unable to cancel. The predicate existed in ``vgrab`` from
+    2026-07-31 and no production caller passed it, which made the fix inert; this is the
+    wire."""
     if str(backend).lower() == "vantage":
-        path = vgrab.capture_window_png(vgrab.VANTAGE_TITLE, out_path, width, height)
+        path = vgrab.capture_window_png(vgrab.VANTAGE_TITLE, out_path, width, height,
+                                        should_cancel=should_cancel)
         if path:
             return path, "vantage"
         if log:
             log(f"probe: Vantage grab unavailable ({vgrab.last_error()}) — "
-                "this probe and the rest of the run render in V-Ray")
+                + ("this probe is SKIPPED rather than mixed into the grid as a V-Ray "
+                   "plate" if not fallback else
+                   "this probe and the rest of the run render in V-Ray"))
+        if not fallback:
+            return None, "vantage"
     return render_frame(camera, out_path, width, height), "vray"
 
 

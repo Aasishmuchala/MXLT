@@ -11,8 +11,11 @@ picker, every tone stage and the delivered render are all V-Ray (controller.py:1
 
 Stdlib ``ctypes`` + ``core.png_min`` only — NO Pillow. Max 2026's embedded Python ships
 neither numpy nor Pillow (that is why png_min exists at all), so a capture path that needs
-either is a capture path that does not run on the box. ``ctypes.windll`` is touched only
-INSIDE functions, so this module imports cleanly off-Max and off-Windows.
+either is a capture path that does not run on the box. The Win32 DLLs are loaded through
+``_dlls()`` into handles PRIVATE to this module — never ``ctypes.windll``, which returns one
+shared object per process and caches argtypes/restype on it, so configuring it would break
+every other plugin in Max (see the G-11 note below). Loading is lazy, so this module still
+imports cleanly off-Max and off-Windows.
 
 Nothing here raises, ever. Every failure degrades to ``None`` plus a ``last_error()``
 string the caller logs, because the caller's fallback (render it in V-Ray) is correct —
@@ -49,6 +52,7 @@ angle this backend produced.
 
 from __future__ import annotations
 
+import ctypes          # stdlib everywhere; the Win32 DLL loads stay lazy (see _dlls)
 import os
 import time
 from typing import List, Optional, Sequence, Tuple
@@ -114,12 +118,89 @@ def _fail(msg: str) -> None:
     _LAST_ERROR = msg
 
 
+# --------------------------------------------------------------------------- win32 handles
+#
+# G-11, fixed 2026-07-31. ``ctypes.windll.user32`` returns ONE shared WinDLL object for the
+# whole Max process, and ctypes caches ``restype``/``argtypes`` ON THAT OBJECT. This module
+# was setting ``restype = c_void_p`` on GetDC/CreateCompatibleDC/CreateDIBSection/
+# SelectObject and — worse — installing a freshly-created private ``_Point`` class as
+# ``WindowFromPoint.argtypes`` on EVERY call. Any other plugin or startup script that later
+# called ``user32.WindowFromPoint(pt)`` then got
+#
+#     ctypes.ArgumentError: expected _Point instance instead of POINT
+#
+# because argtypes demanded THIS module's private class, freshly constructed, so even a
+# structurally identical POINT failed the identity check. Permanent until Max restarts, and
+# the blast radius is OTHER PEOPLE'S CODE.
+#
+# ``WinDLL(...)`` constructs a fresh object where ``windll.x`` returns the shared one, so
+# these three handles are private to this module and nothing configured on them escapes.
+# ``_Point`` is hoisted to module scope for the same reason: one class, defined once.
+_U32 = None
+_G32 = None
+_DWM = None
+_K32 = None
+
+
+class _Point(ctypes.Structure):
+    """ONE class, defined once. It used to be redefined per call and installed as
+    ``WindowFromPoint.argtypes`` on the process-shared user32 handle, so every later
+    caller in the whole Max process had to pass an instance of a class that no longer
+    existed anywhere they could reach."""
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def _dlls():
+    """→ (user32, gdi32, dwmapi, kernel32), PRIVATE to this module, or Nones off-Windows."""
+    global _U32, _G32, _DWM, _K32
+    if _U32 is None:
+        try:
+            _U32 = ctypes.WinDLL("user32", use_last_error=True)
+            _G32 = ctypes.WinDLL("gdi32", use_last_error=True)
+            _DWM = ctypes.WinDLL("dwmapi")
+            _K32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        except Exception:  # noqa: BLE001 — not Windows, or a locked-down box
+            return None, None, None, None
+    return _U32, _G32, _DWM, _K32
+
+
+def _rows_from_bgrx(raw: bytes, width: int, height: int
+                    ) -> List[List[Tuple[int, int, int]]]:
+    """A GDI 32-bit top-down DIB buffer → rows of (r, g, b).
+
+    Extracted 2026-07-31 so the BGRX→RGB swizzle can be tested off-box. It is the single
+    most classic place in Win32 imaging to get red and blue backwards, it was untested by
+    all thirteen tests in test_vgrab.py, and an R/B swap materially changes the answer:
+    luminance is 0.2126·R + 0.0722·B, so swapping shifts which pixels clear
+    ``metrics.HOT_THRESHOLD`` and therefore the entire ranking the sun solve depends on.
+    """
+    rows: List[List[Tuple[int, int, int]]] = []
+    stride = width * 4
+    for y in range(height):
+        base = y * stride
+        line = raw[base:base + stride]
+        # BGRX → RGB, dropping the unused alpha byte GDI leaves at 0
+        rows.append([(line[x + 2], line[x + 1], line[x]) for x in range(0, stride, 4)])
+    return rows
+
+
 def reset_settle() -> None:
     """Forget the last run's final frame. A run that starts by comparing against a picture
     from an hour ago would pass its freshness test on the strength of the artist having
     moved the camera in between, which is not evidence about THIS probe."""
     global _LAST_SIGNATURE
     _LAST_SIGNATURE = None
+
+
+def last_signature() -> Optional[List[float]]:
+    """The coarse signature of the last ACCEPTED grab, or None after ``reset_settle``.
+
+    Public so preflight's stability gate can compare two grabs without re-deriving the
+    crop. Added 2026-07-31: ``check_vantage_armed``'s docstring promised a two-grab
+    comparison and its body took ONE grab and checked only that it returned a path, which
+    is the one condition a scene mid-ingest also satisfies.
+    """
+    return list(_LAST_SIGNATURE) if _LAST_SIGNATURE is not None else None
 
 
 # --------------------------------------------------------------------------- process ids
@@ -153,7 +234,9 @@ def _pids_for_image(name: str = VANTAGE_IMAGE) -> Tuple[int, ...]:
     pids: List[int] = []
     snapshot = None
     try:
-        k32 = ctypes.windll.kernel32
+        _u, _g, _d, k32 = _dlls()
+        if k32 is None:
+            return ()
         k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
         snapshot = k32.CreateToolhelp32Snapshot(0x00000002, 0)   # TH32CS_SNAPPROCESS
         if not snapshot or snapshot == wintypes.HANDLE(-1).value:
@@ -170,7 +253,7 @@ def _pids_for_image(name: str = VANTAGE_IMAGE) -> Tuple[int, ...]:
     finally:
         try:
             if snapshot:
-                ctypes.windll.kernel32.CloseHandle(snapshot)
+                _dlls()[3].CloseHandle(snapshot)
         except Exception:  # noqa: BLE001
             pass
     return tuple(pids)
@@ -201,13 +284,13 @@ def _window_rect(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
         rect = wintypes.RECT()
         try:
             # DWMWA_EXTENDED_FRAME_BOUNDS = 9
-            hr = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            hr = _dlls()[2].DwmGetWindowAttribute(
                 wintypes.HWND(hwnd), ctypes.c_uint(9), ctypes.byref(rect),
                 ctypes.sizeof(rect))
         except Exception:  # noqa: BLE001
             hr = -1
         if hr != 0:
-            if not ctypes.windll.user32.GetWindowRect(wintypes.HWND(hwnd),
+            if not _dlls()[0].GetWindowRect(wintypes.HWND(hwnd),
                                                       ctypes.byref(rect)):
                 return None
         return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
@@ -238,7 +321,9 @@ def _client_rect(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
     except Exception:  # noqa: BLE001
         return None
     try:
-        user32 = ctypes.windll.user32
+        user32 = _dlls()[0]
+        if user32 is None:
+            return None
         rect = wintypes.RECT()
         if not user32.GetClientRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
             return None
@@ -300,7 +385,9 @@ def _enum_candidates(pids: Sequence[int]) -> List[Tuple]:
         return []
     found: List[Tuple] = []
     try:
-        user32 = ctypes.windll.user32
+        user32 = _dlls()[0]
+        if user32 is None:
+            return []
         proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
         def _visit(hwnd, _lparam):
@@ -319,7 +406,7 @@ def _enum_candidates(pids: Sequence[int]) -> List[Tuple]:
                     return True
                 cloaked = ctypes.c_int(0)
                 try:   # DWMWA_CLOAKED = 14
-                    ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                    _dlls()[2].DwmGetWindowAttribute(
                         hwnd, ctypes.c_uint(14), ctypes.byref(cloaked),
                         ctypes.sizeof(cloaked))
                 except Exception:  # noqa: BLE001 — no dwmapi: nothing is cloaked
@@ -405,11 +492,10 @@ def _occluded_fraction(hwnd: int, rect: Tuple[int, int, int, int]) -> Optional[f
     if w <= 0 or h <= 0:
         return None
 
-    class _Point(ctypes.Structure):
-        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
     try:
-        user32 = ctypes.windll.user32
+        user32 = _dlls()[0]
+        if user32 is None:
+            return None
         user32.WindowFromPoint.restype = wintypes.HWND
         user32.WindowFromPoint.argtypes = [_Point]
         user32.GetAncestor.restype = wintypes.HWND
@@ -476,7 +562,9 @@ def _grab_rows(rect: Tuple[int, int, int, int], width: int,
 
     screen_dc = mem_dc = dib = old = None
     try:
-        user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+        user32, gdi32, _dwm, _k32 = _dlls()
+        if user32 is None:
+            return None
         for fn in (user32.GetDC, gdi32.CreateCompatibleDC, gdi32.CreateDIBSection,
                    gdi32.SelectObject):
             fn.restype = ctypes.c_void_p          # 64-bit handles must not truncate
@@ -514,26 +602,18 @@ def _grab_rows(rect: Tuple[int, int, int, int], width: int,
         return None
     finally:
         try:
-            import ctypes as _ct
-
+            _u32, _g32, _dwm2, _k322 = _dlls()
             if old:
-                _ct.windll.gdi32.SelectObject(_ct.c_void_p(mem_dc), _ct.c_void_p(old))
+                _g32.SelectObject(ctypes.c_void_p(mem_dc), ctypes.c_void_p(old))
             if dib:
-                _ct.windll.gdi32.DeleteObject(_ct.c_void_p(dib))
+                _g32.DeleteObject(ctypes.c_void_p(dib))
             if mem_dc:
-                _ct.windll.gdi32.DeleteDC(_ct.c_void_p(mem_dc))
+                _g32.DeleteDC(ctypes.c_void_p(mem_dc))
             if screen_dc:
-                _ct.windll.user32.ReleaseDC(None, _ct.c_void_p(screen_dc))
+                _u32.ReleaseDC(None, ctypes.c_void_p(screen_dc))
         except Exception:  # noqa: BLE001
             pass
-    rows: List[List[Tuple[int, int, int]]] = []
-    stride = w_out * 4
-    for y in range(h_out):
-        base = y * stride
-        line = raw[base:base + stride]
-        # BGRX → RGB, dropping the unused alpha byte GDI leaves at 0
-        rows.append([(line[x + 2], line[x + 1], line[x]) for x in range(0, stride, 4)])
-    return rows
+    return _rows_from_bgrx(raw, w_out, h_out)
 
 
 def _all_black(rows: Sequence[Sequence[Tuple[int, int, int]]]) -> bool:
@@ -589,14 +669,19 @@ def _moved(sig: Sequence[float], prev: Sequence[float]) -> bool:
     return max(abs(a - b) for a, b in zip(sig, prev)) >= SETTLE_DELTA
 
 
-def _settled_rows(rect: Tuple[int, int, int, int], width: int, height: int, rows):
+def _settled_rows(rect: Tuple[int, int, int, int], width: int, height: int, rows,
+                  should_cancel=None):
     """Poll until the window shows a picture the PREVIOUS probe did not → (rows, sig).
 
     → (None, []) when the budget runs out without the frame moving, which the caller turns
-    into a refusal: one refusal disarms the backend for the run (controller.py:661-662) and
-    the run finishes in V-Ray, slowly and correctly. That is the right trade — a sun angle
-    solved off frames that all predate their own apply is not a cheaper answer, it is a
-    different question answered confidently.
+    into a refusal. Three consecutive refusals disarm the backend for the run and the rest
+    finishes in V-Ray, slowly and correctly. That is the right trade — a sun angle solved
+    off frames that all predate their own apply is not a cheaper answer, it is a different
+    question answered confidently.
+
+    ``should_cancel`` is consulted every step (2026-07-31). This loop sleeps up to 0.6 s
+    per probe and 44 probes is up to 26 seconds of unresponsive dock, which is main-thread
+    blocking added by a commit whose stated motivation was an artist unable to cancel.
     """
     prev = _LAST_SIGNATURE
     sig = _signature(rows)
@@ -605,6 +690,13 @@ def _settled_rows(rect: Tuple[int, int, int, int], width: int, height: int, rows
     # out the budget instead of comparing and take what is on screen at the end of it. One
     # 0.6 s pause per run is the induction base for every probe after it.
     while (prev is None or not _moved(sig, prev)) and time.monotonic() < deadline:
+        if should_cancel is not None:
+            try:
+                if should_cancel():
+                    _fail("cancelled while waiting for the live link to deliver")
+                    return None, []
+            except Exception:  # noqa: BLE001 — a broken predicate must not wedge the poll
+                pass
         time.sleep(max(0.0, float(SETTLE_STEP_S)))
         fresh = _grab_rows(rect, width, height)
         if not fresh:
@@ -618,7 +710,7 @@ def _settled_rows(rect: Tuple[int, int, int, int], width: int, height: int, rows
 
 
 def capture_window_png(title_substr: str, out_path: str,
-                       width: int, height: int) -> Optional[str]:
+                       width: int, height: int, should_cancel=None) -> Optional[str]:
     """Grab the Vantage live-link window into an 8-bit RGB PNG at probe size → path/None.
 
     find → client rect → aspect crop → occlusion → grab → settle → black test → write.
@@ -656,9 +748,22 @@ def capture_window_png(title_substr: str, out_path: str,
     if not rows:
         _fail("the screen capture returned no pixels")
         return None
-    rows, sig = _settled_rows(rect, width, height, rows)
+    rows, sig = _settled_rows(rect, width, height, rows, should_cancel)
     if not rows:
         return None                       # _settled_rows already named the reason
+    # G-5, 2026-07-31: RE-VERIFY OCCLUSION ON THE FRAME THAT IS ACTUALLY RETURNED.
+    # The check above ran on a frame _settled_rows then threw away — it re-grabs up to
+    # twelve more times, unchecked — so a toast or a tooltip appearing during the 0.6 s
+    # poll was not merely missed, it was CERTIFIED: the popup moves the picture by far
+    # more than SETTLE_DELTA, so _moved returns True immediately and the freshness guard
+    # waves the popup's pixels straight through as "the live link delivered". 144
+    # WindowFromPoint calls, microseconds.
+    covered_now = _occluded_fraction(int(hwnd), rect)
+    if covered_now is None or covered_now > OCCLUSION_LIMIT:
+        _fail("something appeared over the Vantage window while the live link was "
+              "delivering — the frame that was going to be returned is not verifiably "
+              "Vantage's")
+        return None
     if _all_black(rows):
         _fail("the Vantage grab came back black (window covered, minimising, or the "
               "viewport is not drawing)")

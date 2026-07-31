@@ -84,7 +84,17 @@ def consolidate_analyses(samples: List[Dict]) -> Dict:
     if not samples:
         raise ValueError("no analysis samples to consolidate")
     if len(samples) == 1:
-        return dict(samples[0])
+        out = dict(samples[0])
+        # STAMP THE ABSENCE, do not launder it into a measurement. ``spread`` is undefined
+        # for N=1, so computing a number here would say "these samples agreed" about a
+        # sample that had nothing to agree with. The controller reads a missing agreement
+        # key as 1.0 — full trust — which is how ``analyze_samples: 1`` (a documented
+        # config value) silently bought the reading a quarter of the match objective.
+        # 0.0 with a None spread lets the CONSUMER say "one sample, no agreement
+        # evidence", which is the true statement. (2026-07-31)
+        out.setdefault("sun_bearing_agreement", 0.0)
+        out.setdefault("sun_bearing_spread_deg", None)
+        return out
     best = max(samples, key=lambda s: float(s.get("confidence", 0.0)))
     out: Dict = {}
     for key in samples[0]:

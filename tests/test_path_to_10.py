@@ -330,7 +330,11 @@ def test_verify_exposure_host_flips_flag_on_inert_host(tmp_path, monkeypatch):
     monkeypatch.setattr(expmod, "ExposureHost", FakeHost)
 
     def fake_render(cam, out, w, h):
-        Image.new("RGB", (16, 16), (140, 140, 140)).save(out)   # identical both probes
+        # the canary (2026-07-31) BLOCKS a plate that is not the size it asked for —
+        # render_frame has three layered size spellings and a build where all three fall
+        # through saves a valid frame at SCENE resolution, which compute_stats then
+        # downsamples so the numbers look normal. Honour the requested size here.
+        Image.new("RGB", (w, h), (140, 140, 140)).save(out)     # identical both probes
         return out
 
     monkeypatch.setattr(ctl.rd, "render_frame", fake_render)

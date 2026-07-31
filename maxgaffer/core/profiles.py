@@ -8,6 +8,7 @@ which avoids resolution-dependent score drift while still saving expensive probe
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import List, Optional
 
 
 @dataclass(frozen=True)
@@ -65,7 +66,91 @@ class MatchProfile:
 
     @property
     def worst_case_renders(self) -> int:
-        return self.max_iterations + self.sweep_count + self.polish_max_probes
+        """DEPRECATED — kept because tests and the public API assert on it.
+
+        It counts iterations + sweep + polish and NOTHING else, which on a standard
+        profile is 133 of the 190 renders a match can actually fire: it omits the
+        multi-start basin (≤6), the two tone-align passes, the sun solve (up to 44), the
+        two exposure-host plates, the two plan probes and the final full re-render. The
+        artist was quoted 133 and charged 190 — roughly an hour of extra TULA renders that
+        nobody had agreed to. ``planned_renders`` is the one budget; this stays only so
+        old callers keep working, and it is derived from the new function so the two can
+        never drift apart again.
+        """
+        return sum(s.count for s in planned_renders(
+            self, do_sweep=True, has_sun=False, multi_start=False,
+            exposure_free=False, plan_ran=False, verify_exposure=False,
+            final_render=False))
+
+
+@dataclass(frozen=True)
+class Stage:
+    """One budgeted block of renders, at ONE resolution.
+
+    ``count`` is the WORST case for that stage — what the artist could be charged, which
+    is the only honest number to quote before committing. The resolution rides along
+    because pricing needs it: on a heavy scene 181 of a standard profile's 190 renders are
+    the same 240×135 size, so one timed probe at that size prices 96% of the match.
+    """
+    key: str
+    label: str
+    count: int
+    width: int
+    height: int
+
+
+def planned_renders(profile: "MatchProfile", *, do_sweep: bool = True,
+                    has_sun: bool = True, multi_start: bool = True,
+                    n_scenarios: int = 6, exposure_free: bool = True,
+                    plan_ran: bool = False, verify_exposure: bool = True,
+                    final_render: bool = True,
+                    ref_has_patches: bool = True) -> List[Stage]:
+    """EVERY render a match can fire, as ordered stages. ONE budget, one source of truth.
+
+    Written 2026-07-31. There were two hand-maintained copies of this number and they
+    disagreed: ``controller.run_match`` computed ``hard_cap = max_iterations + sweep +
+    polish`` = 133 and printed it to the artist, while its own progress bar's
+    ``_stage_budget`` a few lines later knew about the basin (6) and the sun solve (44)
+    and totalled 183 — and neither counted the tone-align passes, the exposure-host
+    plates, the plan probes or the final full re-render. The true worst case on a standard
+    profile is 190. Being short by 57 renders on TULA is being short by an hour.
+
+    Same failure shape as the draft-cap bug 29bbae6 fixed: two sources of truth for one
+    setting. Both callers now derive from this.
+    """
+    from . import sunsolve                    # local: keeps the module import-cheap
+
+    sweep_size = (profile.sweep_width, profile.sweep_height)
+    loop_size = (profile.loop_width, profile.loop_height)
+    stages: List[Stage] = []
+    if verify_exposure:
+        # _verify_exposure_host fires TWO 160×90 rd.render_frame calls with no
+        # announcement at all — on TULA that is ~2 minutes of silence right after
+        # "run dir: …". They are renders; they are counted.
+        stages.append(Stage("evcheck", "exposure-host check", 2, 160, 90))
+    if plan_ran:
+        stages.append(Stage("plan", "plan effect", 2, *loop_size))
+    if multi_start:
+        stages.append(Stage("basin", "multi-start", max(1, int(n_scenarios)),
+                            *sweep_size))
+    if has_sun and exposure_free:
+        stages.append(Stage("tone", "tone-align", 2, *sweep_size))
+    if has_sun and ref_has_patches:
+        coarse = int(getattr(sunsolve, "COARSE_AZIMUTHS", 12)) * len(
+            sunsolve.COARSE_ALTITUDES)
+        fine = len(sunsolve.FINE_AZIMUTH_OFFSETS) + len(sunsolve.FINE_ALTITUDE_OFFSETS)
+        stages.append(Stage("sunsolve", "sun solve", coarse + fine, *sweep_size))
+    if do_sweep:
+        stages.append(Stage("sweep", "sun sweep", max(0, int(profile.sweep_count)),
+                            *sweep_size))
+    stages.append(Stage("iter", "match loop", max(1, int(profile.max_iterations)),
+                        *loop_size))
+    if profile.polish and profile.polish_max_probes:
+        stages.append(Stage("polish", "polish", int(profile.polish_max_probes),
+                            *profile.polish_size))
+    if final_render:
+        stages.append(Stage("final", "final re-render", 1, *loop_size))
+    return [s for s in stages if s.count > 0]
 
 
 def _scaled(width: int, height: int, scale: float, floor_w: int = 160):

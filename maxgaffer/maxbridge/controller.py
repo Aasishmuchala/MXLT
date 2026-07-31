@@ -20,12 +20,13 @@ import subprocess
 import time
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from ..core import (animation, consensus, critic, domeseed, expose, fairness, feedback,
-                    transfer,
+from ..core import (animation, ask as askmod, consensus, critic, domeseed, expose,
+                    fairness, feedback, plate, png_min, transfer,
                     metrics, omega, planner, profiles, prompts, providers, rules,
                     scenedigest, solver, sunsolve, refread, scenarios as scen)
 from ..core.director import (Hooks, MatchConfig, MatchResult, TRANSFER_WEIGHT,
                              blend_transfer, run_match, run_sun_sweep)
+from ..core.errors import MatchCancelled, PreflightBlocked
 from ..core.genome import LightingState
 from ..core.parse import ParseError, validate_analysis
 from ..core.session import (Session, preset_dumps, preset_loads, reference_signature,
@@ -36,6 +37,7 @@ from . import digest as dg
 from . import draft as df
 from . import execute as ex
 from . import render as rd
+from . import preflight as pf
 from . import scene as sc
 from . import vantage as vt
 
@@ -45,6 +47,68 @@ MAX_FIRST_EXTS = (".exr", ".hdr", ".tif", ".tiff")
 # director's notes are persisted AND pinned into every DELTAS prompt of the ensemble and
 # the whole deep match — cap their SIZE (the [-6:] list cap only bounds their count)
 MAX_NOTE_CHARS = 500
+
+#: Seconds of cancel latency above which the run STOPS AND ASKS rather than committing.
+#:
+#: A module constant, deliberately NOT a config field. I3 says cancel responsiveness is an
+#: invariant with a bounded worst case; ``draft_sampler`` and ``probe_max_seconds`` being
+#: config fields is exactly how 2026-07-30 ended up with no bound at all — they were on
+#: disk, the Options menu overwrote them, and nothing said so.
+#:
+#: A V-Ray frame in flight CANNOT be aborted from Python: rt.render() is a synchronous C++
+#: call and Python does not execute again until it returns, so polling cannot run during
+#: the window it needs to act in. Cancel latency therefore cannot be reduced below one
+#: probe, and the honest invariant is not "cancel is instant" but "after ✕ the artist
+#: waits at most one probe, and that number was measured and stated before the run
+#: committed". 15 s is roughly where waiting stops feeling like waiting.
+CANCEL_LATENCY_BUDGET_S = 15.0
+
+#: The reality check's thresholds (I6). Weakest-link: ANY of the three fires.
+#:
+#: Warm/cool inversion. critic's colour component is 1 - d_lab/30, so 0.35 is a LAB
+#: distance of ~19.5 — about a full golden-hour-to-dusk swing, far outside white-balance
+#: residual. On 2026-07-30 the delivered frame was a cool sunless dusk courtyard against a
+#: warm golden-hour reference and no stage of the pipeline ever said so.
+UNLIKE_REFERENCE_COLOR = 0.35
+#: The reference has directional light and the render essentially does not. The existing
+#: 0.75 line says "not landing the same way"; this says "not there".
+UNLIKE_REFERENCE_HIGHLIGHT = 0.35
+#: Below this the reference has no sun patch to be missing (sunsolve skips the solve
+#: entirely at 0.0), so the highlight term must not fire.
+REF_HAS_SUN_HOT_FRAC = 0.02
+#: The absolute floor, set at the BASIN gate's number rather than higher. This repo's own
+#: recorded scores include legitimate basins at 77.6 and 80.35 and structurally-wrong-but-
+#: plausible finished matches at 63.2 and 77.21; 45 is below every legitimate number ever
+#: measured on this box and above every black-frame number (2.7-12.0), so it can only fire
+#: on garbage. The colour and highlight terms carry the discrimination.
+UNLIKE_REFERENCE_SCORE = 45.0
+#: The multi-start basin floor (gate 3). Same number, same argument: the black frames of
+#: 2026-07-30 scored 12.0, 10.9, 8.7 and 2.7 and the picker announced a "best basin" from
+#: them within ~7 renders. Nothing this tool can adjust gets from 12 to a match.
+BASIN_FLOOR_SCORE = 45.0
+#: sun_bearing_agreement below which the direction gate asks the artist. 0.34 is a
+#: circular spread above 40° — the samples cannot agree on a QUADRANT, which is the
+#: coarsest thing a human answers in five seconds. consensus.py already calls 60° "no
+#: confidence"; 40° is where the reading stops constraining anything the grid could not
+#: find faster. It sits below refread's established 0.75 for the opposite reason: this
+#: gate spends an hour of an artist's day when it fires, so it should be shy about firing.
+BEARING_ASK_AGREEMENT = 0.34
+#: A quadrant is a quadrant, not an angle. An artist answering "over my left shoulder" has
+#: given ±45°, and locking the axis outright would forfeit refinement the render can still
+#: do — so the answer becomes a START VALUE plus this much slack, never a lock.
+QUADRANT_SLACK_DEG = 45.0
+
+#: How much confidence a cost basis string carries, worst last. ``cost_estimate`` quotes
+#: the WEAKEST basis across the priced stages, because a headline built partly out of an
+#: extrapolation is an extrapolation. (2026-07-31)
+_BASIS_ORDER = ("measured at this size", "affine fit", "scaled from", "EXTRAPOLATED")
+
+
+def _BASIS_RANK(basis: str) -> int:
+    for i, prefix in enumerate(_BASIS_ORDER):
+        if str(basis).startswith(prefix):
+            return i
+    return -1                 # "" — nothing priced yet
 
 
 def _needs_max_ingest(path: str) -> bool:
@@ -66,8 +130,108 @@ class Controller:
         # pure-I/O runner — the UI swaps in a worker-thread pump so gateway waits never
         # freeze Max; pymxs is NEVER called through this (network/subprocess only)
         self.io: Callable = lambda fn: fn()
+        # ESCALATION seam, wired exactly like ``io``: the dock swaps in a QMessageBox, a
+        # headless caller leaves it alone and cfg.uncertainty_policy decides. Core stays
+        # dialog-free. Added 2026-07-31 — on 2026-07-30 the analyzer knew it could not
+        # agree with itself and spent 90 minutes guessing instead of asking.
+        self.ask: Callable[[askmod.Question], str] = lambda _q: ""
         self._session_gen = sc.scene_generation()
+        # I3: one sticky latch, checked at the top of _render_exposed, which is the ONE
+        # function every render in the plugin passes through. Setting it bounds EVERY
+        # loop — polish's diagonal ride, tone-align, execute_plan, the basin picker, the
+        # board, the finals — without touching any of them, because none of them can
+        # render without coming through here. Forgetting a loop then costs one probe, not
+        # a run.
+        self._cancel_latch: str = ""
+        #: sticky: a validated black/near-black plate stops the run everywhere, once
+        self._probe_abort: str = ""
+        #: the CURRENT operation's cancel predicate, for the one place inside a render
+        #: that can still poll (see _begin_operation / _cancel_poll)
+        self._op_should_cancel: Callable[[], bool] = lambda: False
+        # I1: plate validation state. _plate_memo means stats_for() returns the dict
+        # _render_exposed already computed, so validating every frame costs LESS than the
+        # status quo, which computed it twice for the one guarded probe.
+        self._plate_memo: Tuple[str, Optional[Dict]] = ("", None)
+        self._plate_prev_sig: Tuple = ()
+        self._plate_prev_state: Optional[Dict] = None
+        self._frozen_run = 0
+        self._frozen_total = 0
+        self._frozen_escalated = False
+        self._skip_sun_stages = False
+        # I2: measured render timings, keyed by pixel count. Vantage samples are excluded
+        # at the source — a 50 ms grab pricing 181 V-Ray renders reads as "9 seconds".
+        self._render_times: Dict[int, List[float]] = {}
+        self._cold_seconds: Optional[float] = None
+        self._cost_stages: List = []
+        self._cost_reported = False
+        # I6: every fallback, degradation and skipped stage, replayed in the final report.
+        # They already log at the moment they happen and then scroll away under 190 THUMB
+        # lines; the ledger is what makes "announced" survive to the verdict.
+        self._degradations: List[str] = []
+        self._decisions: List[Dict] = []
+        #: stamped into every write-back path. A run the dock has DETACHED must not apply
+        #: state, record a match or save the session minutes later (see dock._force_release).
+        self._generation = 0
+        cfgmod.add_warn_sink(self._config_warn)
         sc.register_scene_callbacks()
+
+    # ------------------------------------------------------------------ I3 bookkeeping
+    def _begin_operation(self, should_cancel: Optional[Callable[[], bool]] = None
+                         ) -> None:
+        """A NEW artist-initiated operation starts uncancelled and un-aborted.
+
+        The two latches are one-way WITHIN an operation and are checked at the top of
+        ``_render_exposed`` — the one function every render passes through — so whatever
+        sets one bounds every loop. That is the point. But until 2026-07-31 only
+        ``run_match`` cleared them, and they were promoted to gate _render_exposed in the
+        same commit: after a ✕ or a black-frame abort, REFINE, the scenario board,
+        ``execute_plan``'s effect probes and the delivered finals all raised the stale
+        message before rendering a single pixel, for the rest of the Max session, and only
+        a fresh MATCH resurrected them. With ``plan_first`` it was worse — the dock runs
+        ``execute_plan`` BEFORE ``run_match``, so the next match died before reaching the
+        reset. Every entry point an artist can press now says so here.
+
+        It also records the operation's cancel predicate. A V-Ray frame is uninterruptible
+        and that is physics; the Vantage settle poll is a ``time.sleep`` loop on the main
+        thread and that is a choice — so it gets the predicate and the artist gets ✕ back
+        inside ``vgrab.SETTLE_STEP_S`` instead of ``SETTLE_LIMIT_S``.
+        """
+        self._cancel_latch = ""
+        self._probe_abort = ""
+        self._op_should_cancel: Callable[[], bool] = should_cancel or (lambda: False)
+
+    def _cancel_poll(self) -> bool:
+        """The predicate handed to anything that SLEEPS inside a render (I3)."""
+        if self._cancel_latch:
+            return True
+        try:
+            return bool(self._op_should_cancel())
+        except Exception:  # noqa: BLE001 — a broken predicate must not wedge a poll
+            return False
+
+    # ------------------------------------------------------------------ plumbing sinks
+    def _config_warn(self, msg: str) -> None:
+        """Config warnings land in the artist's transcript, not only Max's Listener.
+
+        29bbae6 added "config could not be read — using DEFAULTS" precisely because that
+        sentence was the difference between three lost hours and a two-second diagnosis on
+        2026-07-30, and then print()ed it into a window nobody reads. Buffered until a log
+        is available so a warning raised at construction is not lost."""
+        self._pending_warnings = getattr(self, "_pending_warnings", [])
+        self._pending_warnings.append(str(msg))
+
+    def _drain_warnings(self, log: Callable[[str], None]) -> None:
+        for msg in getattr(self, "_pending_warnings", []):
+            log(msg)
+        self._pending_warnings = []
+
+    def _degrade(self, log: Callable[[str], None], msg: str) -> None:
+        """Degrade LOUDLY, and remember it. One bad component must never kill a match —
+        but degrading SILENTLY is exactly what cost 2026-07-30, so every fallback lands
+        both in the transcript now and in the final report later."""
+        if msg not in self._degradations:
+            self._degradations.append(msg)
+        log("⚠ " + msg)
 
     # ------------------------------------------------------------------ scene / session
     def _bust_stale_caches(self) -> None:
@@ -80,6 +244,25 @@ class Controller:
             self._session_scene = None
             self._rig = None
             self._baselines = {}
+            # A cached MEASUREMENT must not outlive the thing it measured. The
+            # exposure-host verdict is a property of THIS renderer on THIS scene: a
+            # V-Ray GPU→CPU switch or a different .max left last scene's verdict
+            # governing every later run, silently double-applying EV on a host that bakes
+            # it in. Same for the plate-linear flag and the Pillow warning, which is only
+            # reset inside run_match and so was suppressed entirely for refine's branch
+            # probes. (2026-07-31)
+            self._exposure_host_checked = False
+            self._plate_linear = False
+            self._sw_warned = False
+            self._render_times = {}
+            self._cold_seconds = None
+            if getattr(self, "_sw_auto", False):
+                # ONLY the flag WE set off a measurement is cleared. cfg.software_exposure
+                # is also an artist Settings choice, and wiping that on every scene open
+                # would be this module deciding it knows better than the person who
+                # ticked it.
+                self.cfg.software_exposure = False
+                self._sw_auto = False
 
     @property
     def session(self) -> Session:
@@ -197,8 +380,13 @@ class Controller:
         if getattr(self.cfg, "capture_scene_states", True):
             try:
                 sc.capture_scene_state(camera_name)
-            except Exception:  # noqa: BLE001 — bookkeeping must never sink a good match
-                pass
+            except Exception as err:  # noqa: BLE001 — bookkeeping must never sink a match
+                # …but a bare `pass` here meant the artist believed their match was saved
+                # as a native Max Scene State INSIDE the .max file, travelling to whoever
+                # opens the scene, and it was not. (2026-07-31)
+                self._config_warn(f"the native Max Scene State could not be captured "
+                                  f"({err}) — this camera's look lives ONLY in "
+                                  f"MaxGaffer's sidecar, not in the .max file")
 
     def camera_fingerprint(self) -> Tuple:
         return tuple((c.get("id", ""), c.get("name", ""), c.get("class", ""))
@@ -252,6 +440,14 @@ class Controller:
 
     # ------------------------------------------------------------------ stats providers
     def stats_for(self, path: str) -> Optional[Dict]:
+        # MEMO, not a second engine: _render_exposed validates every plate and has to
+        # compute these anyway, and every caller then asks for them again one line later.
+        # Without this, validating every frame would double the stats cost of a match;
+        # with it, validating every frame is CHEAPER than the old one-shot guard, which
+        # computed the first probe's stats twice. Keyed by path, so it can never answer
+        # for a different image.
+        if path and path == self._plate_memo[0]:
+            return self._plate_memo[1]
         s = metrics.compute_stats(path)
         if s is not None:
             return s
@@ -434,6 +630,11 @@ class Controller:
                                             "JSON object, nothing else."}]
             samples.append(validate_analysis(self.io(lambda: self._semantic_call(
                 prompts.ANALYZE_SYSTEM, retry, 2048))))
+        if len(samples) < n:
+            # 2 of 3 samples unusable means the "consensus" is one read wearing a
+            # consensus's clothes, and nothing downstream could tell. (2026-07-31)
+            self._config_warn(f"analyze: {n - len(samples)} of {n} samples were unusable "
+                              f"— the consensus rests on {len(samples)}")
         semantics = consensus.consolidate_analyses(samples)
         agreement = semantics.pop("consensus_agreement", 1.0)   # kept out of the cache
         if (e.reference != ref_path or e.reference_signature != ref_signature
@@ -459,7 +660,14 @@ class Controller:
                 semantics,
                 refread.measure(self.ref_stats(ref_path), reading=semantics,
                                 path=ref_path))
-        except Exception:  # noqa: BLE001 — a measurement must never sink an analysis
+        except Exception as err:  # noqa: BLE001 — a measurement must never sink an analysis
+            # …and it must not disappear either. This bare except deleted the entire
+            # pixel-measured refinement of ANALYZE — the part that checks whether there is
+            # any directional light at all, what colour the illuminant is, how sharply
+            # shadows end — and left the raw model reading standing in its place with no
+            # sign that the measurement had been lost. (2026-07-31)
+            self._config_warn(f"the reference MEASUREMENT could not be fused ({err}) — "
+                              "this run uses the model's raw reading, unrefined by pixels")
             return semantics
 
     def _analyze_samples(self, path: str) -> Dict:
@@ -517,6 +725,9 @@ class Controller:
             if stale:
                 try:
                     read = self._analyze_samples(ref.path)
+                except (MatchCancelled, PreflightBlocked):
+                    raise               # a bare `continue` let reference #2 fire another
+                                        # three gateway calls after the artist pressed ✕
                 except (omega.OmegaError, RuntimeError):
                     continue            # a dead / unreadable angle must not kill the fusion
                 ref.signature = reference_signature(ref.path)
@@ -570,7 +781,15 @@ class Controller:
         down for this run. The analytic solver, metric-only sweep and critic still run:
         a dead gateway degrades the match, it must never abort it."""
         try:
-            return self.analyze_reference(camera_name)
+            out = self.analyze_reference(camera_name)
+            self._drain_warnings(log)   # e.g. "2 of 3 samples were unusable"
+            return out
+        except (MatchCancelled, PreflightBlocked):
+            # FIRST, and before the RuntimeError arm below would swallow it. A cancel
+            # reported as "⚠ gateway unavailable (cancelled) — ANALYTIC-ONLY run" then
+            # PROCEEDED on fabricated semantics: the artist pressed ✕ and the tool
+            # answered by starting a worse version of the same run. (2026-07-31)
+            raise
         except (omega.OmegaError, RuntimeError) as err:
             self._llm_down = True
             e = self.camera_entry(camera_name)
@@ -646,7 +865,48 @@ class Controller:
 
     def _render_exposed(self, cam, out_path: str, w: int, h: int, state=None,
                         entry=None, log: Optional[Callable[[str], None]] = None,
-                        probe: bool = False):
+                        probe: bool = False, validate: bool = True, tag: str = ""):
+        """The ONE render path — and therefore the one place I1, I2 and I3 are enforced.
+
+        Everything below happens on EVERY render in the plugin, because everything renders
+        through here: the loop, the board, the basin picker, the sun solve, refine's
+        ensemble branches, the plan probes, the fairness probe and the delivered finals.
+
+          * I3 — a sticky cancel latch is checked BEFORE the render starts, so ✕ is
+            bounded by one probe no matter which loop is running;
+          * I2 — the wall clock is measured and fed to the cost model;
+          * I1 — the returned plate is VALIDATED (black / near-black / wrong-size /
+            frozen / stale) before any caller is allowed to score it.
+
+        Written 2026-07-31. The 29bbae6 guard checked the FIRST probe only, and its own
+        comment names the worst case it was accepting: if the link dies at probe 50, the
+        remaining 83 probes and the delivered final are all ranked unvalidated. Doing it
+        here closes that, covers both backends, and covers the five scored paths the old
+        guard never saw at all — run_scenarios (where 2026-07-30's "12.0, 10.9, 8.7, 2.7"
+        appeared), probe_score, refine's branches, assess_fairness, and the final full
+        re-render that OVERWRITES result.best_score and hands it to the artist.
+
+        ``validate=False`` exists for exactly one caller — a reference transcode, which is
+        not a render and has no requested size to check against. No scored render uses it.
+        """
+        if self._cancel_latch:
+            raise MatchCancelled(self._cancel_latch)
+        if self._probe_abort:
+            # STICKY, and now bounding EVERY render rather than only render_hook's — the
+            # board, refine's branches and the finals all come through here too.
+            raise RuntimeError(self._probe_abort)
+        _t0 = time.time()
+        path = self._render_raw(cam, out_path, w, h, state=state, entry=entry, log=log,
+                                probe=probe)
+        used = getattr(self, "_last_render_backend", "vray")
+        self._observe_render(w, h, time.time() - _t0, used, log, started=_t0)
+        if not validate or not path:
+            return path
+        return self._validate_plate(path, w, h, state, log, tag or out_path, _t0)
+
+    def _render_raw(self, cam, out_path: str, w: int, h: int, state=None,
+                    entry=None, log: Optional[Callable[[str], None]] = None,
+                    probe: bool = False):
         """``render_frame`` + software exposure when enabled — the ONE render path
         every probe/loop/board/final goes through, so the EV/WB the plugin sets always
         reach the scored (and delivered) pixels, even on renderers whose exposure host
@@ -657,9 +917,33 @@ class Controller:
         pass it — the plan-effect probes, the loop, the board, refine, the finals — stays
         on V-Ray by DEFAULT, which is the safe direction for a default to fail in."""
         if probe and getattr(self, "_probe_backend", "vray") == "vantage":
-            path, used = rd.render_probe(cam, out_path, w, h, backend="vantage", log=log)
-            if used != "vantage":
-                self._probe_backend = "vray"   # one refusal disarms the run, once, loudly
+            # REFUSE, do not substitute. render_probe falls through to render_frame on a
+            # Vantage refusal, so probe a210 came back a V-Ray plate appended to the same
+            # sunsolve table and the same argmax as the Vantage grabs before it. That
+            # table is ranked on highlight_similarity, whose presence half is gated on the
+            # ABSOLUTE metrics.HOT_THRESHOLD, so a tonemap difference is a systematic
+            # offset between the two halves of one comparison — and CROSS_DOMAIN_AGREEMENT
+            # and DECISIVE_MARGIN are absolute too, so the mixture also changes which
+            # branch of the solver runs and what confidence it reports. sunsolve.probe
+            # already treats path=None as a skip, so the grid loses a few samples of ONE
+            # domain instead of gaining samples of a second. (2026-07-31)
+            path, used = rd.render_probe(cam, out_path, w, h, backend="vantage", log=log,
+                                         fallback=False,
+                                         should_cancel=self._cancel_poll)
+            if path is None:
+                # Disarm for the NEXT stage, not this probe, and only after three
+                # consecutive refusals: _settled_rows reads a legitimately static dusk
+                # viewport as "stale", so a single settle timeout used to disarm the fast
+                # path on exactly the scene class where 60 s → 50 ms matters most.
+                self._vantage_refusals = getattr(self, "_vantage_refusals", 0) + 1
+                if self._vantage_refusals >= 3:
+                    self._probe_backend = "vray"
+                    if log:
+                        self._degrade(log, "vantage probe backend demoted to V-Ray after "
+                                            "3 consecutive refused grabs — the remaining "
+                                            "direction probes render at full cost")
+            else:
+                self._vantage_refusals = 0
         else:
             path, used = rd.render_frame(cam, out_path, w, h), "vray"
         # PROVENANCE, recorded rather than inferred: a caller that asked for a probe may
@@ -695,40 +979,512 @@ class Controller:
                 path, path, st.get("exposure.ev", base_ev), base_ev,
                 st.get("exposure.wb_kelvin", base_wb), base_wb) is None \
                 and not getattr(self, "_sw_warned", False):
-            if log:
-                log("⚠ software exposure needs Pillow — frame left un-exposed")
             self._sw_warned = True
+            if log:
+                self._degrade(log, "software exposure needs Pillow and Pillow is not "
+                                   "installed — every frame from here is scored "
+                                   "UN-EXPOSED while the solver keeps prescribing "
+                                   "exposure.ev changes that cannot reach the pixels")
         return path
 
+    # ------------------------------------------------------- I2: what will this cost?
+    def _observe_render(self, w: int, h: int, seconds: float, backend: str,
+                        log: Optional[Callable[[str], None]], started: float = 0.0
+                        ) -> None:
+        """One timed sample per render, and the FIRST honest cost estimate it enables.
+
+        Three rules, each of which was a way to get the number badly wrong:
+
+          * VANTAGE SAMPLES NEVER PRICE A V-RAY PLAN. A ~50 ms window grab multiplied by
+            181 V-Ray renders reads as "9 seconds" for a three-hour run. Same rule the
+            black guard already lives by: gate on the backend that actually answered.
+          * COLD IS NOT STEADY. The first plate of a session carries one-time scene
+            translation, BVH build and the light-cache prepass — on 18M triangles with 460
+            lights that is minutes, not seconds. Multiplying it by 181 is how you get a
+            wildly wrong estimate, so it is added ONCE and never multiplied.
+          * ONE SAMPLE DOES NOT EXTRAPOLATE SILENTLY. With two distinct sizes this fits
+            affine t(px) ≈ fixed + slope·px (render time on a heavy V-Ray scene is affine,
+            not proportional — the fixed term dominates at small sizes). With one, it
+            prices that size and says which basis it used.
+        """
+        if str(backend).lower() != "vray" or seconds <= 0:
+            return
+        px = max(1, int(w) * int(h))
+        if self._cold_seconds is None and not any(self._render_times.values()):
+            # …and it is NOT also filed as a steady sample at its size (2026-07-31). It
+            # was, which made the docstring above false and the fit wrong in the worst
+            # direction: the canary is the ONLY 160×90 sample there is, so _price's affine
+            # branch fitted a line through (14400 px, cold) and (32400 px, warm). On the
+            # heavy scenes this model exists for, cold > warm, the slope comes out
+            # NEGATIVE, and every larger size clamps to max(0.0, …) — the 480×270 loop
+            # and the full-size final, the most expensive frames in the run, priced at
+            # 0.0 s and quoted with a confident "affine fit" basis. Measured: canary 180 s
+            # @160×90 + first basin probe 60 s @240×135 → "182 minutes, measured".
+            self._cold_seconds = float(seconds)
+            return
+        samples = self._render_times.setdefault(px, [])
+        samples.append(float(seconds))
+        del samples[:-4]                     # two are enough; four is cheap insurance
+        if log is not None:
+            self._maybe_report_cost(px, log)
+
+    def _steady_seconds(self, px: int) -> Optional[float]:
+        """The fastest sample seen at this size — the steady-state per-frame cost."""
+        samples = self._render_times.get(px)
+        return min(samples) if samples else None
+
+    def _price(self, px: int) -> Optional[Tuple[float, str]]:
+        """→ (seconds for one render at ``px`` pixels, how it was derived)."""
+        known = {p: min(v) for p, v in self._render_times.items() if v}
+        if not known:
+            return None
+        if px in known:
+            return known[px], "measured at this size"
+        if len(known) >= 2:
+            lo, hi = min(known), max(known)
+            slope = (known[hi] - known[lo]) / float(hi - lo) if hi != lo else -1.0
+            # A NON-POSITIVE SLOPE IS NOT A FIT. More pixels cannot cost less time, so a
+            # slope ≤ 0 says the two samples are not comparable (different warmth,
+            # different backend load, a paused viewport) and the line through them prices
+            # everything larger at max(0.0, …) — zero seconds, quoted as a measurement.
+            # Fall through to the honest single-sample path instead. (2026-07-31)
+            if slope > 0.0:
+                fixed = known[lo] - slope * lo
+                fitted = fixed + slope * px
+                if fitted > 0.0:
+                    return fitted, "affine fit over two measured sizes"
+        base_px, base_s = min(known.items(), key=lambda kv: abs(kv[0] - px))
+        ratio = px / float(base_px)
+        if ratio > 4.0 or ratio < 0.25:
+            # REFUSE to extrapolate silently. Beyond 4× the fixed/variable split is
+            # unknown and a confident wrong number is worse than an honest range.
+            return base_s * min(4.0, max(0.25, ratio)), (
+                f"EXTRAPOLATED from one sample at {base_px} px — this size is "
+                f"{ratio:.1f}× that, so treat it as a lower bound")
+        return base_s * ratio, f"scaled from one sample at {base_px} px"
+
+    def cost_estimate(self) -> Optional[Dict]:
+        """Price the planned stages from what has actually been measured. → a dict or None.
+
+        Pure arithmetic over ``profiles.planned_renders`` and ``_render_times`` — no
+        renders, no guessing, and every "cheaper" figure it quotes is re-priced from the
+        same model against a re-planned budget rather than made up.
+        """
+        if not self._cost_stages or not any(self._render_times.values()):
+            return None
+        total = 0.0
+        rows: List[Dict] = []
+        basis = ""
+        for stage in self._cost_stages:
+            priced = self._price(max(1, stage.width * stage.height))
+            if priced is None:
+                continue
+            seconds, how = priced
+            # the WEAKEST basis of any stage, not the first stage's (2026-07-31). The
+            # first stage of a standard profile is two 160×90 exposure plates; quoting its
+            # basis let a plan whose 7 full-size loop renders were EXTRAPOLATED be
+            # announced as "measured at this size". The headline number is only as honest
+            # as its least honest term.
+            if _BASIS_RANK(how) > _BASIS_RANK(basis):
+                basis = how
+            total += seconds * stage.count
+            rows.append({"key": stage.key, "label": stage.label, "count": stage.count,
+                         "seconds_each": round(seconds, 2)})
+        if not rows:
+            return None
+        cold = float(self._cold_seconds or 0.0)
+        steady = min(min(v) for v in self._render_times.values() if v)
+        warmup = max(0.0, cold - steady)
+        # the headline "one probe took N s" quotes the resolution that DOMINATES the plan
+        # — 180 of a standard profile's 188 renders are the sweep/polish size, so quoting
+        # the first stage (two 160×90 exposure plates) would understate it fourfold
+        dominant = max(rows, key=lambda r: r["count"])
+        return {"minutes": (total + warmup) / 60.0,
+                "renders": sum(r["count"] for r in rows),
+                "seconds_each": dominant["seconds_each"],
+                "seconds_basis_stage": dominant["label"],
+                "warmup_seconds": round(warmup, 1),
+                "basis": basis, "stages": rows}
+
+    def _maybe_report_cost(self, px: int, log: Callable[[str], None]) -> None:
+        """Fire ONCE, on the first V-Ray plate that can price the plan.
+
+        In run_match order that is the first multi-start basin probe — after roughly 1 of
+        190 renders, and BEFORE the 44-probe sun solve and the 120-probe polish. That is
+        where "before committing" has to mean. The existing estimate in director.py fires
+        at iter00, which on TULA is reached about an hour and sixty renders into a run it
+        is supposed to be pricing.
+        """
+        if self._cost_reported or not self._cost_stages:
+            return
+        est = self.cost_estimate()
+        if est is None:
+            return
+        self._cost_reported = True
+        seconds = est["seconds_each"]
+        log(f"cost: one {int(px ** 0.5 * 1.33)}px-class probe took {seconds:.1f} s"
+            + (f" (+{est['warmup_seconds']:.0f} s one-time scene translation)"
+               if est["warmup_seconds"] >= 1.0 else "")
+            + f" — {est['renders']} renders planned → about "
+            + _human_minutes(est["minutes"])
+            + f" ({est['basis']}).")
+        log(f"cost: cancel will take up to {seconds:.0f} s per press — a V-Ray frame "
+            "cannot be interrupted once it has started, so ✕ is bounded by one probe.")
+        self._gate_cost(est, log)
+
+    def _gate_cost(self, est: Dict, log: Callable[[str], None]) -> None:
+        """GATE 5 — above ``cfg.cost_ask_minutes``, that is a decision for the human.
+
+        This is the enforcement config.py's own comment already describes and did not
+        implement ("180 probes at 60s a frame is three hours"). The remedies offered are
+        re-priced from the SAME model against a re-planned budget — never guessed — and
+        the cap line is honest about the fact that a 60 s cap saves nothing when the probe
+        already takes 61 s, which is itself the finding.
+        """
+        limit = float(getattr(self.cfg, "cost_ask_minutes", 0.0) or 0.0)
+        if limit <= 0 or est["minutes"] <= limit:
+            return
+        seconds = est["seconds_each"]
+        lines = [f"{est['renders']} renders planned at {seconds:.0f} s each → "
+                 f"{_human_minutes(est['minutes'])}."]
+        options = [("proceed", f"Proceed — I'll wait {_human_minutes(est['minutes'])}")]
+        if seconds > CANCEL_LATENCY_BUDGET_S:
+            lines.append(f"Cancel will take up to {seconds:.0f} s per press, and there is "
+                         "no way to interrupt a V-Ray frame once it has started.")
+            cap = 60.0
+            capped = est["minutes"] * min(1.0, cap / seconds)
+            lines.append(f"A {cap:.0f} s probe cap would bring that to about "
+                         + _human_minutes(capped)
+                         + (" — i.e. it would save nothing, because your probes are "
+                            "already faster than the cap" if capped >= est["minutes"]
+                            else ""))
+            if capped < est["minutes"]:
+                options.append(("cap", f"Cap probes at {cap:.0f} s "
+                                       f"(~{_human_minutes(capped)})"))
+        options.append(("stop", "Stop — I'll change something first"))
+        answer = self._escalate(askmod.cost_question(
+            est["minutes"], est["renders"], seconds, tuple(options),
+            "\n".join(lines)), log)
+        if answer == "stop":
+            self._cancel_latch = "stopped: the cost was declined before it was spent"
+            raise MatchCancelled(self._cancel_latch)
+        if answer == "cap":
+            # Applied through the existing snapshot-and-restore-in-a-finally path, and
+            # DECOUPLED from draft_sampler: a time cap the artist just agreed to is a
+            # SAFETY control, not a quality control. apply_draft's int-minutes refusal
+            # hands control back rather than silently uncapping.
+            for line in df.apply_draft(60.0):
+                log(line)
+            self._cap_applied = df.pending_snapshot()
+
+    #: The four quadrant answers, as a bearing RELATIVE TO THE CAMERA (0 = into the lens,
+    #: i.e. the sun is in front of the camera; 180 = behind the camera, lighting the shot).
+    QUADRANTS = (("behind", "Behind the camera (lighting the shot)", 180.0),
+                 ("left", "Over my left shoulder", 135.0),
+                 ("right", "Over my right shoulder", -135.0),
+                 ("lens", "Into the lens (backlit)", 0.0))
+
+    def _gate_bearing(self, start, locks: set, sem_live, cfg_kw: Dict,
+                      cam_yaw: float, semantics: Dict,
+                      log: Callable[[str], None]):
+        """GATE 1 — the analyzer does not know where the sun is. ASK, do not spend an hour.
+
+        An artist answering "over my left shoulder" has given a QUADRANT, not an angle, so
+        the answer becomes a START VALUE plus 45° of transfer slack and the loop and polish
+        may still refine inside it. Locking the axis outright would forfeit refinement the
+        render can still do, so only the explicit "I know the angle" branch locks — and
+        ``sunsolve.solve_sun_angles`` then returns None on that lock with no new machinery
+        in the solver at all.
+        """
+        est = self.cost_estimate()
+        sunsolve_min = 0.0
+        for stage in self._cost_stages:
+            if stage.key == "sunsolve":
+                priced = self._price(max(1, stage.width * stage.height))
+                if priced:
+                    sunsolve_min = priced[0] * stage.count / 60.0
+        spread = semantics.get("sun_bearing_spread_deg")
+        cost_txt = (f" (~{_human_minutes(sunsolve_min)} at this scene's measured probe "
+                    "time)" if sunsolve_min > 0 else "")
+        options = tuple((k, label) for k, label, _b in self.QUADRANTS)
+        answer = self._escalate(askmod.Question(
+            key="sun_bearing",
+            headline=("ANALYZE read the sun's direction "
+                      + (f"{int(self.cfg.analyze_samples)} times and got ±{spread:.0f}° "
+                         "of scatter" if spread is not None
+                         else "and produced no usable direction evidence")
+                      + " — it does not know where the light is"),
+            detail=(f"Solving it on the render grid costs "
+                    f"{sum(s.count for s in self._cost_stages if s.key == 'sunsolve')} "
+                    f"probes{cost_txt}. You can answer in five seconds by looking at the "
+                    "photograph. A quadrant is enough — it becomes a starting direction "
+                    "with 45° of slack, not a lock, so the render can still refine it."),
+            options=options + (("solve", f"Solve it on the grid anyway{cost_txt}"),
+                               ("stop", "Stop — I'll lock the azimuth myself")),
+            default="solve",
+            facts={"spread_deg": spread,
+                   "agreement": semantics.get("sun_bearing_agreement"),
+                   "sunsolve_minutes": round(sunsolve_min, 1)}), log)
+        if answer == "stop":
+            self._cancel_latch = "stopped: the sun's direction is yours to set"
+            raise MatchCancelled(self._cancel_latch)
+        if answer == "solve":
+            return start, locks
+        bearing = dict((k, b) for k, _l, b in self.QUADRANTS).get(answer)
+        if bearing is None:
+            return start, locks
+        azimuth = (cam_yaw + bearing) % 360.0
+        if "sun.azimuth_deg" in start.values:
+            start.set("sun.azimuth_deg", azimuth)
+        if sem_live is not None:
+            sem_live["sun_bearing_deg"] = round(bearing, 1)
+            sem_live["sun_bearing_slack_deg"] = QUADRANT_SLACK_DEG
+            # the artist's eye is better evidence about direction than a decisive grid —
+            # full transfer weight, and the slack is what keeps it honest
+            sem_live["sun_bearing_agreement"] = 1.0
+            cfg_kw["transfer_weight"] = TRANSFER_WEIGHT
+        log(f"sun direction: taken from you — {bearing:+.0f}° from the camera "
+            f"(azimuth {azimuth:.0f}°), held to ±{QUADRANT_SLACK_DEG:.0f}°. The "
+            "44-probe grid solve is SKIPPED; the loop and polish may still refine inside "
+            "that quadrant.")
+        self._skip_sun_stages = True
+        return start, locks
+
+    def _gate_frozen_plates(self, log: Callable[[str], None]) -> str:
+        """GATE 4 — six pixel-identical probes in a row while the state kept changing.
+
+        Headless default is "skip", not "continue": spending 38 more renders that are
+        provably the same picture is not a defensible default for anyone.
+        """
+        answer = self._escalate(askmod.Question(
+            key="frozen_plates",
+            headline=(f"{self._frozen_run} probes in a row rendered PIXEL-IDENTICAL "
+                      "while the light being steered changed"),
+            detail=("The sun MaxGaffer is driving is not reaching this frame. Preflight's "
+                    "SUN_ENABLED and RIG_NOTES lines above name the two likeliest "
+                    "causes: the sun is switched off, or it is an untargeted VRaySun, "
+                    "which aims by node rotation so azimuth writes do not re-aim it. "
+                    "Every remaining direction probe will rank the same picture."),
+            options=(("enable", "Stop — I'll enable the right sun and re-run"),
+                     ("skip", "Skip the sun stages and match tone only"),
+                     ("continue", "Continue anyway")),
+            default="skip",
+            facts={"frozen_run": self._frozen_run,
+                   "frozen_total": self._frozen_total}), log)
+        if answer == "enable":
+            self._cancel_latch = ("stopped: the light being steered is not reaching the "
+                                  "frame")
+            raise MatchCancelled(self._cancel_latch)
+        if answer == "skip":
+            self._skip_sun_stages = True
+            self._degrade(log, "sun stages SKIPPED for the rest of this run — their "
+                               "probes were provably ranking one unchanging picture")
+        return answer
+
+    # ------------------------------------------------------- I5: ask, do not guess
+    def _escalate(self, q: "askmod.Question", log: Callable[[str], None]) -> str:
+        """Put a decision to the artist — or, headless, to ``cfg.uncertainty_policy``.
+
+        The question and its measured facts are LOGGED BEFORE anyone is asked, every time.
+        A question the transcript does not record is the silent-degradation failure again,
+        just with better manners. The answer is logged too, WITH who gave it, and both go
+        into run.json.
+        """
+        log(f"? {q.headline}")
+        if q.detail:
+            for line in str(q.detail).splitlines():
+                if line.strip():
+                    log("  " + line.strip())
+        policy = str(getattr(self.cfg, "uncertainty_policy", "ask") or "ask").lower()
+        if policy not in ("ask", "assume", "abort"):
+            log(f"  (uncertainty_policy '{policy}' is not a known value — reading it as "
+                "'ask', the same defensive default probe_backend uses)")
+            policy = "ask"
+        answer, who = q.default, "policy"
+        if policy == "abort":
+            self._decisions.append({"key": q.key, "answer": "abort", "who": "policy",
+                                    "headline": q.headline, **dict(q.facts)})
+            raise PreflightBlocked(q.headline)
+        if policy == "assume":
+            log(f"  policy: assume — answering '{q.label_for(q.default)}' without asking")
+        else:
+            try:
+                answer = str(self.ask(q) or "")
+            except Exception as err:  # noqa: BLE001 — a broken dialog must not sink a run
+                log(f"  ⚠ the question could not be put to you ({err}) — falling back to "
+                    f"'{q.label_for(q.default)}'")
+                answer = ""
+            if answer and answer in q.values():
+                who = "artist"
+            else:
+                if answer:
+                    log(f"  ⚠ '{answer}' is not one of this question's answers — using "
+                        f"'{q.label_for(q.default)}'")
+                answer = q.default
+        log(f"  → {q.label_for(answer)} ({who})")
+        self._decisions.append({"key": q.key, "answer": answer, "who": who,
+                                "headline": q.headline, **dict(q.facts)})
+        return answer
+
+    # ------------------------------------------------------- I1: is this plate real?
+    @staticmethod
+    def _state_fingerprint(state) -> Optional[Dict]:
+        if state is None:
+            return None
+        try:
+            out = {str(k): round(float(v), 6) for k, v in state.values.items()}
+            out.update({f"group:{k}": round(float(v), 6)
+                        for k, v in (state.groups or {}).items()})
+            return out
+        except Exception:  # noqa: BLE001 — a fingerprint must never fail a render
+            return None
+
+    def _validate_plate(self, path: str, w: int, h: int, state,
+                        log: Optional[Callable[[str], None]], tag: str,
+                        t0: float):
+        """I1 — never score an unvalidated image. → the path, or None when rejected."""
+        stats = self.stats_for(path)
+        self._plate_memo = (path, stats)
+        if stats is None:
+            return path            # unmeasurable: callers already treat None stats as skip
+        fingerprint = self._state_fingerprint(state)
+        changed_axes: List[str] = []
+        state_changed = False
+        if fingerprint is not None and self._plate_prev_state is not None:
+            changed_axes = sorted(k for k in set(fingerprint) | set(self._plate_prev_state)
+                                  if fingerprint.get(k) != self._plate_prev_state.get(k))
+            state_changed = bool(changed_axes)
+        try:
+            got = png_min.read_png_size(path)
+        except Exception:  # noqa: BLE001
+            got = None
+        verdict = plate.validate(stats, want=(int(w), int(h)), got=got,
+                                 prev_sig=self._plate_prev_sig,
+                                 state_changed=state_changed,
+                                 frozen_run=self._frozen_run,
+                                 changed_axes=changed_axes[:4])
+        self._plate_prev_sig = verdict.signature
+        if fingerprint is not None:
+            self._plate_prev_state = fingerprint
+        self._frozen_run = verdict.frozen_run
+        # STALE — handled at the source rather than as a fifth test: render_frame deletes a
+        # pre-existing target before rendering and capture_window_png holds the same
+        # contract, so what is left uncovered is a path whose mtime PREDATES this call.
+        # One comparison, and t0 is already in hand for the timing.
+        try:
+            if os.path.getmtime(path) < t0 - 2.0:
+                if log:
+                    self._degrade(log, f"the renderer returned a plate older than the "
+                                       f"call that asked for it ({tag}) — this is a stale "
+                                       "file from an earlier run, not a measurement")
+                return None
+        except OSError:
+            pass
+        if verdict.reason == "frozen":
+            self._frozen_total += 1
+            if verdict.frozen_report and log:
+                self._degrade(log, verdict.detail)
+            return path
+        if verdict.ok:
+            return path
+        if verdict.reason in ("black", "near_black"):
+            # STICKY, and not merely an exception: sunsolve.probe catches every exception
+            # per probe BY DESIGN (sunsolve.py:117-124), as do the tone-align and
+            # sun-solve blocks, so a bare raise would be swallowed 44 times and each
+            # swallow would fire another 60-second render. With the flag, every later
+            # render raises before rendering (microseconds), the surviving stages degrade
+            # the way they already know how, and the error escapes through the
+            # draft-restoring finally into the dock's "✗ …".
+            head = verdict.detail + f" ({tag})"
+            self._probe_abort = (self._black_probe_message(head)
+                                 if verdict.reason == "black" else head)
+            if log:
+                log("✗ " + self._probe_abort)
+            raise RuntimeError(self._probe_abort)
+        if log:
+            self._degrade(log, verdict.detail + f" ({tag}) — this plate was REJECTED, not "
+                                                "scored")
+        return None
+
     def _verify_exposure_host(self, cam, run_dir: str,
-                              log: Callable[[str], None]) -> None:
+                              log: Callable[[str], None],
+                              should_cancel: Callable[[], bool] = lambda: False) -> None:
         """One-time (per Controller) MEASUREMENT: does the renderer bake EV into the
         saved buffer? Two tiny probes 2 EV apart must move the key ~2 stops; if it
         barely moves, the host is display-stage only (measured on-box for V-Ray GPU)
-        and software exposure is switched on for the session, loudly."""
+        and software exposure is switched on for the session, loudly.
+
+        PREFLIGHT B rides on the FIRST of those two plates, at zero additional cost. It
+        was already firing two unannounced 160×90 renders here — on TULA that is about two
+        minutes of silence immediately after "run dir: …" — so the canary is free: it only
+        has to ASSERT things about a plate that was going to be rendered anyway.
+
+        Three assertions and one measurement:
+          1. it produced a file at all → else BLOCK;
+          2. it is not black → BLOCK only when preflight named a CAUSE. The existing
+             reasoning below stays and is right: nothing has been applied yet, so a scene
+             whose lights the artist left off is legitimately black here. But that does not
+             apply to the DR case — DR-on-with-a-dead-port PLUS a black plate is not an
+             unlit scene, it is a dead renderer, and the socket test is exactly what tells
+             them apart. Pairing the two is what licenses the promotion;
+          3. it is the size that was asked for → else BLOCK. render_frame has three layered
+             size spellings, the third of which mutates rt.renderWidth/Height globally; a
+             build where all three fall through saves a valid frame at SCENE resolution and
+             compute_stats downsamples it to 256 px so the numbers look normal;
+          4. wall-clock → the I2 seed. Quoted as a LOWER BOUND, not a scaled-down sample:
+             on a heavy scene the ~60 s probe cost is dominated by scene translation and
+             BVH build across 18M triangles, not by pixel count.
+        """
         if getattr(self, "_exposure_host_checked", False) \
                 or getattr(self.cfg, "software_exposure", False) \
                 or getattr(self.cfg, "no_renders", False):
             return
+        if should_cancel():
+            self._cancel_latch = self._cancel_latch or "cancelled before the host check"
+            raise MatchCancelled(self._cancel_latch)
         self._exposure_host_checked = True
         from .exposure import ExposureHost
 
         host = ExposureHost(cam)
         ev0 = host.read_ev()
         if ev0 is None:
+            # EVERY early return here logs its reason now. A silent one meant the artist
+            # could not tell "measured and fine" from "never measured".
+            kind = getattr(host, "kind", "unknown")
+            self._degrade(log, f"the exposure host ({kind}) would not report an EV — "
+                               "the renderer's exposure was NOT measured this run, so "
+                               "software exposure stays as configured")
             return
+        wrote = False
         try:
             # DELIBERATELY rd.render_frame and NOT the probe dispatcher: this measures the
             # HOST — whether THIS renderer bakes EV into the saved buffer — and measuring
             # it through a tonemapped Vantage grab is precisely how software_exposure gets
             # switched on by mistake, which then double-applies EV to every later frame.
+            log("checking the renderer's exposure host with two 160×90 plates — the "
+                "first is also this run's CANARY (it proves the renderer can produce "
+                "pixels at the size it was asked for, and it times one frame)")
+            _t0 = time.time()
             p1 = rd.render_frame(cam, os.path.join(run_dir, "evcheck_a.png"), 160, 90)
             s1 = metrics.compute_stats(p1) if p1 else None
-            host.write_ev(ev0 + 2.0)
+            self._canary(p1, s1, time.time() - _t0, log)
+            wrote = bool(host.write_ev(ev0 + 2.0))
             p2 = rd.render_frame(cam, os.path.join(run_dir, "evcheck_b.png"), 160, 90)
             s2 = metrics.compute_stats(p2) if p2 else None
         finally:
             host.write_ev(ev0)
+        if not wrote:
+            # write_ev returns False whenever set_prop finds no matching spelling, the
+            # host kind is 'none', or the legacy ISO path fails. A failed write means p2
+            # rendered at ev0, moved ≈ 0.0, and the branch below switches software
+            # exposure ON for the whole session with the confident, WRONG sentence
+            # "+2 EV moved the render only 0.00 stops — display-stage only".
+            kind = getattr(host, "kind", "unknown")
+            self._degrade(log, f"the exposure host ({kind}) REFUSED the +2 EV test "
+                               "write — the host was NOT measured, and software exposure "
+                               "is left exactly as configured rather than mis-flagged off "
+                               "a write that never happened")
+            return
         # Two BLACK plates give moved == 0.0, i.e. "this host is display-stage only", and
         # would switch software_exposure ON for the whole session off a dead render. This
         # check runs BEFORE the first render_hook probe, so without the black gate the
@@ -747,12 +1503,28 @@ class Controller:
                 "render"))
             return
         if not (s1 and s2) or metrics.is_black(s1) or metrics.is_black(s2):
+            self._degrade(log, "the exposure-host check could not measure both of its "
+                               "plates — the renderer's exposure behaviour is UNKNOWN "
+                               "this run and software exposure is left as configured")
             return
         import math
 
         moved = abs(math.log2(max(1e-5, s1["log_key"]) / max(1e-5, s2["log_key"])))
         if moved < 1.0:      # expected ~2 stops; under half = EV not reaching pixels
             self.cfg.software_exposure = True
+            self._sw_auto = True       # WE set it — _bust_stale_caches may clear it
+            if not _pillow_available():
+                # Pillow is what expose_image_file needs, and without it every frame is
+                # scored un-exposed while the analytic solver keeps prescribing
+                # exposure.ev changes that cannot reach the pixels: the loop burns its
+                # budget, hits its EV leash repeatedly, and director.py blames scene
+                # albedo. Drop the axes instead of pretending they are solvable.
+                self._unsolvable_axes = {"exposure.ev", "exposure.wb_kelvin"}
+                self._degrade(log, "software exposure is needed on this renderer but "
+                                   "Pillow is not installed — exposure.ev and "
+                                   "exposure.wb_kelvin are DROPPED from the solvable "
+                                   "axes for this run (install Pillow, or set "
+                                   "system_python, to get them back)")
             log(f"⚠ measured: +2 EV moved the render only {moved:.2f} stops — this "
                 "renderer's exposure is display-stage only. Software exposure ON for "
                 "this session (turn it on in Settings to persist).")
@@ -770,18 +1542,81 @@ class Controller:
                 f"the saved plate is linear (color management: {cs or 'unknown'}). "
                 "Loop plates will be sRGB-encoded in software before scoring.")
 
-    def _arm_probe_backend(self, log) -> None:
-        """Decide ONCE per run where direction probes come from, and say so. Armed only
-        when the live link is actually streaming AND the window is actually findable —
-        an unarmed backend costs nothing, an armed-but-broken one costs a log line per
-        probe."""
+    def _canary(self, path: Optional[str], stats: Optional[Dict], seconds: float,
+                log: Callable[[str], None]) -> None:
+        """PREFLIGHT B, riding free on the exposure-host check's first plate.
+
+        BLOCKs on the three conditions where continuing produces a number that is not a
+        measurement, and seeds the cost model with the one thing it cannot get any other
+        way: a real timed frame from THIS scene."""
+        if path is None:
+            raise PreflightBlocked(
+                "the canary render produced no file at all — this renderer cannot save a "
+                "frame at 160×90, so nothing in this run could be measured. Check the "
+                "output path, the renderer, and the render type.")
+        size = png_min.read_png_size(path)
+        if size is not None and size != (160, 90):
+            raise PreflightBlocked(
+                f"the canary render was asked for 160×90 and came back {size[0]}×"
+                f"{size[1]} — none of render_frame's three size spellings bound on this "
+                "build, so every 'probe-resolution' frame in this run would actually be a "
+                "full-resolution one. That is not a cheap run, and the stats would look "
+                "entirely normal.")
+        if metrics.is_black(stats):
+            cause = getattr(self, "_preflight_black_cause", "")
+            if cause:
+                raise PreflightBlocked(
+                    "the canary render came back 100% BLACK and preflight already named "
+                    "the cause: " + cause)
+            log("⚠ " + self._black_probe_message(
+                "the canary render came back 100% BLACK before anything was applied — "
+                "reported, not aborted, because a scene whose lights the artist left off "
+                "is legitimately black at this point and is about to be lit by the first "
+                "guess"))
+        self._observe_render(160, 90, seconds, "vray", None)
+        log(f"canary: one 160×90 frame in {seconds:.1f} s — a LOWER BOUND on this "
+            "scene's per-frame cost (pixel count is not the driver on a heavy scene; "
+            "scene translation and BVH build are), re-priced from the first real probe")
+
+    def _arm_probe_backend(self, log, report=None) -> None:
+        """Decide ONCE per run where direction probes come from, and say so.
+
+        Preflight has already done the work — the live link, the window, the stability
+        gate, the GPU conflict and the active-camera identity — so this READS a decision
+        rather than re-deriving one (and rather than paying vt.link_running's two 1-second
+        socket waits on the main thread a second time; controller.py used to call it
+        twice per run). Without a report — or with an EMPTY one — it falls back to the old
+        direct probe.
+
+        "Empty" is the case that mattered (2026-07-31). run_match always passes a report
+        object, never None, and preflight_level='off' (or a preflight that raised and was
+        degraded) hands back a report with no findings at all. Reading only ``demotions``
+        then armed the Vantage grab having checked NOTHING: not the live link, not the
+        window, not the GPU conflict (checklist #14's documented Max-crash configuration),
+        not the camera. A report that never ran VANTAGE_ARMED has not armed anything.
+        """
         self._probe_backend = "vray"
+        self._vantage_refusals = 0
         if str(getattr(self.cfg, "probe_backend", "vray")).lower() != "vantage":
             return
         from . import vgrab
 
-        # the freshness chain is inductive (vgrab.SETTLE_LIMIT_S) — a new run must not
-        # inherit the last run's final frame as its baseline
+        decided = report.demotions.get("probe_backend") if report is not None else None
+        if decided is not None:
+            if decided != "vantage":
+                # preflight said why, in its own line; do not say it twice
+                self._degrade(log, "vantage probe backend NOT armed (see the preflight "
+                                   "line above) — every direction probe renders in V-Ray "
+                                   "at full cost")
+                return
+            # the freshness chain is inductive (vgrab.SETTLE_LIMIT_S) — a new run must not
+            # inherit the last run's final frame as its baseline
+            vgrab.reset_settle()
+            self._probe_backend = "vantage"
+            log("probe backend: VANTAGE window grab for the sun solve's direction probes "
+                "— the sweep, the tone stages, the basin, polish, the plan probes and "
+                "the final all stay on V-Ray")
+            return
         vgrab.reset_settle()
         port = vt.link_running()
         hwnd = vgrab.find_window(vgrab.VANTAGE_TITLE) if port else None
@@ -790,11 +1625,16 @@ class Controller:
             log(f"probe backend: VANTAGE window grab for the sun solve's 44 probes "
                 f"(live link on {port}) — the sweep, the tone stages, the basin, polish, "
                 f"the plan probes and the final all stay on V-Ray")
+            self._degrade(log, "this arming was NOT preflighted (no VANTAGE_ARMED "
+                               "finding in this run's report): the live link and the "
+                               "window were found, but the GPU-conflict check "
+                               "(checklist #14) and the two-grab stability gate did not "
+                               "run, so the grabs are of whatever Vantage is showing")
         else:
-            log("probe backend: vantage requested but " +
-                ("no live link is streaming" if not port
-                 else f"the window was not found ({vgrab.last_error()})") +
-                " — rendering every probe in V-Ray")
+            self._degrade(log, "vantage probe backend requested but " +
+                          ("no live link is streaming" if not port
+                           else f"the window was not found ({vgrab.last_error()})") +
+                          " — rendering every probe in V-Ray at full cost")
 
     def _black_probe_message(self, head: str = "") -> str:
         """Name the cause instead of guessing at it. On 2026-07-30 a whole run came back
@@ -830,31 +1670,57 @@ class Controller:
 
     def probe_score(self, camera_name: str, tag: str) -> Optional[float]:
         """One loop-res render of the current scene scored against the camera's reference
-        — the cheap 'did that help?' measurement."""
+        — the cheap 'did that help?' measurement.
+
+        ``self._probe_why`` records WHICH of the six ways this can return None actually
+        happened. It used to return a bare None six different ways and ``execute_plan``
+        had no ``else`` on either branch, so a scene-wide plan that mutated dozens of
+        properties could carry no effect measurement and no explanation of why —
+        unmeasured, on the most destructive operation in the plugin. (2026-07-31)"""
+        self._probe_why = ""
         if getattr(self.cfg, "no_renders", False):
+            self._probe_why = "no-render mode is ON (Settings)"
             return None                    # no-render mode: plans apply unmeasured
         e = self.camera_entry(camera_name)
         if not (e and e.reference):
+            self._probe_why = "this camera has no reference bound"
             return None
         ref = self.ref_stats(e.reference)
         cam = self.camera_node(camera_name)
-        if ref is None or cam is None:
+        if ref is None:
+            self._probe_why = "the reference could not be decoded by any reader"
+            return None
+        if cam is None:
+            self._probe_why = f"camera '{camera_name}' is not in the scene"
             return None
         path = self._render_exposed(
             cam, os.path.join(self._ensure_run_dir(_safe(camera_name)), f"probe_{tag}.png"),
-            self.cfg.loop_width, self.cfg.loop_height, entry=e)
-        cur = self.stats_for(path) if path else None
+            self.cfg.loop_width, self.cfg.loop_height, entry=e, tag=f"probe_{tag}")
+        if not path:
+            self._probe_why = "the probe render produced no usable plate"
+            return None
+        cur = self.stats_for(path)
         if cur is None:
+            self._probe_why = "the probe plate could not be measured"
             return None
         return critic.score(ref, cur, self._critic_weights()).score
 
     def execute_plan(self, ops, camera_name: str,
-                     log: Callable[[str], None], measure: bool = True) -> Dict:
+                     log: Callable[[str], None], measure: bool = True,
+                     should_cancel: Callable[[], bool] = lambda: False) -> Dict:
         """Execute a validated plan (one undo record; MG_ layer for created lights) and
         return the before/after change report — including the plan's MEASURED effect
         (critic score before vs after, one probe render each side). Rig re-classified
         after so new lights join the dimmer boards immediately."""
+        self._begin_operation(should_cancel)
+        # D2 (2026-07-31): a plan's two probe renders are two full frames, and on a heavy
+        # scene that is two minutes the artist may already have asked to skip. Defaulted
+        # so api.py and every existing caller are unaffected until they pass one.
+        if should_cancel():
+            self._cancel_latch = self._cancel_latch or "cancelled before the plan ran"
+            raise MatchCancelled(self._cancel_latch)
         before_score = self.probe_score(camera_name, "preplan") if measure else None
+        before_why = getattr(self, "_probe_why", "")
         cam = self.camera_node(camera_name)
         report = ex.execute_plan(ops, cam)
         for c in report["changes"]:
@@ -864,9 +1730,21 @@ class Controller:
         for w in report["warnings"]:
             log("  ⚠ " + w)
         self.rig(refresh=True)
-        if measure and before_score is not None:
+        if not measure:
+            log("plan effect: NOT measured (the caller asked for no measurement) — the "
+                "plan was applied unverified")
+        elif before_score is None:
+            # I6: no `else` on either branch meant the most destructive operation in the
+            # plugin could complete with no effect key and no explanation at all
+            log(f"plan effect: NOT measured ({before_why or 'no before-probe'}) — the "
+                "plan was applied unverified")
+        else:
             after_score = self.probe_score(camera_name, "postplan")
-            if after_score is not None:
+            if after_score is None:
+                after_why = getattr(self, "_probe_why", "") or "no after-probe"
+                log(f"plan effect: NOT measured ({after_why}) — the plan was applied "
+                    "unverified")
+            else:
                 report["effect"] = {"before": before_score, "after": after_score}
                 log(f"plan effect: critic {before_score:.1f} → {after_score:.1f}"
                     + ("  ⚠ the plan made the match WORSE — one Ctrl+Z reverts it"
@@ -981,21 +1859,30 @@ class Controller:
         cam = self.camera_node(camera_name)
         if cam is None:
             raise RuntimeError(f"camera '{camera_name}' not found in the scene")
-        self._set_active_camera(camera_name)
-        # checklist #14 is a CRASH vector, not a perf note: V-Ray GPU loop renders while
-        # a Vantage live link streams the same scene can VRAM-starve the one card and
-        # take Max down. Detect the combination and say so BEFORE the first render.
-        try:
-            from . import vantage as _vt
-
-            port = _vt.link_running()
-            rcls = str(sc._rt().classOf(sc._rt().renderers.current)).lower()
-            if port is not None and "gpu" in rcls:
-                log(f"⚠ Vantage live link is UP (port {port}) and the renderer is "
-                    "V-Ray GPU — one GPU doing both can crash Max (checklist #14). "
-                    "Close the link for the match or switch V-Ray to CPU.")
-        except Exception:
-            pass
+        # I3 — a NEW run starts uncancelled. The latch is one-way WITHIN a run; only
+        # starting the next one clears it, and the dock refuses to start one while a
+        # previous generation is still live.
+        self._begin_operation(should_cancel)
+        self._generation += 1
+        self._degradations = []
+        self._decisions = []
+        self._frozen_run = self._frozen_total = 0
+        self._frozen_escalated = False
+        self._skip_sun_stages = False
+        self._skip_sun_said = False
+        self._plate_prev_sig = ()
+        self._plate_prev_state = None
+        self._cost_reported = False
+        self._cost_stages = []
+        self._unsolvable_axes = set()
+        self._preflight_black_cause = ""
+        self._cap_applied = False
+        generation = self._generation
+        self._drain_warnings(log)
+        # the GPU + live-link crash vector (checklist #14) used to be checked here; it is
+        # now GPU_VANTAGE_CONFLICT inside preflight, where it sits beside the eighteen
+        # other things that were never checked at all — and where its CONSEQUENCE for the
+        # Vantage probe backend can be named in the same breath
         if self.cfg.auto_exposure_control:
             from .exposure import ExposureHost, ensure_exposure_control
 
@@ -1006,8 +1893,50 @@ class Controller:
                     # remember WE created it — Restore must exit the experiment entirely
                     e.ec_created = True
         locks = set(locks if locks is not None else e.locks)
+        # UNCONDITIONAL, and back here rather than only inside preflight (2026-07-31).
+        # check_camera_active is the REPORT on this call's return value; it is not the
+        # call itself, and preflight_level='off' returns before any check runs. V-Ray
+        # renders the camera node it is handed either way, but the Vantage live link
+        # mirrors the ACTIVE VIEWPORT camera, so a run with preflight off was grabbing
+        # 44 direction probes of whatever shot the artist last looked at.
+        self._set_active_camera(camera_name)
         run_dir = self._new_run_dir(camera_name)
         log(f"run dir: {run_dir}")
+
+        # ---- I4: PREFLIGHT THE SCENE BEFORE SPENDING ANYTHING.
+        # Here, and not later, on purpose: BEFORE pre_match is snapshotted, before the
+        # 10-60 s ANALYZE network round trip, and before anything is mutated. It performs
+        # no renders and no mutations (one balanced EV round-trip aside), so on a clean
+        # scene it costs about forty milliseconds of property reads and one localhost
+        # socket refusal — and on 2026-07-30's scene it would have stopped the run in two.
+        # ref_stats is hoisted here to feed the reference checks and is _ref_cache-backed,
+        # so the pinned read further down is free.
+        preflight_report = pf.PreflightReport()
+        try:
+            preflight_report = pf.run(self, camera_name, cam, rig, e, self.cfg, log,
+                                      ref_path=e.reference,
+                                      ref_stats=self.ref_stats(e.reference),
+                                      run_dir=run_dir)
+        except PreflightBlocked:
+            raise
+        except Exception as err:  # noqa: BLE001 — preflight must never invent a failure
+            self._degrade(log, f"preflight could not run ({err}) — this scene was NOT "
+                               "verified before the run began")
+        dr = preflight_report.find("DR_DEAD_PORT")
+        if dr is not None and dr.severity == "block" \
+                and str(getattr(self.cfg, "preflight_level", "block")
+                        or "block").lower() == "block":
+            # remembered so the canary can promote a black plate from "report" to "block":
+            # DR-on-with-a-dead-port PLUS a black frame is not an unlit scene, it is a
+            # dead renderer, and the socket test is what tells them apart.
+            #
+            # GATED ON THE LEVEL ACTUALLY IN FORCE (2026-07-31). A Finding keeps its
+            # authored severity in the report even when pf.run downgraded it, so reading
+            # .severity alone made preflight_level='warn' — whose own tooltip promises
+            # "report everything, stop for nothing" — STRICTER than 'off', which produces
+            # an empty report and no cause at all. The canary then raised PreflightBlocked
+            # on a scene that is legitimately black before the first apply.
+            self._preflight_black_cause = dr.detail
 
         # snapshot the light as it stands — matches are explorations, not commitments
         # (unless the plan stage of this same run already snapshotted the true start).
@@ -1064,7 +1993,7 @@ class Controller:
             return self._apply_only(camera_name, e, rig, cam, start, run_dir,
                                     semantics, log)
 
-        self._arm_probe_backend(log)
+        self._arm_probe_backend(log, preflight_report)
 
         draft_applied = False
         if self.cfg.draft_sampler:
@@ -1090,7 +2019,7 @@ class Controller:
         # error in the exposure check, the sweep or the MatchConfig build must never
         # strand the artist's sampler settings for the rest of the Max session
         try:
-            self._verify_exposure_host(cam, run_dir, log)
+            self._verify_exposure_host(cam, run_dir, log, should_cancel)
 
             profile = profiles.resolve_profile(
                 "hero" if deep else quality_profile,
@@ -1100,13 +2029,24 @@ class Controller:
                 sweep_count=self.cfg.sweep_count,
                 target_score=self.cfg.target_score,
             )
-            sweep_part = profile.sweep_count if do_sweep else 0
-            polish_part = profile.polish_max_probes if profile.polish else 0
-            hard_cap = profile.max_iterations + sweep_part + polish_part
+            # ONE budget. There used to be two hand-maintained copies of this number and
+            # they disagreed by 50 renders — the one printed to the artist said 133 and
+            # the progress bar's said 183, and neither counted the tone passes, the
+            # exposure-host plates or the final re-render. That is the same
+            # two-sources-of-truth shape the draft cap was just fixed for. (2026-07-31)
+            self._cost_stages = profiles.planned_renders(
+                profile, do_sweep=do_sweep,
+                has_sun=rig.get("sun") is not None and start_override is None,
+                multi_start=bool(multi_start and start_override is None
+                                 and ref_stats is not None),
+                exposure_free="exposure.ev" not in locks,
+                plan_ran=False, verify_exposure=False, final_render=True,
+                ref_has_patches=bool(ref_stats
+                                     and float(ref_stats.get("hot_frac") or 0.0) > 0.0))
+            hard_cap = sum(s.count for s in self._cost_stages)
             log(f"{profile.label.upper()} PROFILE: {profile.loop_width}×"
-                f"{profile.loop_height} loop · ≤{profile.max_iterations} iterations"
-                + (f" · ≤{sweep_part} low-res sweep renders" if sweep_part else "")
-                + (f" · ≤{polish_part} polish probes" if polish_part else "")
+                f"{profile.loop_height} loop · "
+                + " · ".join(f"≤{s.count} {s.label}" for s in self._cost_stages)
                 + f" · hard worst-case ≤{hard_cap} renders")
 
             # software exposure: apply the just-applied state's EV/WB to each loop frame
@@ -1114,26 +2054,34 @@ class Controller:
             # anchor probes/board/finals use, so all exposed pixels stay consistent)
             self._sw_state = start
             self._sw_warned = False
-            # black-frame guard, armed per run: the FIRST probe that comes back is checked
-            # once, and the abort is STICKY (see render_hook / _black_probe_message)
-            self._probe_abort = ""
-            self._first_probe_checked = False
+            # The FIRST-probe-only black guard is GONE (2026-07-31). Its own comment named
+            # the worst case it accepted — a link that dies at probe 50 leaves the
+            # remaining 83 probes and the delivered final unvalidated — and every plate is
+            # now validated inside _render_exposed, which is strictly cheaper because
+            # stats_for reads the memo instead of recomputing.
             if getattr(self.cfg, "software_exposure", False) \
                     and "exposure.ev" in start.values:
                 log("software exposure ON — EV/WB applied to loop frames before scoring "
                     "(renderer-independent; V-Ray GPU's exposure is display-stage only)")
+            if self._unsolvable_axes:
+                locks = set(locks) | set(self._unsolvable_axes)
+                log("locked (unsolvable this run): " + ", ".join(sorted(
+                    self._unsolvable_axes)))
 
             # ---- PROGRESS. Stages are counted by their render tags and weighted by the
             # budget each one is allowed, so the bar tracks work actually done rather than
-            # a guess. Totals come from the resolved profile, so a fast run and a hero run
-            # both read 0..100 honestly instead of the hero crawling to 30.
+            # a guess. The budget comes from planned_renders — the SAME function that
+            # priced the run — so the bar and the estimate can never disagree again.
+            _budget_of = {s.key: s.count for s in self._cost_stages}
             _stage_budget = [
-                ("basin", "multi-start", 6),
-                ("sunsolve", "sun solve", int(sunsolve.__dict__.get("COARSE_AZIMUTHS", 12))
-                 * len(sunsolve.COARSE_ALTITUDES) + 8),
-                ("sweep", "sun sweep", max(1, int(profile.sweep_count))),
-                ("iter", "match loop", max(1, int(profile.max_iterations))),
-                ("polish", "polish", max(1, int(profile.polish_max_probes))),
+                ("basin", "multi-start", max(1, _budget_of.get("basin", 6))),
+                ("sunsolve", "sun solve", max(1, _budget_of.get("sunsolve", 44))),
+                ("sweep", "sun sweep", max(1, _budget_of.get("sweep",
+                                                             profile.sweep_count))),
+                ("iter", "match loop", max(1, _budget_of.get("iter",
+                                                             profile.max_iterations))),
+                ("polish", "polish", max(1, _budget_of.get(
+                    "polish", profile.polish_max_probes))),
             ]
             _total_units = float(sum(b for _k, _l, b in _stage_budget)) or 1.0
             _seen = {k: 0 for k, _l, _b in _stage_budget}
@@ -1173,9 +2121,15 @@ class Controller:
                 # without threading a callback through the solver, the sweep, the loop and
                 # polish separately. A match can run for many minutes; without this the
                 # artist has no way to tell a working run from a hung one.
-                if self._probe_abort:      # STICKY — see the black guard below
+                if self._probe_abort:      # STICKY — see _validate_plate
                     raise RuntimeError(self._probe_abort)
                 _tick(tag)
+                # I3 — LATCH the artist's ✕ here and let _render_exposed enforce it. Once
+                # set it stays set for the run: a stage that swallows the exception
+                # (sunsolve does, by design) simply raises again on its next probe at
+                # microsecond cost instead of firing another 60-second render each time.
+                if not self._cancel_latch and should_cancel():
+                    self._cancel_latch = "cancelled by the artist"
                 # DIRECTION-solving stages render small. They are comparing where the light
                 # falls, not judging tone, and there are dozens of them: the global sun
                 # solve alone probes up to 56. Measured — it was rendering at full loop
@@ -1217,42 +2171,44 @@ class Controller:
                 #     ones uploaded to the model by llm_pick, and a screenshot of another
                 #     renderer is not what that prompt describes. Eight probes is not
                 #     worth a second cross-source path.
+                # exactly the DIRECTION probes: sunsolve's coarse/fine grid and the sun
+                # sweep's sweep### frames. NOT sunsolve_tonealign (an exposure stage that
+                # happens to share the prefix) and NOT sweep_basin_* (the multi-start
+                # picker, which is not a sun stage at all).
+                sun_probe = (tag.startswith(("sunsolve_a", "sunsolve_fine"))
+                             or (tag.startswith("sweep")
+                                 and not tag.startswith("sweep_basin")))
+                if self._skip_sun_stages and sun_probe:
+                    # THE STAGE THAT IS RUNNING, not just the next one (2026-07-31).
+                    # _skip_sun_stages is set from inside this hook — GATE 4 fires at the
+                    # 6th frozen plate, i.e. coarse probe 7 of 44 — and it was only read
+                    # at the two stage entrances further down. An artist who answered
+                    # "skip the sun stages" still paid for the remaining ~37 probes of
+                    # the solve already in flight (~37 minutes on TULA), and the report
+                    # then told them the sun stages had been SKIPPED. sunsolve.probe reads
+                    # None as a skip and run_sun_sweep handles a None plate, so returning
+                    # here ends the stage in progress at its next probe.
+                    if not getattr(self, "_skip_sun_said", False):
+                        self._skip_sun_said = True
+                        self._degrade(log, "sun direction probes are being SKIPPED from "
+                                           "here — the stage already in flight is ending "
+                                           "at this probe rather than finishing its grid")
+                    return None
                 use_vantage = tag.startswith(("sunsolve_a", "sunsolve_fine"))
                 path = self._render_exposed(
                     cam, os.path.join(run_dir, f"{tag}.png"),
                     width, height,
                     state=getattr(self, "_sw_state", None) or start, entry=e, log=log,
-                    probe=use_vantage)
-                if path and not self._first_probe_checked \
-                        and getattr(self, "_last_render_backend", "vray") == "vray":
-                    # ONE extra compute_stats per run (~0.1 s on a 256px thumbnail) buys
-                    # the whole diagnosis: on 2026-07-30 an entire TULA run was spent
-                    # ranking 100% black frames before anyone noticed.
-                    #
-                    # The guard is spent on a V-RAY plate or not at all. A Vantage grab is
-                    # already guaranteed non-black by vgrab (it refuses one), so letting
-                    # it consume the check would burn it on a plate that cannot fail —
-                    # and every V-Ray plate afterwards (tone stages, the basin, the loop,
-                    # polish, the finals) would go unchecked, which is the 2026-07-30
-                    # failure with the guard installed and inert. Same for a plate whose
-                    # stats could not be computed: an unmeasured frame is not evidence.
-                    #
-                    # The abort is a STICKY FLAG and not merely an exception, because
-                    # sunsolve.probe catches every exception per probe by design
-                    # (sunsolve.py:117-124), as do the tone-align and sun-solve blocks —
-                    # a bare raise would be swallowed 44 times, and each swallow would
-                    # fire another 60-second render. With the flag, every later probe
-                    # raises before rendering (microseconds), the surviving stages
-                    # degrade the way they already know how, and the RuntimeError finally
-                    # escapes through iter00 (director.py:351, unguarded) and the
-                    # draft-restoring finally into the dock's "✗ …".
-                    first_stats = self.stats_for(path)
-                    if first_stats is not None:
-                        self._first_probe_checked = True
-                        if metrics.is_black(first_stats):
-                            self._probe_abort = self._black_probe_message()
-                            log("✗ " + self._probe_abort)
-                            raise RuntimeError(self._probe_abort)
+                    probe=use_vantage, tag=tag)
+                # I1 lives in _render_exposed now — EVERY plate from EVERY caller, both
+                # backends, black / near-black / wrong-size / frozen / stale. The
+                # 29bbae6 one-shot guard that used to sit here is deleted: its own comment
+                # named the case it accepted (the link dies at probe 50; 83 probes and the
+                # delivered final go unvalidated), and it could only ever see render_hook.
+                if not self._frozen_escalated \
+                        and self._frozen_run >= plate.FROZEN_ESCALATE_RUN:
+                    self._frozen_escalated = True
+                    self._gate_frozen_plates(log)
                 if path:
                     log(f"THUMB::{path}")   # UI renders these markers as inline thumbnails
                 return path
@@ -1281,13 +2237,22 @@ class Controller:
             bearing_trust = 1.0
             cfg_kw = {"transfer_weight": 0.0}
             if semantics:
+                # ABSENT EVIDENCE IS NOT EVIDENCE. This read `.get(..., 1.0)`, so a
+                # gateway-down run — whose DEFAULT_SEMANTICS carry no agreement key at all
+                # — steered 10% of every loop and polish score toward an INVENTED -60°
+                # sun, and printed "sun mid @ bearing -60°" in the same sentence shape it
+                # uses for a real reading. A missing key now reads as zero trust.
+                # (2026-07-31)
                 bearing_trust = max(0.25, min(1.0, float(
-                    semantics.get("sun_bearing_agreement", 1.0) or 0.0)))
+                    semantics.get("sun_bearing_agreement", 0.0) or 0.0)))
                 spread = semantics.get("sun_bearing_spread_deg")
-                if spread is not None and bearing_trust < 1.0:
-                    log(f"⚠ ANALYZE disagreed with itself on the sun's direction "
-                        f"(±{spread:.0f}° across samples) — leaning harder on the render "
-                        f"and less on the reading (trust {bearing_trust:.0%})")
+                if bearing_trust < 1.0:
+                    log("⚠ ANALYZE "
+                        + (f"disagreed with itself on the sun's direction (±{spread:.0f}° "
+                           f"across samples)" if spread is not None
+                           else "left no evidence about the sun's direction at all")
+                        + f" — leaning harder on the render and less on the reading "
+                          f"(trust {bearing_trust:.0%})")
                 cfg_kw["transfer_weight"] = TRANSFER_WEIGHT * bearing_trust
 
             # A COPY: the sun sweep updates the bearing below, and e.semantics is the
@@ -1296,10 +2261,34 @@ class Controller:
             # every later run of this camera.
             sem_live = dict(semantics) if semantics else None
 
+            # ---- GATE 1: THE DIRECTION GATE (I5).
+            # Fires only when the 44-probe solve is actually going to run and the analyzer
+            # has admitted it does not know. On 2026-07-30 that was ±76° of scatter and
+            # ~90 minutes of probing a coin toss, with the artist sitting right there.
+            if (start_override is None and rig.get("sun") is not None
+                    and "sun.azimuth_deg" not in locks and ref_stats is not None
+                    and float(ref_stats.get("hot_frac") or 0.0) > 0.0
+                    and bearing_trust <= max(0.25, BEARING_ASK_AGREEMENT)
+                    and float(semantics.get("sun_bearing_agreement", 0.0) or 0.0)
+                    < BEARING_ASK_AGREEMENT):
+                start, locks = self._gate_bearing(
+                    start, locks, sem_live, cfg_kw, cam_yaw, semantics, log)
+
             def transfer_hook(st):
                 try:
                     return transfer.score(sem_live, st, cam_yaw)["score"] / 100.0
-                except Exception:  # noqa: BLE001
+                except Exception as err:  # noqa: BLE001
+                    # Swallowing to None DELETES the semantic quarter of the objective for
+                    # the whole match — after the log line has already announced its
+                    # weight. Say it once, then keep degrading quietly so 190 probes do
+                    # not each print it. (2026-07-31)
+                    if not getattr(self, "_transfer_warned", False):
+                        self._transfer_warned = True
+                        self._degrade(log, f"the semantic transfer objective FAILED "
+                                           f"({err}) — the announced "
+                                           f"{cfg_kw['transfer_weight']:.0%} of the "
+                                           "objective that judges agreement with the "
+                                           "reference's lighting reading is not in effect")
                     return None
 
             hooks = Hooks(
@@ -1374,17 +2363,30 @@ class Controller:
                             tone_stats = (self.stats_for(tone_path)
                                           if tone_path else None)
                             if tone_stats is None:
+                                # a break with no line looked exactly like a stage that
+                                # ran and agreed with itself (2026-07-31)
+                                self._degrade(log, f"tone-align stopped after "
+                                                   f"{_tone_pass} pass(es): the probe "
+                                                   "could not be measured, so the sun "
+                                                   "solve judges geometry at the "
+                                                   "starting exposure")
                                 break
                             ev_new = solver.solve_ev(ref_stats, tone_stats,
                                                      start.get("exposure.ev"))
                             if ev_new is None:
+                                log(f"tone-align: settled after {_tone_pass + 1} pass(es) "
+                                    "— the exposure solver asked for no further change")
                                 break
                             log(f"tone-align: exposure.ev "
                                 f"{start.get('exposure.ev'):.2f} → {ev_new:.2f} so the "
                                 f"sun solve judges geometry at the reference's exposure")
                             start.set("exposure.ev", ev_new)
+                    except (MatchCancelled, PreflightBlocked):
+                        raise      # a validated stop is not an "assist that failed"
                     except Exception as err:  # noqa: BLE001
-                        log(f"tone-align skipped ({err})")
+                        self._degrade(log, f"tone-align SKIPPED ({err}) — the sun solve "
+                                           "will judge geometry at whatever exposure the "
+                                           "starting rig happens to have")
 
             # GLOBAL SUN SOLVE, before the sweep and usually instead of it. Sun direction
             # was this plugin's worst failure and it was being attacked with local search:
@@ -1396,15 +2398,23 @@ class Controller:
             # measure that discriminates, two bounded angles are cheaper to SOLVE on a grid
             # than to hill-climb. A grid cannot land in a local optimum.
             solved: Optional[Dict] = None
-            if start_override is None and rig.get("sun") is not None \
+            if self._skip_sun_stages:
+                log("sun solve: SKIPPED — the direction is already settled (you answered "
+                    "it, or the probes were provably ranking one unchanging picture)")
+            elif start_override is None and rig.get("sun") is not None \
                     and ref_stats is not None and not should_cancel():
                 try:
                     solved = sunsolve.solve_sun_angles(
                         start, ref_stats, hooks.apply, hooks.render, self.stats_for,
-                        log=log, should_cancel=should_cancel, locks=locks)
+                        log=log, should_cancel=should_cancel, locks=locks,
+                        max_probes=sum(s.count for s in self._cost_stages
+                                       if s.key == "sunsolve") or 56)
+                except (MatchCancelled, PreflightBlocked):
+                    raise      # a validated stop is not an "assist that failed"
                 except Exception as err:  # noqa: BLE001 — the solve is an ASSIST; losing
                     # it must cost the assist, never the match (the sweep still runs)
-                    log(f"⚠ sun solve failed ({err}) — falling back to the sweep")
+                    self._degrade(log, f"sun solve FAILED ({err}) — falling back to the "
+                                       "sweep, which is a coarser instrument")
                     solved = None
             if solved is not None and solved.get("confidence", 0.0) >= 0.5:
                 start.set("sun.azimuth_deg", solved["azimuth_deg"])
@@ -1429,6 +2439,9 @@ class Controller:
                 log("sun solve was not decisive — falling back to the sweep, and the "
                     "answer will be held loosely either way")
 
+            if do_sweep and self._skip_sun_stages:
+                log("sun sweep: SKIPPED — the direction is already settled")
+                do_sweep = False
             if do_sweep and start_override is None and rig.get("sun") is not None \
                     and "sun.azimuth_deg" not in locks:
                 log(f"sun sweep: {profile.sweep_count} directions at "
@@ -1438,6 +2451,15 @@ class Controller:
                     start, rules.sweep_azimuths(profile.sweep_count), hooks,
                     llm_pick=lambda paths, azs: self._sweep_call(ref_block, paths, azs),
                     ref_stats=ref_stats, out=sweep_out)
+                if _why:
+                    # run_sun_sweep produces four distinct failure strings and every one
+                    # of them was DISCARDED at this line — the sweep's basis ("metric-
+                    # only" when the gateway is down) among them. (2026-07-31)
+                    log("sun sweep: " + str(_why))
+                if az is None:
+                    self._degrade(log, "the sun sweep returned NO direction" +
+                                  (f" ({_why})" if _why else "") +
+                                  " — the sun stays where the starting rig put it")
                 if az is not None:
                     start.set("sun.azimuth_deg", az)
                     # ANALYZE estimates the bearing from ONE image, which is a hard
@@ -1517,6 +2539,7 @@ class Controller:
                 # read off the reference" — enough to pin direction, not enough to
                 # override the pixels that carry tone and detail
                 transfer_weight=cfg_kw["transfer_weight"],
+                cost_reported=self._cost_reported,
             )
             if profile.polish:
                 log("HERO MATCH: target 99 · bounded coordinate-descent polish "
@@ -1525,20 +2548,43 @@ class Controller:
                                rig_notes="; ".join(rig.get("notes", [])),
                                director_note=director_note)
         finally:
-            if draft_applied:   # crash-safe: even a raise puts the artist's sampler back
+            if draft_applied or getattr(self, "_cap_applied", False):
+                # crash-safe: even a raise puts the artist's sampler back. The gate-5 cap
+                # rides the same snapshot-and-restore path, so agreeing to a cap can no
+                # more strand a render setting than draft mode can.
+                self._cap_applied = False
                 for line in df.restore_draft():
                     log(line)
         e.locks = locks
+        result.degradations = list(self._degradations)
+        result.decisions = list(self._decisions)
+        # I3/D4 — a run the dock DETACHED must not write anything back. The dialog at
+        # _force_release promises the result "will be discarded"; before this, only the
+        # dock's return value was discarded while the controller went on to apply state,
+        # record the match and save the session minutes later. (2026-07-31)
+        if self._generation != generation:
+            self._degrade(log, f"run #{generation} was detached while it was still "
+                               f"running — its result is DISCARDED and the scene is left "
+                               "exactly as this later run leaves it")
+            return result
         if result.best_score is None and result.stop_reason in ("cancelled",
-                                                                "render_failed"):
+                                                                "render_failed",
+                                                                "max_iterations",
+                                                                "stalled"):
             # nothing was ever measured — recording would overwrite the camera's
             # accepted state+score with an unmeasured first guess. Put the scene back
             # to its previous light instead (the director skipped its final apply too).
+            #
+            # "max_iterations"/"stalled" joined the set 2026-07-31: repeated stats
+            # failures produce a FULL match at best_score None under those reasons, which
+            # used to fall through to the else-branch — so the controller recorded the
+            # match, applied the final state, and handed the artist "best score n/a" with
+            # nothing saying no frame in the run had ever been measured.
             prev = e.state if e.state is not None else e.pre_match
             if prev is not None:
                 self._apply_logged(rig, prev, cam, log)
-            log(f"match {result.stop_reason} before any successful render — "
-                "no measurement, kept previous lighting")
+            log(f"✗ match {result.stop_reason} and NO FRAME IN THIS RUN WAS EVER "
+                "MEASURED — nothing was recorded, kept previous lighting")
         else:
             # LIGHTING TRANSFER, reported alongside the pixel score. The critic answers
             # "do these frames match", which is unanswerable when the reference is a photo
@@ -1567,7 +2613,16 @@ class Controller:
                 # showing anything: the reported number and the plate the artist sees must
                 # both come from a full render, or the speed-up would be paid for in
                 # honesty. One render, at the end, against 120 saved during polish.
-                if result.best_state is not None and result.best_render:
+                if self._cancel_latch and result.best_state is not None:
+                    # ✕ must not buy one more full-size frame. This block fires whenever
+                    # best_state and best_render exist — including on a cancelled run —
+                    # and on TULA that is another 60 seconds after the artist asked it to
+                    # stop. The polish plate stands as the best render; the score below is
+                    # the one already measured for it. (2026-07-31)
+                    self._degrade(log, "cancelled — the final full-size re-render was "
+                                       "SKIPPED, so the reported score comes from the "
+                                       "half-size polish plate the search landed on")
+                elif result.best_state is not None and result.best_render:
                     full = os.path.join(run_dir, "final_full.png")
                     ap.apply_state(rig, self._baselines, result.best_state, cam,
                                    undo=False)
@@ -1602,6 +2657,9 @@ class Controller:
                             log(f"⚠ sun-patch agreement {hi:.0%} — the reference's bright "
                                 f"directional light is not landing the same way in this "
                                 f"match. The score above cannot see this; your eyes can.")
+                    self._reality_check(result, ref_stats, log)
+            except (MatchCancelled, PreflightBlocked):
+                raise
             except Exception:  # noqa: BLE001 — never sink a match over the readout
                 pass
             self._record_match(camera_name, result.best_state, result.best_score)
@@ -1662,21 +2720,102 @@ class Controller:
                            "quality_profile": profile.name,
                            "semantics": semantics, "llm_down": bool(self._llm_down),
                            "probes": probes,
+                           # 44 probes of evidence used to be dropped on the floor at the
+                           # end of the sun solve; preflight's findings had nowhere to go
+                           # at all. Both survive the run now. (2026-07-31)
+                           "preflight": preflight_report.to_json(),
+                           "sun_solve": solved,
+                           "cost": self.cost_estimate(),
                            **result.to_summary()}, f, indent=1)
         except (OSError, TypeError, ValueError):
             pass
+        self._final_report(result, log)
+        return result
+
+    # ------------------------------------------------------------------ I6: prove it
+    def _reality_check(self, result, ref_stats: Optional[Dict],
+                       log: Callable[[str], None]) -> None:
+        """Say "this does not look like your reference" when three instruments agree.
+
+        Every number here is ALREADY COMPUTED a few lines above and none of them was ever
+        compared to a threshold — that, and not the metric, was the 2026-07-30 gap. Worked
+        through by hand on the delivered frame (a cool sunless dusk courtyard against a
+        warm golden-hour reference, EV solved) the critic returns roughly 35/100 with
+        colour ~0.10 and highlight ~0.05. It was already capable of screaming.
+
+        WEAKEST-LINK, matching the critic's own aggregation philosophy: any one of the
+        three suffices. The absolute score term is deliberately the WEAKEST of the three
+        at 45.0 — this repo's recorded legitimate scores go down to 63.2, and a single
+        confident absolute number on the headline verdict is exactly the kind of false
+        positive this whole exercise exists to kill. Colour and highlight carry the
+        discrimination; the score floor only catches garbage.
+        """
+        reasons: List[str] = []
+        comps = result.best_components or {}
+        score = result.best_score
+        if score is not None and score < UNLIKE_REFERENCE_SCORE:
+            reasons.append(f"score {score:.1f}/100 — below every legitimate match ever "
+                           f"measured on this box")
+        colour = comps.get("color", comps.get("colour"))
+        if colour is not None and float(colour) < UNLIKE_REFERENCE_COLOR:
+            reasons.append(f"colour {float(colour):.2f} — the reference and this render "
+                           "are not the same colour of light")
+        hi = result.highlight
+        ref_hot = float((ref_stats or {}).get("hot_frac") or 0.0)
+        if hi is not None and float(hi) < UNLIKE_REFERENCE_HIGHLIGHT \
+                and ref_hot > REF_HAS_SUN_HOT_FRAC:
+            reasons.append(f"sun-patch agreement {float(hi):.0%} — the reference has "
+                           "directional light and this render essentially has none")
+        if not reasons:
+            return
+        result.unlike_reference = True
+        result.unlike_reasons = reasons
+        log("✗ THIS DOES NOT LOOK LIKE YOUR REFERENCE.")
+        for r in reasons:
+            log("  · " + r)
+        transfer_score = (result.transfer or {}).get("score")
+        if transfer_score is not None:
+            log(f"  · lighting transfer {float(transfer_score):.0f}/100")
+        log(f"  {len(reasons)} independent measure(s) agree. Do not deliver this frame.")
+
+    def _final_report(self, result, log: Callable[[str], None]) -> None:
+        """What actually IMPROVED, measured — not what was applied (I6).
+
+        "✓ done (stalled) — best 71.8" says nothing about whether the run was worth its
+        three hours. This states the start basin, the measured gain, what polish bought
+        for its probes, and — the part that kept getting lost — every degradation and
+        skipped stage, replayed from the ledger after 190 THUMB lines have scrolled the
+        originals away.
+        """
         score_txt = f"{result.best_score:.1f}" if result.best_score is not None else "n/a"
         log(f"match finished: {result.stop_reason}, best score {score_txt} "
             f"({len(result.iterations)} iterations)")
+        scored = [r.score for r in result.iterations if r.score is not None]
+        if scored and result.best_score is not None:
+            log(f"  start {scored[0]:.1f} → final {result.best_score:.1f} "
+                f"({result.best_score - scored[0]:+.1f} measured, same reference, "
+                "same size)")
         if result.polish_probes:
             tail = ""
             if getattr(result, "ceiling_proven", False):
                 tail = " · CEILING PROVEN (no fine move improves)"
             elif result.ceiling_converged:
                 tail = " · plateau (finer steps untested)"
-            log(f"polish: +{result.polish_gain:.2f} over {result.polish_probes} probes"
-                + tail)
-        return result
+            per_probe = result.polish_gain / max(1, result.polish_probes)
+            log(f"  polish: +{result.polish_gain:.2f} over {result.polish_probes} probes "
+                f"({per_probe:.3f} points per probe){tail}")
+            # polish_gain was computed and reported WITHOUT the 120 probes it bought. It is
+            # the only measured-improvement number in the pipeline; quoting it without its
+            # cost is how "the tool worked for three hours" stays unfalsifiable.
+            est = self.cost_estimate()
+            if result.polish_gain < 1.0 and est is not None:
+                spent = result.polish_probes * est["seconds_each"] / 60.0
+                log(f"  polish spent {_human_minutes(spent)} for less than a point — this "
+                    "scene was already at its basin's ceiling when the loop handed it over")
+        for d in result.degradations:
+            log("  DEGRADED  " + d)
+        if not result.degradations:
+            log("  no degradations: every stage ran on its intended instrument")
 
     def _apply_only(self, camera_name: str, e, rig, cam, start: LightingState,
                     run_dir: str, semantics: Dict,
@@ -1726,6 +2865,7 @@ class Controller:
         winner continues into a deep match with the note pinned into every prompt.
         ``locks`` is the UI's CURRENT lock selection (run_match's convention); None
         falls back to the camera's persisted locks."""
+        self._begin_operation(should_cancel)
         e = self.camera_entry(camera_name, create=True)
         if not e.reference:
             raise RuntimeError("bind a reference image to this camera first")
@@ -1872,6 +3012,21 @@ class Controller:
         queue = [name for name, e in self.session.cameras.items() if e.reference]
         if not queue:
             return {"": "no cameras have references bound"}
+        # A 45-camera overnight queue must not stop on the first dialog and block until
+        # morning, so the batch answers its own questions from each question's default and
+        # LOGS every one of them. Restored in a finally: the artist's interactive policy is
+        # theirs, not the batch's. (2026-07-31)
+        prev_policy = getattr(self.cfg, "uncertainty_policy", "ask")
+        self.cfg.uncertainty_policy = "assume"
+        log("batch: questions will be answered from their defaults and logged — an "
+            "unattended queue cannot wait for you")
+        try:
+            return self._match_all_queue(queue, log, should_cancel, do_sweep, results)
+        finally:
+            self.cfg.uncertainty_policy = prev_policy
+
+    def _match_all_queue(self, queue, log, should_cancel, do_sweep,
+                         results: Dict[str, str]) -> Dict[str, str]:
         if self.cfg.plan_first:
             log("note: scene-wide plans run on single MATCH only — the batch queue uses "
                 "the match loop (plans need your preview)")
@@ -1883,8 +3038,19 @@ class Controller:
             try:
                 r = self.run_match(name, log, should_cancel,
                                    locks=None, do_sweep=do_sweep)
-                results[name] = (f"{r.best_score:.1f}" if r.best_score is not None
-                                 else r.stop_reason)
+                if r.unlike_reference:
+                    # a bare score here read as success. It was not. (2026-07-31)
+                    results[name] = (f"FAILED — does not look like the reference "
+                                     f"({r.best_score:.1f})"
+                                     if r.best_score is not None else
+                                     "FAILED — does not look like the reference")
+                else:
+                    results[name] = (f"{r.best_score:.1f}" if r.best_score is not None
+                                     else r.stop_reason)
+            except MatchCancelled:
+                results[name] = "cancelled"
+                log(f"— batch stopped at {name} —")
+                break
             except Exception as err:  # noqa: BLE001 one bad camera must not kill the night
                 results[name] = f"error: {err}"
                 log(f"✗ {name}: {err}")
@@ -1918,6 +3084,7 @@ class Controller:
         cfg_probe = MatchConfig(
             transfer_weight=TRANSFER_WEIGHT if hooks.transfer is not None else 0.0)
         best_key, best_state, best_score = "first_guess", first_guess, None
+        scores: List[float] = []
         for key, st in cands:
             if hooks.should_cancel():
                 break
@@ -1926,6 +3093,10 @@ class Controller:
                 path = hooks.render(f"sweep_basin_{key}")
                 cur = self.stats_for(path) if path else None
                 if cur is None:
+                    # a silent `continue` turned a 6-candidate board into a 1-candidate
+                    # board with no line saying so (2026-07-31)
+                    log(f"multi-start: {key} produced no measurable plate — that basin "
+                        "is NOT in the comparison")
                     continue
                 value = critic.score(ref_stats, cur, self._critic_weights()).score
                 # Judged on the SAME objective the loop will use. On pixels alone this
@@ -1935,15 +3106,54 @@ class Controller:
                 # free. One weak comparison at the top of the run cost the whole match:
                 # the loop finished at 80.35 with the sun switched off.
                 value = blend_transfer(value, st, hooks, cfg_probe)
+            except (MatchCancelled, PreflightBlocked):
+                raise      # a validated stop is not "one bad candidate"
             except Exception as err:  # noqa: BLE001 one bad candidate ≠ a dead match
                 log(f"multi-start: {key} probe failed ({err})")
                 continue
             log(f"multi-start: {key} → {value:.1f}")
+            scores.append(value)
             if best_score is None or value > best_score:
                 best_key, best_state, best_score = key, st.copy(), value
         if best_score is not None:
             log(f"multi-start: best basin '{best_key}' at {best_score:.1f} "
                 f"(of {len(cands)} probed) — the match starts here")
+            if len(scores) >= 2:
+                lead = best_score - max(s for s in scores if s != best_score) \
+                    if len(set(scores)) > 1 else 0.0
+                if lead < 1.0:
+                    log(f"multi-start: the winner leads by only {lead:.2f} points — a "
+                        "near-tie across the board is not a choice, it is the board "
+                        "saying these rigs are indistinguishable here")
+            # ---- GATE 3: THE BASIN FLOOR (I5). This is the gate that would have stopped
+            # 2026-07-30 within about seven renders. The black frames scored 12.0, 10.9,
+            # 8.7 and 2.7 and this function announced a "best basin" from them.
+            if best_score < BASIN_FLOOR_SCORE:
+                answer = self._escalate(askmod.Question(
+                    key="basin_floor",
+                    headline=(f"the best of {len(scores)} starting rigs scored "
+                              f"{best_score:.1f}/100 against your reference"),
+                    detail=("Nothing this tool can adjust gets from "
+                            f"{best_score:.1f} to a match — every legitimate basin ever "
+                            f"measured on this box scored above {BASIN_FLOOR_SCORE:.0f}, "
+                            "and the 2026-07-30 run that ranked 100% black frames for "
+                            "hours scored 2.7 to 12.0 exactly here. Something upstream is "
+                            "wrong: the renderer, the reference, or which camera this is. "
+                            "Continuing spends the whole budget."),
+                    options=(("stop", "Stop — something upstream is wrong"),
+                             ("continue", "Continue anyway")),
+                    default="stop",
+                    facts={"best_score": round(best_score, 2), "best_basin": best_key,
+                           "probed": len(scores),
+                           "floor": BASIN_FLOOR_SCORE}), log)
+                if answer == "stop":
+                    self._cancel_latch = (
+                        f"stopped: the best starting rig scored {best_score:.1f}/100 — "
+                        "that is not a basin, it is a broken input")
+                    raise PreflightBlocked(self._cancel_latch)
+                self._degrade(log, f"continuing from a {best_score:.1f} basin on your "
+                                   "say-so — the final score will be measured, not "
+                                   "assumed, and the verdict will say what it found")
         try:
             hooks.apply(best_state)     # leave the scene wearing the chosen basin
         except Exception:  # noqa: BLE001
@@ -1959,6 +3169,7 @@ class Controller:
         """Render the candidate rigs from core.scenarios at loop res, score each against
         the reference when one is bound, and leave the scene exactly as it was found.
         → [{key, label, why, state, render, score}] in board order."""
+        self._begin_operation(should_cancel)
         rig = self.rig(refresh=True)
         cam = self.camera_node(camera_name)
         if cam is None:
@@ -2382,6 +3593,7 @@ class Controller:
         "cancelled"), and one camera's failure never aborts the batch. The scene's
         found light (and dome texture) is restored in a finally — finals must not
         strand the LAST camera's light in the artist's scene."""
+        self._begin_operation(should_cancel)
         if getattr(self.cfg, "no_renders", False):
             for name in camera_names:
                 on_progress(name, "skipped — no-render mode is ON (Settings)")
@@ -2467,7 +3679,10 @@ class Controller:
 
             d = os.path.join(tempfile.gettempdir(), "MaxGaffer_sessions", stem, sub)
             os.makedirs(d, exist_ok=True)
-            print(f"MaxGaffer: sessions dir unavailable ({err}) — run files go to {d}")
+            # print() goes to Max's Listener, which is not where the artist reads. This
+            # fallback silently moves every run artefact to a different disk. (2026-07-31)
+            self._config_warn(f"the sessions directory is unavailable ({err}) — every run "
+                              f"file for this session is going to {d} instead")
         if sub == "refs":
             # the transcode cache is FILES (ref_*.png / llm_*.png), not run dirs —
             # prune it under the same keep policy or it grows without bound
@@ -2481,6 +3696,30 @@ class Controller:
         self._run_dir = d
         prune_old_runs(parent, keep=int(self.cfg.keep_runs))
         return d
+
+
+def _pillow_available() -> bool:
+    """Is the thing software exposure actually needs installed? Probed at ARM TIME.
+
+    ``expose.expose_image_file`` returns None without Pillow, and the caller only warned
+    ONCE — so on a V-Ray GPU scene without Pillow every frame after the first was scored
+    un-exposed while the solver kept prescribing exposure changes that could not reach the
+    pixels. Better to know before the loop starts."""
+    try:
+        import PIL  # noqa: F401 — presence probe only
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _human_minutes(minutes: float) -> str:
+    """"3 h 12 min" rather than "192.4 minutes" — the artist is deciding whether to wait."""
+    minutes = max(0.0, float(minutes))
+    if minutes < 1.0:
+        return f"{minutes * 60.0:.0f} s"
+    if minutes < 60.0:
+        return f"{minutes:.0f} min"
+    return f"{int(minutes // 60)} h {int(round(minutes % 60)):02d} min"
 
 
 def _seed_still_referenced(session, path: str, exclude=None) -> bool:

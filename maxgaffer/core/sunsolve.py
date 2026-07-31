@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from typing import Callable, Dict, List, Optional, Tuple
 
+from .errors import MatchCancelled, PreflightBlocked
 from .genome import LightingState
 from .metrics import highlight_similarity
 from .patchgeom import bearing_agreement
@@ -115,17 +116,28 @@ def solve_sun_angles(
         # of the whole solve and killed the run (found by stress, 2026-07-26). A failed
         # probe is skipped; if every probe fails the coarse pass returns None and the
         # caller falls back to the sweep.
+        # CHARGED BEFORE THE ATTEMPT, not after it succeeds. This used to increment only
+        # on a successful reading, so a grid whose probes all failed would keep attempting
+        # them forever — max_probes bounded successes, not RENDERS, and a render is what
+        # costs the artist a minute each. (2026-07-31)
+        probes += 1
         try:
             apply(cand)
             path = render(tag)
             if path is None:
                 return None
             cur = stats(path)
+        except (MatchCancelled, PreflightBlocked):
+            # FIRST, and deliberately. This handler is what made the sticky abort flag
+            # necessary in the first place: a validated stop swallowed here would be
+            # re-raised on the next probe, and each swallow fired another 60-second
+            # render. Forty-four swallows is forty-four minutes of a run the artist
+            # already stopped. (2026-07-31)
+            raise
         except Exception:  # noqa: BLE001 — one bad frame is a skip, not a dead match
             return None
         if cur is None:
             return None
-        probes += 1
         value = highlight_similarity(ref_stats, cur)
         if value is None:
             return None
@@ -152,6 +164,29 @@ def solve_sun_angles(
         log("sun solve: no probe could be measured — leaving the sun where it was")
         return None
 
+    # ---- how decisive was the COARSE grid on its own? MEASURED and REPORTED, and
+    # deliberately NOT used to skip the fine pass. (2026-07-31)
+    #
+    # The honesty plan proposed skipping the 8 fine probes whenever this margin was under
+    # half of DECISIVE_MARGIN, on the reasoning that refining a flat table only adds
+    # precision to a guess. Measured against this module's own regression world
+    # (test_a_same_scene_solve_is_untouched_by_the_fallback, a 105° sun that the full
+    # solve lands within 2.5°): the coarse grid TIES at 0.000 there, because at 30°
+    # resolution the true peak sits between two grid points and both sample it equally
+    # well. The fine pass is precisely what breaks that tie. Skipping on a coarse tie
+    # would therefore abandon the solve on exactly the smooth landscapes it solves best,
+    # and report confidence 0.0 for an answer it could have found — a saving of 8 probes
+    # paid for with the answer. So the number is kept as evidence and reported, and the
+    # fine pass runs.
+    coarse_rivals = [v for az, _alt, v in table
+                     if abs((az - best[0] + 180.0) % 360.0 - 180.0) > 25.0]
+    coarse_margin = best[2] - max(coarse_rivals) if coarse_rivals else 0.0
+    if coarse_margin < DECISIVE_MARGIN * 0.5:
+        log(f"sun solve: the coarse grid is flat so far (best {best[2]:.3f} leads by "
+            f"{coarse_margin:.3f} at 30° resolution) — the "
+            f"{len(FINE_AZIMUTH_OFFSETS) + len(FINE_ALTITUDE_OFFSETS)} fine probes will "
+            "decide whether that is a real tie or just this grid's resolution")
+
     # ---- fine pass around the winner
     az0, alt0, score0 = best
     for d_az in FINE_AZIMUTH_OFFSETS:
@@ -166,6 +201,14 @@ def solve_sun_angles(
             if got is not None and got > best[2]:
                 best = (az1, _clamp_altitude((alt1 or 0.0) + d_alt), got)
 
+    return _finish(best, table, lateral, probes, coarse_margin, log)
+
+
+def _finish(best, table, lateral, probes: int, coarse_margin: float,
+            log: Callable[[str], None]) -> Dict:
+    """Rank, judge decisiveness and report. Split out 2026-07-31 so the coarse-flat
+    early-out (Gate 2) returns through exactly the same reporting path as a full solve —
+    a second copy of this arithmetic is how two budgets came to disagree elsewhere."""
     # ---- CROSS-DOMAIN fallback. If nothing reproduced the reference's patch layout, the
     # layout was never ours to match and ranking on it picked a direction for reasons that
     # do not transfer. Re-rank on the lateral centroid, which survives a change of building.
@@ -190,8 +233,20 @@ def solve_sun_angles(
     # ---- how decisive was it? A flat table is a finding, not a failure.
     rivals = [v for az, alt, v in table
               if abs((az - best[0] + 180.0) % 360.0 - 180.0) > 25.0]
-    margin = best[2] - max(rivals) if rivals else best[2]
-    confidence = max(0.0, min(result_confidence_cap, margin / DECISIVE_MARGIN))
+    if rivals:
+        margin = best[2] - max(rivals)
+        confidence = max(0.0, min(result_confidence_cap, margin / DECISIVE_MARGIN))
+    else:
+        # NO RIVAL SURVIVED, so there is no margin to measure. This used to fall back to
+        # the ABSOLUTE score, which meant a grid where 43 of 44 probes failed reported
+        # confidence 1.0 off one probe — the caller then set the azimuth, pinned the
+        # objective to it at full transfer weight and skipped the sweep, all on a single
+        # unopposed sample. A margin nobody contested is not a margin. (2026-07-31)
+        margin = 0.0
+        confidence = 0.0
+        log(f"sun solve: only one direction could be measured at all ({probes} probe(s) "
+            f"produced a reading) — there is nothing to compare it against, so the answer "
+            f"is reported with NO confidence rather than with false confidence")
     result = {
         "azimuth_deg": round(best[0], 2),
         "altitude_deg": (round(best[1], 2) if best[1] is not None else None),
@@ -200,6 +255,9 @@ def solve_sun_angles(
         "confidence": round(confidence, 3),
         "probes": probes,
         "cross_domain": cross_domain,
+        #: how decisive the COARSE grid alone was — the evidence Gate 2 acts on, kept so
+        #: run.json records why the fine pass did or did not run
+        "coarse_margin": round(coarse_margin, 4),
         "table": [(round(a, 1), round(e, 1), round(v, 4)) for a, e, v in table],
     }
     if confidence < 0.5:

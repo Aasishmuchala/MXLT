@@ -11,6 +11,7 @@ import types
 import pytest
 
 from maxgaffer.core.director import MatchResult
+from maxgaffer.core.errors import PreflightBlocked
 from maxgaffer.core.genome import LightingState
 from maxgaffer.core.scenarios import DEFAULT_SEMANTICS
 from maxgaffer.maxbridge import config as cfgmod
@@ -62,11 +63,21 @@ def ctrl(tmp_path, monkeypatch):
     monkeypatch.setattr(c, "ref_stats", lambda path: {"log_key": 0.2})
     c._test_applies = applies
     c._test_scene = scene
+    c._test_tmp = tmp_path
     return c
 
 
 def bound(ctrl, name="CamA"):
-    ctrl.session.entry(name).reference = "ref.jpg"
+    """Bind a REAL file on disk as the reference.
+
+    It used to be the string "ref.jpg" and nothing checked. Preflight's REFERENCE_PRESENT
+    now blocks a run whose reference is not on disk — the 2026-07-30 lesson is that a
+    match against a file that is not there produces numbers, not measurements — so the
+    fixture has to be as honest as the product is."""
+    path = ctrl._test_tmp / "ref.jpg"
+    if not path.exists():
+        path.write_bytes(b"\xff\xd8\xff\xe0not-really-a-jpeg-but-it-is-on-disk")
+    ctrl.session.entry(name).reference = str(path)
     return ctrl.session.cameras[name]
 
 
@@ -511,12 +522,99 @@ def test_vantage_plate_is_never_software_exposed(ctrl, monkeypatch):
     assert touched == ["encode", "expose"]
 
 
-def test_one_refused_grab_disarms_the_run(ctrl, monkeypatch):
-    """An armed-but-broken backend costs a log line per probe; disarm it once, loudly."""
+def test_a_refused_vantage_grab_is_skipped_not_replaced_by_a_vray_plate(ctrl,
+                                                                        monkeypatch):
+    """G-2, 2026-07-31. render_probe used to fall through to render_frame on a refusal,
+    so probe a210 came back a V-Ray plate appended to the SAME sunsolve table and the same
+    argmax as the tonemapped Vantage grabs before it — and highlight_similarity's presence
+    half is gated on an ABSOLUTE luminance threshold, so that is a systematic offset
+    between the two halves of one comparison. A refused grab is now a SKIP.
+
+    And one refusal no longer disarms the run: _settled_rows reads a legitimately static
+    dusk viewport as "stale", so a single settle timeout used to disarm the fast path on
+    exactly the scene class where 60 s → 50 ms matters most. Three in a row does."""
     ctrl._probe_backend = "vantage"
-    monkeypatch.setattr(ctl.rd, "render_probe", lambda *a, **k: ("p", "vray"))
-    assert ctrl._render_exposed(object(), "p.png", 8, 8, probe=True) == "p"
+    monkeypatch.setattr(ctl.rd, "render_probe", lambda *a, **k: (None, "vantage"))
+    logs = []
+    for _ in range(2):
+        assert ctrl._render_exposed(object(), "p.png", 8, 8, probe=True,
+                                    log=logs.append) is None
+        assert ctrl._probe_backend == "vantage"      # one, then two, is not a verdict
+    assert ctrl._render_exposed(object(), "p.png", 8, 8, probe=True,
+                                log=logs.append) is None
+    assert ctrl._probe_backend == "vray"             # three consecutive is
+    assert any("demoted to V-Ray" in ln for ln in logs)
+
+
+def test_a_refused_grab_never_reaches_render_frame_at_all(ctrl, monkeypatch):
+    """The half of the name above that nothing tested. The stub there was
+    ``lambda *a, **k: (None, "vantage")`` — a ``**k`` that swallows the very kwarg the
+    behaviour lives in, so reverting ``fallback=False`` to ``fallback=True`` passed it
+    unchanged. This drives the REAL render_probe and fails the test if V-Ray is asked to
+    substitute a plate into the sunsolve table. (2026-07-31)"""
+    ctrl._probe_backend = "vantage"
+    monkeypatch.setattr(ctl.rd.vgrab, "capture_window_png",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(ctl.rd.vgrab, "last_error", lambda: "no live link is streaming")
+    monkeypatch.setattr(ctl.rd, "render_frame",
+                        lambda *a, **k: pytest.fail(
+                            "a refused Vantage grab must be SKIPPED, never replaced by a "
+                            "V-Ray plate in the same ranked table"))
+    logs = []
+    assert ctrl._render_exposed(object(), "p.png", 8, 8, probe=True,
+                                log=logs.append) is None
+    assert any("SKIPPED rather than mixed into the grid" in ln for ln in logs)
+
+
+def test_an_empty_preflight_report_does_not_arm_the_grab(ctrl, monkeypatch):
+    """2026-07-31. run_match always passes a report object and never None, so
+    preflight_level='off' (or a preflight that raised and was degraded) handed
+    _arm_probe_backend an EMPTY report — and reading only ``demotions`` armed the window
+    grab having checked nothing at all: not the live link, not the window, not the
+    checklist #14 GPU conflict, not the camera."""
+    from maxgaffer.maxbridge import preflight as pf
+    from maxgaffer.maxbridge import vgrab
+
+    ctrl.cfg.probe_backend = "vantage"
+    monkeypatch.setattr(ctl.vt, "link_running", lambda *a, **k: None)
+    monkeypatch.setattr(vgrab, "find_window",
+                        lambda *a, **k: pytest.fail("unreachable if it armed blindly"))
+    logs = []
+    ctrl._arm_probe_backend(logs.append, report=pf.PreflightReport())
     assert ctrl._probe_backend == "vray"
+    assert any("rendering every probe in V-Ray" in ln for ln in logs)
+
+
+def test_the_report_decision_is_what_arms_it_in_either_direction(ctrl, monkeypatch):
+    from maxgaffer.maxbridge import preflight as pf
+    from maxgaffer.maxbridge import vgrab
+
+    ctrl.cfg.probe_backend = "vantage"
+    monkeypatch.setattr(vgrab, "find_window",
+                        lambda *a, **k: pytest.fail("the decision is preflight's"))
+    yes = pf.PreflightReport(demotions={"probe_backend": "vantage"})
+    ctrl._arm_probe_backend(lambda _ln: None, report=yes)
+    assert ctrl._probe_backend == "vantage"
+
+    no = pf.PreflightReport(demotions={"probe_backend": "vray"})
+    logs = []
+    ctrl._arm_probe_backend(logs.append, report=no)
+    assert ctrl._probe_backend == "vray"
+    assert any("see the preflight line above" in ln for ln in logs)
+
+
+def test_an_unpreflighted_arming_says_that_it_was_not_preflighted(ctrl, monkeypatch):
+    """I6. The direct-probe fallback is still allowed — it is the documented behaviour for
+    automation with preflight off — but it must not read like a verified arming."""
+    from maxgaffer.maxbridge import vgrab
+
+    ctrl.cfg.probe_backend = "vantage"
+    monkeypatch.setattr(ctl.vt, "link_running", lambda *a, **k: 20701)
+    monkeypatch.setattr(vgrab, "find_window", lambda *a, **k: 4242)
+    logs = []
+    ctrl._arm_probe_backend(logs.append, report=None)
+    assert ctrl._probe_backend == "vantage"
+    assert any("NOT preflighted" in ln for ln in logs)
 
 
 def test_only_the_sun_solve_uses_the_probe_backend(ctrl, monkeypatch):
@@ -610,12 +708,18 @@ _BLACK = {"mean_rgb": [0.0, 0.0, 0.0], "p": {"95": 0.0}, "log_key": 1e-6}
 
 
 def _black_probe_harness(ctrl, monkeypatch, stats):
+    """Patch _render_RAW, not _render_exposed.
+
+    2026-07-31: plate validation moved INTO _render_exposed, so a harness that replaces
+    that function replaces the thing under test. _render_raw is the seam below it — the
+    part that actually talks to V-Ray or vgrab — so patching there keeps the validation,
+    the timing and the cancel latch in the picture, which is the point."""
     ctrl.cfg.no_renders = False
     ctrl.cfg.draft_sampler = True
     bound(ctrl)
     monkeypatch.setattr(ctrl, "ref_stats", lambda p: None)
     rendered = []
-    monkeypatch.setattr(ctrl, "_render_exposed",
+    monkeypatch.setattr(ctrl, "_render_raw",
                         lambda cam, out, w, h, **kw: rendered.append(out) or out)
     monkeypatch.setattr(ctrl, "stats_for", lambda p: dict(stats))
     restored = []
@@ -624,6 +728,106 @@ def _black_probe_harness(ctrl, monkeypatch, stats):
     monkeypatch.setattr(ctl.df, "restore_draft",
                         lambda: restored.append(True) or ["draft: off"])
     return rendered, restored
+
+
+# --------------------------------------------------------- PREFLIGHT B: the canary
+def _plate(tmp_path, name, w, h, value=90):
+    from maxgaffer.core import png_min
+
+    rows = [[(value, value, value)] * w for _ in range(h)]
+    return png_min.write_png_rgb(str(tmp_path / name), rows)
+
+
+_LIT_STATS = {"mean_rgb": [0.3, 0.3, 0.3], "p": {"5": 0.1, "95": 0.9}, "contrast": 0.8,
+              "hot_frac": 0.02, "log_key": 0.2}
+_BLACK_STATS = {"mean_rgb": [0.0, 0.0, 0.0], "p": {"5": 0.0, "95": 0.0}, "contrast": 0.0,
+                "hot_frac": 0.0, "log_key": 1e-6}
+
+
+def test_run_match_points_the_viewport_at_the_camera_even_with_preflight_off(
+        ctrl, monkeypatch):
+    """The call was DELETED from run_match and left only inside check_camera_active, and
+    pf.run returns before building a Context when preflight_level='off'. V-Ray is
+    unaffected — it renders the camera node it is handed — but the Vantage live link
+    mirrors the ACTIVE VIEWPORT camera, so every direction probe was a grab of whatever
+    shot the artist last looked at, ranked against the reference. (2026-07-31)"""
+    bound(ctrl)
+    ctrl.cfg.preflight_level = "off"
+    pointed = []
+    monkeypatch.setattr(ctl.sc, "set_active_camera",
+                        lambda name, camera_id="": pointed.append(name) or True)
+    monkeypatch.setattr(ctl, "run_match", lambda *a, **k: MatchResult(
+        best_state=make_state(), best_score=90.0, best_render=None,
+        stop_reason="target_reached"))
+    ctrl.run_match("CamA", lambda _m: None, multi_start=False, do_sweep=False)
+    assert pointed == ["CamA"]
+
+
+def test_the_canary_blocks_when_the_renderer_saved_no_file(ctrl):
+    """Three BLOCK conditions and the only coverage any of them had was
+    `any("canary" in ln for ln in log.lines)` — a log-string presence check that passes
+    against a canary which never blocks at all. (2026-07-31)"""
+    with pytest.raises(PreflightBlocked, match="no file at all"):
+        ctrl._canary(None, None, 1.0, lambda _m: None)
+
+
+def test_the_canary_blocks_on_the_wrong_size(ctrl):
+    """render_frame has three layered size spellings, the third of which mutates
+    rt.renderWidth/Height globally. A build where all three fall through saves a valid
+    frame at SCENE resolution, compute_stats downsamples it to 256 px, and every number
+    looks entirely normal while every "probe-resolution" frame costs full price."""
+    path = _plate(ctrl._test_tmp, "big.png", 320, 180)
+    with pytest.raises(PreflightBlocked, match="came back 320×180"):
+        ctrl._canary(path, dict(_LIT_STATS), 1.0, lambda _m: None)
+
+
+def test_the_canary_accepts_the_size_it_asked_for(ctrl):
+    path = _plate(ctrl._test_tmp, "ok.png", 160, 90)
+    logs = []
+    ctrl._canary(path, dict(_LIT_STATS), 12.0, logs.append)
+    assert any("160×90 frame in 12.0 s" in ln for ln in logs)
+
+
+def test_a_black_canary_with_a_named_cause_blocks_and_without_one_only_reports(ctrl):
+    """DR-on-with-a-dead-port PLUS a black plate is not an unlit scene, it is a dead
+    renderer. Without that pairing a black canary is legitimate — nothing has been applied
+    yet — and blocking would lock an artist out of the scene they came to light."""
+    path = _plate(ctrl._test_tmp, "dark.png", 160, 90, value=0)
+    logs = []
+    ctrl._preflight_black_cause = ""
+    ctrl._canary(path, dict(_BLACK_STATS), 1.0, logs.append)
+    assert any("100% BLACK" in ln and ln.startswith("⚠") for ln in logs)
+
+    ctrl._preflight_black_cause = "distributed rendering is ON and NOTHING is listening"
+    with pytest.raises(PreflightBlocked, match="preflight already named the cause"):
+        ctrl._canary(path, dict(_BLACK_STATS), 1.0, logs.append)
+
+
+def test_preflight_warn_does_not_block_the_run_through_the_canary(ctrl, monkeypatch):
+    """preflight_level='warn' promises "report everything, stop for nothing". A Finding
+    keeps its authored severity in the report even when pf.run downgraded it, so reading
+    .severity alone made 'warn' STRICTER than 'off' — the canary raised PreflightBlocked
+    on a legitimately unlit scene. (2026-07-31)"""
+    from maxgaffer.maxbridge import preflight as pf
+
+    bound(ctrl)
+    ctrl.cfg.no_renders = False
+    report = pf.PreflightReport(findings=[
+        pf.Finding("DR_DEAD_PORT", "block", "nothing is listening on 192.168.1.50")])
+    monkeypatch.setattr(pf, "run", lambda *a, **k: report)
+    monkeypatch.setattr(ctl.rd, "render_frame",
+                        lambda cam, out, w, h: _plate(ctrl._test_tmp, "c.png", 160, 90))
+    monkeypatch.setattr(ctl.metrics, "compute_stats", lambda p, **k: dict(_LIT_STATS))
+    monkeypatch.setattr(ctl, "run_match", lambda *a, **k: MatchResult(
+        best_state=make_state(), best_score=90.0, best_render=None,
+        stop_reason="target_reached"))
+
+    for level, expected in (("block", "nothing is listening on 192.168.1.50"),
+                            ("warn", ""), ("off", "")):
+        ctrl.cfg.preflight_level = level
+        ctrl._exposure_host_checked = False
+        ctrl.run_match("CamA", lambda _m: None, multi_start=False, do_sweep=False)
+        assert ctrl._preflight_black_cause == expected, level
 
 
 def test_black_first_probe_aborts_the_match(ctrl, monkeypatch):
@@ -652,37 +856,40 @@ def test_black_first_probe_aborts_the_match(ctrl, monkeypatch):
     assert restored == [True]                    # the artist's sampler still came back
 
 
-def test_a_vantage_grab_does_not_spend_the_black_guard(ctrl, monkeypatch):
-    """vgrab REFUSES a black grab, so a Vantage plate can never fail this check -- and
-    letting it consume the one-shot guard leaves every V-Ray plate after it (the tone
-    stages, the basin, the loop, polish, the finals) unchecked. That is the 2026-07-30
-    failure with the guard installed and inert."""
+def test_a_plate_that_goes_black_at_probe_fifty_still_aborts(ctrl, monkeypatch):
+    """THE regression the 29bbae6 one-shot guard permitted, and its own comment named.
+
+    That guard checked the FIRST probe and latched. If the distributed-rendering link dies
+    at probe 50 — which is exactly what a Vantage live link closing mid-run does — the
+    remaining 83 probes AND the delivered final are ranked unvalidated. Validation now
+    lives in _render_exposed and runs on every plate, so the fiftieth black frame stops
+    the run just as the first would."""
     rendered, _restored = _black_probe_harness(ctrl, monkeypatch, _BLACK)
-    backends = iter(("vantage", "vray"))
-    monkeypatch.setattr(
-        ctrl, "_render_exposed",
-        lambda cam, out, w, h, **kw: rendered.append(out)
-        or setattr(ctrl, "_last_render_backend", next(backends)) or out)
+    lit = {"mean_rgb": [0.4, 0.4, 0.4], "p": {"95": 0.8, "5": 0.1},
+           "contrast": 0.7, "log_key": 0.2, "hot_frac": 0.02}
+    seq = [dict(lit)] * 49 + [dict(_BLACK)]
+    stats = iter(seq)
+    monkeypatch.setattr(ctrl, "stats_for", lambda p: next(stats))
     caught = []
 
     def fake(start, ref, sem, hooks, cfg, locks, **kw):
-        for tag in ("sunsolve_a000", "iter00"):
+        for i in range(60):
             try:
-                hooks.render(tag)
+                hooks.render(f"iter{i:02d}")
             except RuntimeError as err:
                 caught.append(err)
-        if caught:
-            raise caught[-1]
-        return MatchResult(best_state=make_state(), best_score=90.0,
-                           best_render=None, stop_reason="target_reached")
+                break
+        raise caught[-1]
 
     monkeypatch.setattr(ctl, "run_match", fake)
     with pytest.raises(RuntimeError, match="BLACK"):
         ctrl.run_match("CamA", lambda ln: None)
-    assert len(rendered) == 2         # the grab was let through, the V-Ray plate was not
+    assert len(rendered) == 50        # 49 good plates, then the black one stops it
+    assert len(caught) == 1
 
 
-def test_an_unmeasurable_first_plate_does_not_spend_the_black_guard(ctrl, monkeypatch):
+def test_an_unmeasurable_plate_is_not_evidence_and_the_next_one_is_still_checked(
+        ctrl, monkeypatch):
     """Absence of evidence is not evidence: a frame whose stats would not compute has not
     been checked, so the next one still has to be."""
     rendered, _restored = _black_probe_harness(ctrl, monkeypatch, _BLACK)

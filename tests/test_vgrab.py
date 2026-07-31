@@ -119,11 +119,36 @@ def test_good_grab_writes_a_decodable_probe_png(monkeypatch, tmp_path):
     out = tmp_path / "probe.png"
     path = vgrab.capture_window_png("Vantage", str(out), 32, 18)
     assert path == str(out) and os.path.exists(path)
-    assert grabbed == [(32, 18)]                 # GDI did the downscale, not python
+    # (the old assertion here was `grabbed == [(32, 18)]  # GDI did the downscale`, which
+    # asserted that the test's own lambda had been called with the arguments the test
+    # passed. It could not fail for any reason related to GDI or StretchBlt. Replaced
+    # 2026-07-31 with a claim about the FILE, which can. The stub is now grabbed twice —
+    # once for the plate, once for G-5's re-verified occlusion — so a count assertion
+    # here would also have been asserting the mock.)
     back = png_min.read_png_rgb(path, max_dim=64)
     assert back is not None and len(back) == 18 and len(back[0]) == 32
     stats = metrics.compute_stats(path)
     assert stats is not None and metrics.is_black(stats) is False
+
+
+@pytest.mark.parametrize("w,h", [(32, 18), (64, 36), (240, 135)])
+def test_the_requested_probe_size_reaches_the_capture_layer(monkeypatch, tmp_path, w, h):
+    """Removing the old `grabbed == [(32, 18)]` was right — it asserted the test's own
+    lambda arguments — but it left nothing at all pinning that width/height survive
+    _aspect_crop and reach _grab_rows. This asks the FILE instead: the stub honours
+    whatever size it is handed, so a w/h-forwarding bug shows up as wrong PNG dimensions
+    rather than as a mock call record. (2026-07-31)"""
+    monkeypatch.setattr(vgrab, "SETTLE_LIMIT_S", 0.0)
+    monkeypatch.setattr(vgrab, "SETTLE_STEP_S", 0.0)
+    monkeypatch.setattr(vgrab, "find_window", lambda *a, **k: 4242)
+    monkeypatch.setattr(vgrab, "_client_rect", lambda hwnd: (0, 0, 1600, 900))
+    monkeypatch.setattr(vgrab, "_occluded_fraction", lambda hwnd, rect: 0.0)
+    monkeypatch.setattr(vgrab, "_grab_rows", lambda rect, gw, gh: [
+        [((x * 7) % 256, (y * 13) % 256, 128) for x in range(gw)] for y in range(gh)])
+    vgrab.reset_settle()
+    path = vgrab.capture_window_png("Vantage", str(tmp_path / "p.png"), w, h)
+    assert path is not None
+    assert png_min.read_png_size(path) == (w, h)
 
 
 # --------------------------------------------------------------------------- framing
@@ -242,3 +267,150 @@ def test_centre_crop_black_test_ignores_the_window_shadow():
     dark[10][10] = (1, 0, 0)                     # one lit pixel in the middle
     assert vgrab._all_black(dark) is False
     assert vgrab._all_black([]) is True
+
+
+# ------------------------------------------------------- G-12: the Win32 half, off-box
+#
+# _stub_window replaces find_window, _window_rect, _client_rect, _occluded_fraction AND
+# _grab_rows in one call, and 10 of the 13 tests above use it — so every line where the
+# ctypes work lives had ZERO coverage in a 673-line module the commit message reported as
+# covered by "3781 passed". These four tests reach the parts that were never touched.
+
+
+def test_bgrx_is_swizzled_to_rgb_not_left_backwards():
+    """The single most classic place in Win32 imaging to get red and blue backwards, and
+    it was untested by all thirteen tests above. An R/B swap is not cosmetic here:
+    luminance is 0.2126·R + 0.0722·B, so swapping shifts which pixels clear
+    metrics.HOT_THRESHOLD and therefore the whole ranking the sun solve depends on."""
+    # one 2x1 row: pure RED then pure BLUE, in GDI's BGRX byte order
+    raw = bytes([0, 0, 255, 0,      # B=0   G=0   R=255  X → (255, 0, 0)
+                 255, 0, 0, 0])     # B=255 G=0   R=0    X → (0, 0, 255)
+    assert vgrab._rows_from_bgrx(raw, 2, 1) == [[(255, 0, 0), (0, 0, 255)]]
+
+
+def test_bgrx_reads_rows_top_down_and_drops_the_alpha_byte():
+    """biHeight is set NEGATIVE for a top-down DIB, so row 0 of the buffer is row 0 of the
+    picture — no flip anywhere in this function."""
+    raw = bytes([10, 20, 30, 99,        # row 0
+                 40, 50, 60, 99])       # row 1
+    assert vgrab._rows_from_bgrx(raw, 1, 2) == [[(30, 20, 10)], [(60, 50, 40)]]
+
+
+def test_the_settle_poll_is_actually_bounded(monkeypatch, tmp_path):
+    """The old test claimed boundedness in its docstring and MEASURED NOTHING — and
+    _stub_window sets SETTLE_STEP_S = 0.0, so it was a busy-spin that would burn CPU
+    rather than fail. A fake clock makes the claim checkable: at most
+    SETTLE_LIMIT_S / SETTLE_STEP_S grabs.
+
+    The grab stub RAISES past the bound rather than letting the fake clock spin forever:
+    detection by pytest timeout is detection by hanging the suite, which is not a failing
+    test. (2026-07-31)"""
+    _stub_window(monkeypatch, rows=_plate(120))
+    monkeypatch.setattr(vgrab, "SETTLE_LIMIT_S", 0.6)
+    monkeypatch.setattr(vgrab, "SETTLE_STEP_S", 0.05)
+    now = {"t": 0.0}
+    monkeypatch.setattr(vgrab.time, "monotonic", lambda: now["t"])
+    monkeypatch.setattr(vgrab.time, "sleep",
+                        lambda s: now.__setitem__("t", now["t"] + s))
+    grabs = []
+    ceiling = int(0.6 / 0.05) + 2
+
+    def _bounded(rect, w, h):
+        grabs.append(1)
+        if len(grabs) > ceiling:
+            raise AssertionError(f"the settle poll is UNBOUNDED: {len(grabs)} grabs")
+        return _plate(120)
+
+    monkeypatch.setattr(vgrab, "_grab_rows", _bounded)
+    vgrab.reset_settle()
+    vgrab.capture_window_png("Vantage", str(tmp_path / "a.png"), 32, 18)
+    assert len(grabs) <= int(0.6 / 0.05) + 2, len(grabs)
+    assert now["t"] <= 0.65
+
+
+def test_render_probe_forwards_should_cancel_to_the_settle_poll(monkeypatch):
+    """The predicate existed here from 2026-07-31 and NO production caller passed it, so
+    the G-13 fix was inert on box: render_probe had no such parameter and _render_raw had
+    nothing to give it. This is the wire, tested at the seam that was missing. The test
+    below drives vgrab directly and could never have detected its absence."""
+    from maxgaffer.maxbridge import render as rd
+
+    seen = {}
+    monkeypatch.setattr(rd.vgrab, "capture_window_png",
+                        lambda t, o, w, h, should_cancel=None:
+                        seen.update(should_cancel=should_cancel, size=(w, h)) or o)
+    pred = lambda: True                                       # noqa: E731
+    assert rd.render_probe(None, "g.png", 240, 135, backend="vantage",
+                           should_cancel=pred) == ("g.png", "vantage")
+    assert seen["should_cancel"] is pred
+    assert seen["size"] == (240, 135), "the requested probe size must reach the grab"
+
+
+def test_the_controller_hands_its_own_cancel_predicate_to_every_grab(tmp_path,
+                                                                    monkeypatch):
+    """…and the predicate it hands over has to be live: pressing ✕ must make it True."""
+    import honesty_harness as H
+    from maxgaffer.maxbridge import controller as ctl
+
+    c = H.build(tmp_path, monkeypatch, probe_backend="vantage")
+    c._probe_backend = "vantage"
+    pressed = {"v": False}
+    c._begin_operation(lambda: pressed["v"])
+    seen = {}
+    monkeypatch.setattr(ctl.rd, "render_probe",
+                        lambda cam, out, w, h, backend="vray", log=None, fallback=True,
+                        should_cancel=None:
+                        seen.update(pred=should_cancel) or (out, "vantage"))
+    monkeypatch.setattr(c, "stats_for", lambda p: dict(H.LIT))
+    c._render_exposed(object(), str(tmp_path / "p.png"), 8, 8, probe=True)
+    assert callable(seen["pred"])
+    assert seen["pred"]() is False
+    pressed["v"] = True
+    assert seen["pred"]() is True
+
+
+def test_the_settle_poll_consults_should_cancel_every_step(monkeypatch, tmp_path):
+    """G-13: 0.6 s per probe × 44 probes is up to 26 seconds of unresponsive dock, added
+    by a commit whose stated motivation was an artist unable to cancel."""
+    _stub_window(monkeypatch, rows=_plate(120))
+    monkeypatch.setattr(vgrab, "SETTLE_LIMIT_S", 0.6)   # _stub_window zeroes it
+    monkeypatch.setattr(vgrab, "SETTLE_STEP_S", 0.0)
+    monkeypatch.setattr(vgrab, "_grab_rows", lambda rect, w, h: _plate(120))
+    vgrab.reset_settle()
+    asked = []
+    out = vgrab.capture_window_png("Vantage", str(tmp_path / "a.png"), 32, 18,
+                                   should_cancel=lambda: asked.append(1) or True)
+    assert out is None
+    assert asked, "the poll must look at the cancel flag"
+    assert "cancelled" in vgrab.last_error()
+
+
+def test_occlusion_is_re_verified_on_the_frame_that_is_returned(monkeypatch, tmp_path):
+    """G-5: occlusion was measured, then _settled_rows re-grabbed up to twelve more times
+    unchecked and returned one of THOSE. A toast during the 0.6 s poll moves the picture
+    by far more than SETTLE_DELTA, so the freshness guard actively CERTIFIED the popup's
+    pixels as 'the live link delivered'."""
+    _stub_window(monkeypatch, rows=_plate(120))
+    covered = iter([0.0, 0.9])          # clear when asked; a dialog by the time it matters
+    monkeypatch.setattr(vgrab, "_occluded_fraction",
+                        lambda hwnd, rect: next(covered, 0.9))
+    vgrab.reset_settle()
+    assert vgrab.capture_window_png("Vantage", str(tmp_path / "a.png"), 32, 18) is None
+    assert "appeared over the Vantage window" in vgrab.last_error()
+
+
+def test_the_module_never_configures_the_process_shared_windll():
+    """G-11. ctypes.windll.user32 is ONE object for the whole Max process and ctypes
+    caches argtypes on it, so installing this module's private _Point class as
+    WindowFromPoint.argtypes made every OTHER caller in Max fail with
+    'expected _Point instance instead of POINT' — permanently, until restart. The blast
+    radius was other people's code."""
+    import os as _os
+
+    src = open(_os.path.join(_os.path.dirname(vgrab.__file__), "vgrab.py"),
+               encoding="utf-8").read()
+    code = src.split('"""', 2)[-1]           # drop the module docstring, which names it
+    code = "\n".join(ln for ln in code.splitlines()
+                     if not ln.lstrip().startswith("#"))
+    assert "ctypes.windll" not in code
+    assert 'ctypes.WinDLL("user32"' in code

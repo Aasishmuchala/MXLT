@@ -12,12 +12,39 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Tuple
 
 
+#: Where config warnings land, on TOP of the listener. ``print`` goes to Max's Listener
+#: window, which is not where an artist reads — the dock transcript is. 29bbae6 added the
+#: "config could not be read — using DEFAULTS" warning precisely because that message was
+#: the difference between three lost hours and a two-second diagnosis on 2026-07-30, and
+#: then sent it somewhere nobody was looking. The Controller installs itself here at
+#: construction; the list is a list so a second Controller cannot silence the first.
+_SINKS: list = []
+
+
+def add_warn_sink(sink) -> None:
+    """Route config warnings to a log callable as well as the listener. Idempotent."""
+    if sink is not None and sink not in _SINKS:
+        _SINKS.append(sink)
+
+
+def remove_warn_sink(sink) -> None:
+    try:
+        _SINKS.remove(sink)
+    except ValueError:
+        pass
+
+
 def _warn(msg: str) -> None:
-    """Config problems must be LOUD (Max listener / console) but never fatal."""
+    """Config problems must be LOUD (Max listener AND the dock) but never fatal."""
     try:
         print("[MaxGaffer] config: " + msg)
     except Exception:
         pass
+    for sink in list(_SINKS):
+        try:
+            sink("⚠ config: " + msg)
+        except Exception:  # noqa: BLE001 — a broken sink must never sink a config load
+            pass
 
 
 def _ensure_dir(d: str) -> None:
@@ -122,6 +149,27 @@ class Config:
     # (Chaos docs/forums), so disabling the sun can gut a VRaySky environment. "disable"
     # remains available for dome-only rigs.
     overcast_sun_mode: str = "dim"
+    #: What to do when the tool does not know and a human may not be reachable.
+    #: "ask"    — the dock prompts (Controller.ask); with no dock installed each question
+    #:            degrades to its own default and SAYS SO, i.e. today's behaviour.
+    #: "assume" — log the default and proceed. What match_all uses: a 45-camera overnight
+    #:            queue must not stop on the first dialog and block until morning.
+    #: "abort"  — raise PreflightBlocked rather than guess.
+    #: Unknown values read as "ask", the same defensive default probe_backend uses.
+    #:
+    #: Added 2026-07-31. On 2026-07-30 ANALYZE could not agree with itself about the sun's
+    #: bearing (±76° across samples), said so in a warning, and then spent ~90 minutes
+    #: probing 44 directions anyway. The artist could have answered in five seconds.
+    uncertainty_policy: str = "ask"
+    #: Estimated MINUTES above which a match stops and ASKS before spending. 0 disables.
+    #: Priced from ONE real timed probe, so the number quoted is measured, not assumed.
+    #: 20 minutes is roughly where a match stops being something you wait through.
+    cost_ask_minutes: float = 20.0
+    #: Preflight findings at or above this severity stop the run. "block" | "warn" | "off".
+    #: "warn" downgrades every block to a warning and logs that it did; "off" skips
+    #: preflight entirely and logs that too — it is for automation that has already
+    #: validated its own scenes, never a way to make a bad scene quiet.
+    preflight_level: str = "block"
     critic_weights: Dict[str, float] = field(default_factory=dict)   # override critic defaults
     artist_preference: str = "balanced"       # balanced | direction | color_mood | tonal
     repo_path: str = ""                      # clone folder, written by install.bat
