@@ -414,3 +414,126 @@ def test_the_module_never_configures_the_process_shared_windll():
                      if not ln.lstrip().startswith("#"))
     assert "ctypes.windll" not in code
     assert 'ctypes.WinDLL("user32"' in code
+
+
+# --------------------------------------------------------------------- tone correction
+#
+# The armed core.vtone transfer (2026-07-31). The contract under test: unarmed behaviour
+# is byte-identical to before the feature existed; an armed correction lands on disk; a
+# FAILING armed correction refuses the grab rather than writing uncorrected pixels —
+# refuse over lying, because the consumer that armed it scores absolute values.
+def _identity_plus_20():
+    """A real fitted VTone that adds 20 to every channel — visible in written bytes."""
+    from maxgaffer.core.vtone import VTone
+
+    pairs = [(float(v), min(255.0, float(v) + 20.0)) for v in range(0, 256, 3)]
+    tone = VTone.fit({"r": pairs, "g": pairs, "b": pairs})
+    assert tone is not None
+    return tone
+
+
+def test_unarmed_grab_is_byte_identical_to_the_pre_feature_path(monkeypatch, tmp_path):
+    """With no tone armed, the plate on disk is exactly png_min.write_png_rgb(rows) —
+    the strictly-additive guarantee every existing consumer (the ordinal sun solve)
+    relies on."""
+    rows = _plate(120)
+    _stub_window(monkeypatch, rows=rows)
+    assert vgrab.armed_tone() is None
+    out = tmp_path / "probe.png"
+    assert vgrab.capture_window_png("Vantage", str(out), 32, 18) == str(out)
+    ref = tmp_path / "ref.png"
+    png_min.write_png_rgb(str(ref), rows)
+    assert out.read_bytes() == ref.read_bytes()
+
+
+def test_armed_tone_correction_lands_on_disk(monkeypatch, tmp_path):
+    _stub_window(monkeypatch, rows=_plate(120))
+    monkeypatch.setattr(vgrab, "_TONE", _identity_plus_20())
+    out = tmp_path / "probe.png"
+    assert vgrab.capture_window_png("Vantage", str(out), 32, 18) == str(out)
+    back = png_min.read_png_rgb(str(out), max_dim=64)
+    # every 120 in the source plate must have landed as 140
+    assert back[2][2] == (140, 140, 140)
+
+
+def test_failing_tone_correction_refuses_and_writes_nothing(monkeypatch, tmp_path):
+    """An uncorrected plate the caller believes corrected is the silent-wrong-pixels
+    failure — the refusal must fire BEFORE the write, leave no file, and name itself."""
+
+    class _Broken:
+        def to_vray_space(self, rows):
+            raise RuntimeError("boom")
+
+    _stub_window(monkeypatch, rows=_plate(120))
+    monkeypatch.setattr(vgrab, "_TONE", _Broken())
+    out = tmp_path / "probe.png"
+    assert vgrab.capture_window_png("Vantage", str(out), 32, 18) is None
+    assert not out.exists()
+    assert "tone correction failed" in vgrab.last_error()
+    assert "uncorrected" in vgrab.last_error()
+
+
+def test_arm_disarm_round_trip():
+    tone = _identity_plus_20()
+    try:
+        vgrab.arm_tone(tone)
+        assert vgrab.armed_tone() is tone
+        vgrab.disarm_tone()
+        assert vgrab.armed_tone() is None
+        vgrab.arm_tone(tone)
+        vgrab.arm_tone(None)                 # explicit disarm via arm_tone(None)
+        assert vgrab.armed_tone() is None
+    finally:
+        vgrab.disarm_tone()                  # never leak state into another test
+
+
+# --------------------------------------------------------------------- convergence mode
+def test_converged_grab_accepts_a_stationary_picture(monkeypatch, tmp_path):
+    """converged=True: after first motion the poll continues until two consecutive
+    signatures agree. A static stub is stationary on its first comparison."""
+    _stub_window(monkeypatch, rows=_plate(120))
+    monkeypatch.setattr(vgrab, "CONVERGE_LIMIT_S", 1.0)
+    out = tmp_path / "probe.png"
+    assert vgrab.capture_window_png("Vantage", str(out), 32, 18,
+                                    converged=True) == str(out)
+
+
+def test_converged_grab_refuses_a_picture_that_never_stops_moving(monkeypatch, tmp_path):
+    """A frame still accumulating at the deadline has an uncontrolled timestamp in its
+    value — not a measurement. The refusal must say so."""
+    _stub_window(monkeypatch, rows=_plate(60))
+    state = {"n": 0}
+
+    def _restless(rect, w, h):
+        state["n"] += 1
+        return _plate((60 + state["n"] * 40) % 250)      # 40 levels per poll — never still
+
+    monkeypatch.setattr(vgrab, "_grab_rows", _restless)
+    monkeypatch.setattr(vgrab, "CONVERGE_LIMIT_S", 0.06)
+    out = tmp_path / "probe.png"
+    assert vgrab.capture_window_png("Vantage", str(out), 32, 18,
+                                    converged=True) is None
+    assert not out.exists()
+    assert "still accumulating" in vgrab.last_error()
+
+
+def test_converged_poll_honours_cancel(monkeypatch, tmp_path):
+    _stub_window(monkeypatch, rows=_plate(60))
+    state = {"n": 0}
+
+    def _restless(rect, w, h):
+        state["n"] += 1
+        return _plate((60 + state["n"] * 40) % 250)
+
+    monkeypatch.setattr(vgrab, "_grab_rows", _restless)
+    monkeypatch.setattr(vgrab, "CONVERGE_LIMIT_S", 5.0)
+    cancelled = {"after": 2}
+
+    def _cancel():
+        cancelled["after"] -= 1
+        return cancelled["after"] <= 0
+
+    out = tmp_path / "probe.png"
+    assert vgrab.capture_window_png("Vantage", str(out), 32, 18,
+                                    should_cancel=_cancel, converged=True) is None
+    assert "cancelled" in vgrab.last_error()

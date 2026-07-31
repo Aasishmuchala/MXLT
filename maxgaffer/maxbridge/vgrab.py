@@ -38,9 +38,17 @@ ON-BOX CALIBRATION ITEM: a Vantage plate is TONEMAPPED. ``metrics.HOT_THRESHOLD`
 ABSOLUTE 0.35 and ``sunsolve`` scores on ``highlight_similarity`` alone, so a different
 tone curve changes which pixels clear that threshold and biases the presence half of the
 metric; ``CROSS_DOMAIN_AGREEMENT`` / ``DECISIVE_MARGIN`` were calibrated on V-Ray plates.
-Do NOT "fix" this by tone-aligning on Vantage — its exposure cannot be written from Max.
-Measure a capped V-Ray run first; ``config.probe_backend`` defaults to "vray" so this
-ships dark.
+The remedy is the fitted transfer in ``core.vtone`` (armed per run via ``arm_tone`` once
+``scripts/vantage_calibrate.py`` has measured this box) — NOT tone-aligning on Vantage.
+An earlier revision of this docstring claimed Vantage's exposure "cannot be written from
+Max"; the vendor support table (Chaos docs page 124621427) says otherwise — Physical
+Camera ISO / f-number / shutter / EV / white balance all stream over the live link. The
+REAL hazards, both documented, are (a) Vantage's auto-exposure toggle, which "ignores set
+camera exposure" when on (page 125272932) and is not queryable from outside, and (b)
+Vantage 3.3's preserved-local-overrides behaviour (changelog 908558346): a property the
+artist once edited INSIDE Vantage stops following live-link updates, silently. Both are
+measured — never assumed absent — by the calibration harness before any fit may arm.
+``config.probe_backend`` defaults to "vray" so this ships dark.
 
 SECOND CALIBRATION ITEM: the grab is the client area centre-cropped to the probe's aspect
 (``_client_rect`` / ``_aspect_crop``), which is the closest this side can get to the
@@ -91,6 +99,20 @@ _OCCLUSION_GRID = 12
 SETTLE_LIMIT_S = 0.6
 SETTLE_STEP_S = 0.05
 
+#: MEASUREMENT-GRADE convergence, on top of the ordinal freshness poll above. The settle
+#: test proves "the picture CHANGED" and deliberately accepts the FIRST frame that moved —
+#: which is the least-converged, most-denoiser-biased frame in Vantage's accumulation
+#: sequence. That is fine for a RANKING (every probe is early by the same rule) and wrong
+#: for a MEASUREMENT: a tone fit calibrated on converged frames does not apply to
+#: first-motion frames, and vice versa. ``converged=True`` grabs therefore keep polling
+#: after first motion until two consecutive signatures agree within CONVERGE_EPSILON —
+#: stationarity, the cheapest observable proxy for "accumulation has stopped moving the
+#: picture". Both numbers are CALIBRATION ITEMS: the harness's dwell experiment measures
+#: the real knee per box, and 8 s is a ceiling chosen so a heavy scene converges and a
+#: hung link still refuses inside one V-Ray probe's budget.
+CONVERGE_LIMIT_S = 8.0
+CONVERGE_EPSILON = 0.75
+
 #: How far a 4x4 block mean (0..255 per channel) must move before the live link is believed
 #: to have delivered. NOT "any difference at all": Vantage keeps accumulating while it sits
 #: idle, so bit-equality is satisfied by path-tracer noise, which would wave the stale frame
@@ -105,6 +127,34 @@ _LAST_ERROR = ""
 #: ``reset_settle()`` (called once per run when the backend is armed) provides it by
 #: making the first probe wait out the whole budget instead of comparing.
 _LAST_SIGNATURE: Optional[List[float]] = None
+
+#: The armed ``core.vtone.VTone`` transfer, or None. Armed per run by the controller
+#: AFTER the fit's provenance and held-out residual pass their gates — this module never
+#: decides whether a fit is trustworthy, it only applies or refuses. None means grabs
+#: are UNCORRECTED, which is exactly today's shipped behaviour: legal for the sun
+#: solve's ordinal ranking, illegal for anything scored on absolute thresholds.
+_TONE = None
+
+
+def arm_tone(tone) -> None:
+    """Arm a fitted tone transfer for this run's grabs. The caller (the controller's
+    arming path) owns validation; passing None is an explicit disarm."""
+    global _TONE
+    _TONE = tone
+
+
+def disarm_tone() -> None:
+    """Back to uncorrected (ordinal-only) grabs — the state every run must START from,
+    so a previous run's fit can never leak into one whose gates were not checked."""
+    global _TONE
+    _TONE = None
+
+
+def armed_tone():
+    """The currently armed VTone, or None. Read by callers that need to LABEL a plate's
+    provenance (corrected vs ordinal-only) — a plate whose correction state cannot be
+    named is the 'silent wrong pixels' failure this module exists to prevent."""
+    return _TONE
 
 
 def last_error() -> str:
@@ -709,14 +759,67 @@ def _settled_rows(rect: Tuple[int, int, int, int], width: int, height: int, rows
     return rows, sig
 
 
+def _stationary(sig: Sequence[float], prev: Sequence[float]) -> bool:
+    """Have two CONSECUTIVE grabs agreed within accumulation noise? The convergence
+    counterpart of ``_moved`` — same signature space, tighter epsilon."""
+    if not sig or not prev or len(sig) != len(prev):
+        return False
+    return max(abs(a - b) for a, b in zip(sig, prev)) < CONVERGE_EPSILON
+
+
+def _converged_rows(rect: Tuple[int, int, int, int], width: int, height: int, rows,
+                    sig: List[float], should_cancel=None):
+    """Poll AFTER first motion until the picture stops moving → (rows, sig) or (None, []).
+
+    Runs only for ``converged=True`` grabs (the calibration harness and any future
+    measurement-grade consumer). The refusal on timeout is the point: a frame still
+    accumulating visibly after CONVERGE_LIMIT_S is a frame whose value depends on WHEN it
+    was taken, and a measurement with an uncontrolled timestamp in it is not a
+    measurement. Ordinal probes never pay this cost.
+    """
+    deadline = time.monotonic() + max(0.0, float(CONVERGE_LIMIT_S))
+    prev_sig = sig
+    while time.monotonic() < deadline:
+        if should_cancel is not None:
+            try:
+                if should_cancel():
+                    _fail("cancelled while waiting for Vantage to converge")
+                    return None, []
+            except Exception:  # noqa: BLE001 — a broken predicate must not wedge the poll
+                pass
+        time.sleep(max(0.01, float(SETTLE_STEP_S)))
+        fresh = _grab_rows(rect, width, height)
+        if not fresh:
+            _fail("the Vantage window went away while converging")
+            return None, []
+        fresh_sig = _signature(fresh)
+        if _stationary(fresh_sig, prev_sig):
+            return fresh, fresh_sig
+        rows, prev_sig = fresh, fresh_sig
+    _fail(f"the Vantage frame was still accumulating after {CONVERGE_LIMIT_S:g}s — a "
+          "measurement-grade grab needs a stationary picture, and this one's value "
+          "would depend on when it was taken")
+    return None, []
+
+
 def capture_window_png(title_substr: str, out_path: str,
-                       width: int, height: int, should_cancel=None) -> Optional[str]:
+                       width: int, height: int, should_cancel=None,
+                       converged: bool = False) -> Optional[str]:
     """Grab the Vantage live-link window into an 8-bit RGB PNG at probe size → path/None.
 
-    find → client rect → aspect crop → occlusion → grab → settle → black test → write.
+    find → client rect → aspect crop → occlusion → grab → settle → [converge] →
+    re-occlusion → black test → [tone-correct] → write.
     NOTHING is written on any refusal, and a pre-existing file at ``out_path`` is removed
     first, so a stale frame from an earlier probe can never be mistaken for this one's
     render (``render_frame`` holds the same contract for exactly the same reason).
+
+    ``converged=True`` additionally waits for stationarity after first motion — the
+    measurement-grade mode (see ``CONVERGE_LIMIT_S``). When a tone transfer is armed
+    (``arm_tone``) the corrected rows are what lands on disk; a correction that FAILS
+    refuses the grab entirely rather than silently writing uncorrected pixels, because a
+    consumer that armed the correction is by definition one that scores absolute values,
+    and an uncorrected plate it believes corrected is the exact silent-wrong-pixels
+    failure the four refusals above exist to prevent. Ordinal callers simply never arm.
     """
     global _LAST_SIGNATURE
 
@@ -751,6 +854,10 @@ def capture_window_png(title_substr: str, out_path: str,
     rows, sig = _settled_rows(rect, width, height, rows, should_cancel)
     if not rows:
         return None                       # _settled_rows already named the reason
+    if converged:
+        rows, sig = _converged_rows(rect, width, height, rows, sig, should_cancel)
+        if not rows:
+            return None                   # _converged_rows already named the reason
     # G-5, 2026-07-31: RE-VERIFY OCCLUSION ON THE FRAME THAT IS ACTUALLY RETURNED.
     # The check above ran on a frame _settled_rows then threw away — it re-grabs up to
     # twelve more times, unchecked — so a toast or a tooltip appearing during the 0.6 s
@@ -768,6 +875,19 @@ def capture_window_png(title_substr: str, out_path: str,
         _fail("the Vantage grab came back black (window covered, minimising, or the "
               "viewport is not drawing)")
         return None
+    if _TONE is not None:
+        # REFUSE over lying, decided deliberately: the alternative — fall through to the
+        # uncorrected rows — hands a consumer that armed a correction a plate in the
+        # WRONG SPACE with nothing refusing it, and every absolute threshold downstream
+        # (HOT_THRESHOLD first) silently measures the wrong thing. A refusal costs one
+        # V-Ray render; the V-Ray fallback is always correct.
+        try:
+            rows = _TONE.to_vray_space(rows)
+        except Exception as e:  # noqa: BLE001 — a broken fit must refuse, never leak raw pixels
+            _fail(f"the armed tone correction failed ({type(e).__name__}: {e}) — "
+                  "refusing to hand back an uncorrected plate while a corrected "
+                  "surface is armed")
+            return None
     written = png_min.write_png_rgb(out_path, rows)
     if not written:
         _fail(f"the probe PNG could not be written to {out_path}")

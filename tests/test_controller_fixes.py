@@ -960,3 +960,108 @@ def test_exposure_host_check_ignores_black_probes_and_says_so(ctrl, monkeypatch,
     assert ctrl.cfg.software_exposure is False
     assert any("BLACK" in ln and "distributed rendering" in ln for ln in logs)
     assert not getattr(ctrl, "_probe_abort", "")     # reports, never aborts, from here
+
+
+# ------------------------------------------------------------------ tone-fit arming gates
+#
+# The FIFTH refusal (2026-07-31): probe_backend "vantage" arms ordinal-only grabs exactly
+# as before; a stored core.vtone fit UPGRADES them to tone-corrected iff it passes every
+# gate. Each gate below encodes one way a stored fit can be confidently wrong.
+@pytest.fixture(autouse=True)
+def _no_real_tone_fit(monkeypatch):
+    """Hermeticity: these tests must never read the developer's real
+    %LOCALAPPDATA%/MaxGaffer/vantage_tone.json — once the calibration harness has run on
+    a box, that file EXISTS, and tests that silently arm a real fit are tests whose
+    meaning depends on the machine. Gate tests override this per-test."""
+    monkeypatch.setattr(cfgmod, "load_tone_fit", lambda: None)
+    from maxgaffer.maxbridge import vgrab
+
+    vgrab.disarm_tone()
+    yield
+    vgrab.disarm_tone()
+
+
+def _good_fit_dict(residual=1.0, dispersion=0.5, stamp=""):
+    from maxgaffer.core.vtone import VTone
+
+    pairs = [(float(v), float(v)) for v in range(0, 256, 3)]
+    tone = VTone.fit({"r": pairs, "g": pairs, "b": pairs})
+    tone.residual = residual
+    tone.dispersion = dispersion
+    if stamp:
+        tone.provenance["vantage_exe_stamp"] = stamp
+    return tone.to_dict()
+
+
+def _armed_vantage(ctrl, monkeypatch, logs):
+    """Drive _arm_probe_backend down the preflight-decided vantage path."""
+    from maxgaffer.maxbridge import preflight as pf
+
+    ctrl.cfg.probe_backend = "vantage"
+    yes = pf.PreflightReport(demotions={"probe_backend": "vantage"})
+    ctrl._arm_probe_backend(logs.append, report=yes)
+
+
+def test_no_stored_fit_arms_ordinal_only_and_says_so(ctrl, monkeypatch):
+    from maxgaffer.maxbridge import vgrab
+
+    logs = []
+    _armed_vantage(ctrl, monkeypatch, logs)
+    assert ctrl._probe_backend == "vantage"
+    assert vgrab.armed_tone() is None
+    assert any("UNCORRECTED" in ln and "ordinal-only" in ln for ln in logs)
+
+
+def test_a_valid_fit_arms_tone_correction_and_names_the_delivery_gap(ctrl, monkeypatch):
+    from maxgaffer.maxbridge import vgrab
+
+    monkeypatch.setattr(cfgmod, "load_tone_fit", _good_fit_dict)
+    logs = []
+    _armed_vantage(ctrl, monkeypatch, logs)
+    assert vgrab.armed_tone() is not None
+    assert any("TONE-CORRECTED" in ln for ln in logs)
+    assert any("deliverable gap" in ln for ln in logs)
+
+
+def test_each_gate_refuses_and_names_itself(ctrl, monkeypatch):
+    """malformed / unmeasured generalisation / over-residual / AE dispersion / stale
+    build — every gate leaves grabs UNCORRECTED and says why. The held-out gate is the
+    stress-test's central finding: an in-sample residual is INVERTED evidence, so a fit
+    that never measured generalisation must not correct absolute metrics."""
+    from maxgaffer.core import vtone as vt_core
+    from maxgaffer.maxbridge import vgrab
+
+    cases = [
+        (lambda: {"luts": "junk"}, "malformed"),
+        (lambda: _good_fit_dict(residual=None), "HELD-OUT"),
+        (lambda: _good_fit_dict(residual=vt_core.RESIDUAL_LIMIT + 1.0), "trust limit"),
+        (lambda: _good_fit_dict(dispersion=vt_core.DISPERSION_LIMIT + 1.0),
+         "AUTO-EXPOSURE"),
+        (lambda: _good_fit_dict(stamp="999:999"), "DIFFERENT Vantage build"),
+    ]
+    for loader, marker in cases:
+        monkeypatch.setattr(cfgmod, "load_tone_fit", loader)
+        if marker == "DIFFERENT Vantage build":
+            monkeypatch.setattr(ctl, "_vantage_exe_stamp", lambda exe: "111:111")
+        logs = []
+        _armed_vantage(ctrl, monkeypatch, logs)
+        assert ctrl._probe_backend == "vantage", marker   # ordinal use always survives
+        assert vgrab.armed_tone() is None, marker
+        assert any(marker in ln for ln in logs), (marker, logs)
+
+
+def test_a_previous_runs_tone_never_leaks_into_an_unchecked_run(ctrl, monkeypatch):
+    """Disarm-on-entry: a fit armed by run N must not survive into run N+1 whose own
+    gates were not walked — same induction-base shape as reset_settle."""
+    from maxgaffer.core.vtone import VTone
+    from maxgaffer.maxbridge import vgrab
+
+    pairs = [(float(v), float(v)) for v in range(0, 256, 3)]
+    vgrab.arm_tone(VTone.fit({"r": pairs, "g": pairs, "b": pairs}))
+    assert vgrab.armed_tone() is not None
+    monkeypatch.setattr(ctl.vt, "link_running", lambda *a, **k: None)
+    logs = []
+    ctrl.cfg.probe_backend = "vantage"
+    ctrl._arm_probe_backend(logs.append, report=None)     # no link -> vray fallback
+    assert ctrl._probe_backend == "vray"
+    assert vgrab.armed_tone() is None

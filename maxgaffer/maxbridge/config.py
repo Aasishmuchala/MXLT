@@ -256,3 +256,57 @@ def sessions_dir() -> str:
     d = os.path.join(_appdata_dir("MaxGaffer"), "sessions")
     _ensure_dir(d)
     return d
+
+
+# --------------------------------------------------------------------- Vantage tone fit
+#
+# A SIDECAR file, deliberately not a config.json field. config.json is the artist's flat,
+# hand-editable settings surface with a documented history of being overwritten by UI
+# state (29bbae6); a 3×256-float LUT with provenance is machine-written calibration data
+# that no human should hand-edit, and keeping it separate means a corrupt fit can never
+# take the api_key and every other setting down with it. Stored as the raw dict of
+# core.vtone.VTone.to_dict(); this module stays stdlib-and-shape-only (no core import —
+# config imports nothing from core today and that boundary is worth keeping), so
+# validation beyond "is a JSON object" belongs to VTone.from_dict at the arming site.
+TONE_FIT_PATH = os.path.join(_appdata_dir("MaxGaffer"), "vantage_tone.json")
+
+
+def load_tone_fit() -> "dict | None":
+    """The stored Vantage tone-fit dict, or None. Missing file: silent (calibration has
+    simply never run). Present-but-unreadable: LOUD, same rule as load() — a fit that
+    exists and cannot be read means the probe backend silently lost its measurement
+    licence, and mute degradation is how that becomes unfalsifiable from a transcript."""
+    try:
+        with open(TONE_FIT_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError, RecursionError) as e:
+        if os.path.exists(TONE_FIT_PATH):
+            _warn(f"{TONE_FIT_PATH} could not be read ({e}) — Vantage grabs run "
+                  "UNCORRECTED (ordinal-only) until the calibration harness is re-run")
+        return None
+    if not isinstance(d, dict):
+        _warn(f"{TONE_FIT_PATH} holds {type(d).__name__}, not an object — ignoring it")
+        return None
+    return d
+
+
+def save_tone_fit(d: dict) -> bool:
+    """Write the calibration harness's fit dict. Atomic replace, so a crash mid-write
+    leaves the previous fit intact rather than a half-file that load_tone_fit will warn
+    about on every future run."""
+    if not isinstance(d, dict):
+        return False
+    _ensure_dir(os.path.dirname(TONE_FIT_PATH))
+    tmp = TONE_FIT_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=1)
+        os.replace(tmp, TONE_FIT_PATH)
+    except OSError as e:
+        _warn(f"could not write {TONE_FIT_PATH} ({e})")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    return True

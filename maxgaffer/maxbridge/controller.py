@@ -1601,6 +1601,10 @@ class Controller:
             return
         from . import vgrab
 
+        # every run STARTS uncorrected — a fit armed by a previous run must never leak
+        # into one whose gates were not walked (same shape as reset_settle's induction
+        # base, for the same reason)
+        vgrab.disarm_tone()
         decided = report.demotions.get("probe_backend") if report is not None else None
         if decided is not None:
             if decided != "vantage":
@@ -1616,6 +1620,7 @@ class Controller:
             log("probe backend: VANTAGE window grab for the sun solve's direction probes "
                 "— the sweep, the tone stages, the basin, polish, the plan probes and "
                 "the final all stay on V-Ray")
+            self._arm_tone_fit(vgrab, log)
             return
         vgrab.reset_settle()
         port = vt.link_running()
@@ -1630,11 +1635,74 @@ class Controller:
                                "window were found, but the GPU-conflict check "
                                "(checklist #14) and the two-grab stability gate did not "
                                "run, so the grabs are of whatever Vantage is showing")
+            self._arm_tone_fit(vgrab, log)
         else:
             self._degrade(log, "vantage probe backend requested but " +
                           ("no live link is streaming" if not port
                            else f"the window was not found ({vgrab.last_error()})") +
                           " — rendering every probe in V-Ray at full cost")
+
+    def _arm_tone_fit(self, vgrab, log) -> None:
+        """Upgrade this run's grabs from ordinal-only to TONE-CORRECTED — iff a measured
+        fit exists and passes every gate. The FIFTH refusal, added 2026-07-31 with the
+        stress-test's shape: the gates below encode exactly the ways a stored fit can be
+        confidently wrong, and each refusal names itself, because a fit that silently
+        fails to arm reads as "corrected" in the artist's mental model for the rest of
+        the session.
+
+        Gate order is cheapest-lie-first: malformed file, unmeasured generalisation
+        (in-sample residual is INVERTED evidence — a small one is consistent with a
+        broken adaptive transfer, so only a held-out number counts), the auto-exposure
+        signature (per-state curve dispersion), then build staleness (a Vantage update
+        changes the tonemap the fit measured; the changelog did exactly that between
+        3.2 and 3.3). Failing any gate leaves grabs UNCORRECTED — today's shipped
+        ordinal-only behaviour, always legal for the sun solve's ranking."""
+        from ..core import vtone as vt_core
+
+        d = cfgmod.load_tone_fit()
+        if d is None:
+            log("vantage grabs are UNCORRECTED (ordinal-only licence) — no tone fit on "
+                "this box; run scripts/vantage_calibrate.py once to measure one")
+            return
+        tone = vt_core.VTone.from_dict(d)
+        if tone is None:
+            self._degrade(log, f"the stored tone fit ({cfgmod.TONE_FIT_PATH}) is "
+                               "malformed — grabs run UNCORRECTED (ordinal-only)")
+            return
+        if tone.residual is None:
+            self._degrade(log, "the stored tone fit carries no HELD-OUT residual — a "
+                               "fit whose generalisation was never measured must not "
+                               "correct absolute metrics; grabs run UNCORRECTED")
+            return
+        if tone.residual > vt_core.RESIDUAL_LIMIT:
+            self._degrade(log, f"tone fit held-out residual {tone.residual:.1f} is over "
+                               f"the {vt_core.RESIDUAL_LIMIT:g}-level trust limit — the "
+                               "transfer is not a per-pixel curve on this box; grabs "
+                               "run UNCORRECTED (ordinal-only)")
+            return
+        if tone.dispersion is not None and tone.dispersion > vt_core.DISPERSION_LIMIT:
+            self._degrade(log, f"tone fit per-state dispersion {tone.dispersion:.1f} is "
+                               f"over the {vt_core.DISPERSION_LIMIT:g}-level limit — "
+                               "the AUTO-EXPOSURE signature (the curve depends on scene "
+                               "content); disable Vantage auto-exposure and re-run the "
+                               "calibration harness. Grabs run UNCORRECTED")
+            return
+        stored = str((tone.provenance or {}).get("vantage_exe_stamp") or "")
+        current = _vantage_exe_stamp(self.cfg.vantage_exe)
+        if stored and current and stored != current:
+            self._degrade(log, "the tone fit was measured on a DIFFERENT Vantage build "
+                               "than the one installed — a Vantage update can change "
+                               "the tonemap the fit measured; re-run "
+                               "scripts/vantage_calibrate.py. Grabs run UNCORRECTED")
+            return
+        vgrab.arm_tone(tone)
+        gap = tone.delivery_gap()
+        log(f"vantage grabs are TONE-CORRECTED into V-Ray display space (held-out "
+            f"residual {tone.residual:.1f}/255"
+            + (f", dispersion {tone.dispersion:.1f}" if tone.dispersion is not None
+               else "")
+            + f") — deliverable gap p90 {gap['p90']:.0f} levels: the matched VFB image "
+              "and the Vantage frame the client sees differ by at most that much")
 
     def _black_probe_message(self, head: str = "") -> str:
         """Name the cause instead of guessing at it. On 2026-07-30 a whole run came back
@@ -3696,6 +3764,20 @@ class Controller:
         self._run_dir = d
         prune_old_runs(parent, keep=int(self.cfg.keep_runs))
         return d
+
+
+def _vantage_exe_stamp(exe_path: str) -> str:
+    """size:mtime of the installed Vantage binary — the cheapest honest provenance key
+    for a tone fit. Vantage exposes no version API this side of a window title, but a
+    build that changed on disk is a build whose tonemap the fit never measured (the 3.2
+    → 3.3 changelog changed live-link exposure behaviour twice). Empty string when the
+    exe cannot be statted — the arming gate treats missing evidence as no evidence,
+    not as a mismatch."""
+    try:
+        st = os.stat(exe_path)
+        return f"{st.st_size}:{int(st.st_mtime)}"
+    except OSError:
+        return ""
 
 
 def _pillow_available() -> bool:
