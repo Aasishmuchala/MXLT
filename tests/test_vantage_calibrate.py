@@ -134,3 +134,50 @@ def test_fmt_row_stays_one_line():
     line = mod.fmt_row("a" * 60, "PASS", "detail")
     assert "\n" not in line
     assert "PASS" in line
+
+
+# ------------------------------------------------------------------ percentile access
+#
+# Found 2026-08-01 by rendering a real scene and READING the numbers: compute_stats
+# nests percentiles as {"p": {"5": .., "95": ..}} with STRING keys, but E5's
+# certification read stats.get("p5") — None on both sides — so abs(0-0) == 0 and the
+# p5/p95 rows reported perfect agreement unconditionally. A vacuous check is worse than
+# no check: it passes a wrong correction with a number next to it.
+def test_pct_reads_the_nested_string_keyed_percentiles():
+    mod = _load()
+    stats = {"p": {"5": 0.041, "25": 0.11, "50": 0.3, "75": 0.62, "95": 0.98}}
+    assert mod.pct(stats, 5) == 0.041
+    assert mod.pct(stats, 95) == 0.98
+    assert mod.pct(stats, "95") == 0.98          # int or str, same answer
+
+
+def test_pct_returns_none_rather_than_a_confident_zero():
+    """Every degenerate shape must read as 'not measured', never as 0.0 — the whole
+    bug was a missing value silently becoming a number."""
+    mod = _load()
+    assert mod.pct(None, 5) is None
+    assert mod.pct({}, 5) is None
+    assert mod.pct({"p5": 0.3}, 5) is None       # the WRONG flat spelling
+    assert mod.pct({"p": None}, 5) is None
+    assert mod.pct({"p": []}, 5) is None
+    assert mod.pct({"p": {"5": None}}, 5) is None
+    assert mod.pct({"p": {"5": "x"}}, 5) is None
+    assert mod.pct({"p": {"25": 0.1}}, 5) is None
+
+
+def test_dynamic_range_and_its_none_propagation():
+    mod = _load()
+    stats = {"p": {"5": 0.04, "95": 0.99}}
+    assert abs(mod.dynamic_range(stats) - 0.95) < 1e-9
+    assert mod.dynamic_range({"p": {"5": 0.04}}) is None
+    assert mod.dynamic_range({}) is None
+    assert mod.dynamic_range(None) is None
+
+
+def test_dynamic_range_agrees_with_computed_contrast():
+    """compute_stats exposes contrast = pct(95) - pct(5); dynamic_range recomputes it
+    from the percentiles. If these two ever disagree, one of them is reading the wrong
+    thing — which is exactly the failure this section exists to catch."""
+    mod = _load()
+    stats = {"p": {"5": 0.041, "95": 0.981}, "contrast": 0.981 - 0.041}
+    assert abs(mod.dynamic_range(stats) - stats["contrast"]) < 1e-9

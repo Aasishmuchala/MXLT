@@ -200,6 +200,37 @@ def log2_ratio(a, b):
     return abs(math.log2(a / b))
 
 
+def pct(stats, which):
+    """A percentile VALUE out of a compute_stats dict, or None.
+
+    metrics.compute_stats nests them: ``{"p": {"5": .., "25": .., "50": .., "75": ..,
+    "95": ..}}`` — string keys inside a sub-dict, NOT top-level "p5"/"p95". This helper
+    exists because the first version of E5's certification read stats.get("p5"), which is
+    None on BOTH sides, so abs(None-as-0 − None-as-0) == 0 and the p5/p95 rows reported
+    perfect agreement unconditionally — a vacuous check that would have passed a
+    genuinely wrong correction. Found 2026-08-01 by rendering a real scene and reading
+    the numbers instead of trusting them.
+    """
+    if not isinstance(stats, dict):
+        return None
+    p = stats.get("p")
+    if not isinstance(p, dict):
+        return None
+    v = p.get(str(which))
+    try:
+        return None if v is None else float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def dynamic_range(stats):
+    """p95 − p5 in display units (0..1). compute_stats already exposes this as
+    "contrast"; this recomputes it from the percentiles so a caller can assert the two
+    agree, and returns None when either end is missing rather than a confident 0.0."""
+    hi, lo = pct(stats, 95), pct(stats, 5)
+    return None if hi is None or lo is None else hi - lo
+
+
 def fmt_row(name, verdict, detail=""):
     """One aligned console line — the harness's on-box output is read in Max's listener,
     where a table survives and prose wraps into soup."""
@@ -554,15 +585,19 @@ def main() -> int:
                 png_min.write_png_rgb(cpath, pooled.to_vray_space(grows))
                 sc_, sv = metrics.compute_stats(cpath), metrics.compute_stats(vpath)
                 if sc_ and sv:
+                    def _d(a, b):
+                        """None on EITHER side means 'not measured' — never a
+                        confident 0.0 difference, which is how the first version of
+                        this check silently always passed."""
+                        return None if a is None or b is None else abs(a - b)
+
                     cert[key] = {
                         "d_log_key_stops": log2_ratio(sc_.get("log_key"),
                                                       sv.get("log_key")),
-                        "d_hot_frac": abs(float(sc_.get("hot_frac") or 0)
-                                          - float(sv.get("hot_frac") or 0)),
-                        "d_p5": abs(float(sc_.get("p5") or 0)
-                                    - float(sv.get("p5") or 0)),
-                        "d_p95": abs(float(sc_.get("p95") or 0)
-                                     - float(sv.get("p95") or 0)),
+                        "d_hot_frac": _d(sc_.get("hot_frac"), sv.get("hot_frac")),
+                        "d_p5": _d(pct(sc_, 5), pct(sv, 5)),
+                        "d_p95": _d(pct(sc_, 95), pct(sv, 95)),
+                        "d_contrast": _d(dynamic_range(sc_), dynamic_range(sv)),
                     }
             gap = pooled.delivery_gap()
             ok = (residual is not None and residual <= vtone.RESIDUAL_LIMIT

@@ -37,6 +37,7 @@ def render_frame(camera, out_path: str, width: int, height: int) -> Optional[str
     except OSError:
         pass
     old_w, old_h = None, None
+    old_png_type = None
     try:
         # inside the try: a path-length/permission failure here must degrade to the
         # same None every other failure mode returns, not raise through the loop
@@ -52,6 +53,30 @@ def render_frame(camera, out_path: str, width: int, height: int) -> Optional[str
             rt.pngio.setAlpha(False)
         except Exception:
             pass
+        try:
+            # PIN 8-BIT (2026-08-01, measured in Max 2026.2 + V-Ray 7u3). png_min's
+            # premise — "our own 8-bit RGB(A) PNGs written by Max" — is a MACHINE
+            # SETTING, not a fact: pngio's type is persistent per install and on this
+            # box it was #true48, so every plate was 16-bit and png_min refused it
+            # (it decodes bit_depth 8 only).
+            #
+            # What that does and does NOT cost, measured rather than assumed — the
+            # stats of a 16-bit and an 8-bit render of the same frame are IDENTICAL
+            # (key 0.0754 both, contrast 0.9527 both), because compute_stats falls
+            # through to Pillow. So this is not a live scoring error wherever Pillow
+            # is installed. It is two silent capability losses:
+            #   * expose.display_encode_png reads through png_min ONLY, with no Pillow
+            #     fallback — so on a 16-bit box it returns None every time, and the
+            #     OCIO linear-plate remedy simply never runs on a scene that needs it;
+            #   * png_min exists precisely because Pillow is NOT guaranteed inside Max.
+            #     On a Pillow-less install, 16-bit plates make compute_stats return
+            #     None for every loop frame — no stats, no analytic solve, no score.
+            # Snapshotted and restored below: the PNG writer is global, and render
+            # settings belong to the artist (draft.py's house rule).
+            old_png_type = rt.pngio.getType()
+            rt.pngio.setType(rt.Name("true24"))
+        except Exception:
+            old_png_type = None
         # render()'s size-arg spelling varies across Max releases — a single spelling here
         # would be a single point of failure for EVERY loop render. Layered candidates:
         # outputwidth/height kwargs → outputSize:Point2 → the globals (restored in finally).
@@ -89,6 +114,11 @@ def render_frame(camera, out_path: str, width: int, height: int) -> Optional[str
         try:
             if old_w:
                 rt.renderWidth, rt.renderHeight = old_w, old_h
+        except Exception:
+            pass
+        try:
+            if old_png_type is not None:
+                rt.pngio.setType(old_png_type)
         except Exception:
             pass
 
